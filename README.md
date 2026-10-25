@@ -1,4 +1,7 @@
-# Jellyfin [PS] for PS4
+<div align="center">
+  <img src="https://raw.githubusercontent.com/jw-notes/JellyFin-PS3/main/docs/brand/jellyfin-ps3-mark.png" alt="JellyFin [PS]">
+
+  <h1>JellyFin [PS] for PS4</h1>
 
 A native Jellyfin client for jailbroken PS4 consoles, built with the OpenOrbis toolchain. It brings the Classic layout of Jellyfin [PS] to the PS4: library browsing, a full details page, Live TV, a screensaver and MPV/FFmpeg playback.
 
