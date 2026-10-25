@@ -2,6 +2,18 @@
   <img src="https://raw.githubusercontent.com/jw-notes/JellyFin-PS3/main/docs/brand/jellyfin-ps3-mark.png" alt="JellyFin [PS]">
 
   <h1>JellyFin [PS] for PS4</h1>
+  
+  <p>
+    <a href="https://github.com/jw-notes/JellyFin-PS4/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/jw-notes/JellyFin-PS4?label=release&color=00a4dc"></a>
+    <img alt="Platform" src="https://img.shields.io/badge/PS4-HEN%2013.52-003791">
+    <img alt="Jellyfin" src="https://img.shields.io/badge/Jellyfin-10.11%20%7C%2012-aa5cc3">
+    <a href="LICENSE"><img alt="Licence" src="https://img.shields.io/badge/licence-GPLv3-blue"></a>
+  </p>
+
+  <b><a href="https://github.com/jw-notes/JellyFin-PS4/releases/latest">Download</a></b>
+</div>
+
+<br>
 
 A native Jellyfin client for PS4 consoles, built with the OpenOrbis toolchain. It brings the Classic layout of Jellyfin [PS] to the PS4: library browsing, a full details page, Live TV, a screensaver and MPV/FFmpeg playback.
 
