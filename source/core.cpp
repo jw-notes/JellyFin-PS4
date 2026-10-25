@@ -1,0 +1,148 @@
+// Shared utilities: global session state, JSON helpers, item helpers.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "jellyfin_api.h"
+#include "json_lite.h"
+#include "json_unescape.h"   // \u0027 & co. -> UTF-8
+
+// -------------------------------------------------------
+// Global session state
+// -------------------------------------------------------
+
+char g_server[256]        = "";
+char g_username[64]       = "";
+char g_token[256]         = "";
+char g_userid[64]         = "";
+char responseBuffer[RESPONSE_SIZE];
+
+// -------------------------------------------------------
+// JSON helpers
+// -------------------------------------------------------
+
+int json_get_string(const char *json, const char *key, char *out, int out_size) {
+    if (!json || !out || out_size <= 0) return 0;
+    const char *end = json + strlen(json);
+    const char *value = find_top_value(json, end, key);
+    out[0] = 0;
+    if (!value || *value != '"') return 0;
+    json_unescape(value + 1, end, out, out_size); return 1;
+}
+
+// Bounded version: searches within [start, start+len)
+int json_get_in_range(const char *start, int len,
+                      const char *key, char *out, int out_size) {
+    if (!start || !out || out_size <= 0) return 0;
+    const char *value = find_top_value(start, start + len, key);
+    out[0] = 0;
+    if (!value || *value != '"') return 0;
+    json_unescape(value + 1, start + len, out, out_size); return 1;
+}
+
+int json_get_int(const char *json, const char *key, int def) {
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *p = strstr(json, search);
+    if (!p) return def;
+    p += strlen(search);
+    while (*p == ' ') p++;
+    if (*p < '0' || *p > '9') return def;
+    return atoi(p);
+}
+
+void url_encode_query(const char *in, char *out, int out_size) {
+    int j = 0;
+    for (int i = 0; in[i] && j < out_size - 4; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == ' ') { out[j++]='%'; out[j++]='2'; out[j++]='0'; }
+        else if ((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||
+                  c=='-'||c=='_'||c=='.'||c=='~')
+            out[j++] = (char)c;
+        else { snprintf(out+j, out_size-j, "%%%02X", c); j += 3; }
+    }
+    out[j] = '\0';
+}
+
+// -------------------------------------------------------
+// Item helpers
+// -------------------------------------------------------
+
+bool is_container(const char *t) {
+    return strcmp(t,"CollectionFolder")==0 || strcmp(t,"UserView")==0 ||
+           strcmp(t,"Folder")==0           || strcmp(t,"Series")==0   ||
+           strcmp(t,"Season")==0           || strcmp(t,"MusicAlbum")==0 ||
+           strcmp(t,"MusicArtist")==0      || strcmp(t,"BoxSet")==0;
+}
+
+// String-aware depth tracker: skips over { } inside quoted strings
+// so inner arrays like "Studios":[] don't confuse the item boundary.
+int parse_jf_items(const char *json, JFItem *arr, int max) {
+    const char *p = strstr(json, "\"Items\":[");
+    if (!p) return 0;
+    p += 9;
+
+    int count = 0;
+    while (count < max && *p) {
+        while (*p && *p != '{' && *p != ']') p++;
+        if (!*p || *p == ']') break;
+
+        const char *obj_start = p;
+        int  depth     = 0;
+        bool in_string = false;
+        bool escaped   = false;
+
+        while (*p) {
+            char c = *p;
+            if (escaped) {
+                escaped = false;
+            } else if (in_string) {
+                if (c == '\\') escaped = true;
+                else if (c == '"') in_string = false;
+            } else {
+                if      (c == '"') in_string = true;
+                else if (c == '{') depth++;
+                else if (c == '}') { if (--depth == 0) { p++; break; } }
+            }
+            p++;
+        }
+
+        int olen = (int)(p - obj_start);
+        JFItem tmp; memset(&tmp, 0, sizeof(tmp));
+        json_get_in_range(obj_start, olen, "Id",   tmp.id,   sizeof(tmp.id));
+        json_get_in_range(obj_start, olen, "Name", tmp.name, sizeof(tmp.name));
+        json_get_in_range(obj_start, olen, "Type", tmp.type, sizeof(tmp.type));
+        if (tmp.id[0]) arr[count++] = tmp;
+    }
+    return count;
+}
+
+// -------------------------------------------------------
+// Item identity (offline downloads)
+// -------------------------------------------------------
+
+bool jellyfin_parse_item_identity(const char *json, JFItemIdentity *out) {
+    memset(out, 0, sizeof(*out));
+    out->season  = -1;
+    out->episode = -1;
+    if (!json || !json[0]) return false;
+    json_get_string(json, "SeriesName", out->series_name, sizeof(out->series_name));
+    json_get_string(json, "SeriesId",   out->series_id,   sizeof(out->series_id));
+    // The needles start with a quote, so "IndexNumber" cannot match inside
+    // "ParentIndexNumber".
+    out->season  = json_get_int(json, "ParentIndexNumber", -1);
+    out->episode = json_get_int(json, "IndexNumber", -1);
+    out->year    = json_get_int(json, "ProductionYear", 0);
+    const char *rt = strstr(json, "\"RunTimeTicks\":");
+    if (rt) {
+        rt += strlen("\"RunTimeTicks\":");
+        while (*rt == ' ') rt++;
+        unsigned long long ticks = strtoull(rt, NULL, 10);
+        out->runtime_secs = (unsigned)(ticks / 10000000ULL);
+    }
+    out->has_backdrop = strstr(json, "\"BackdropImageTags\":[\"") != NULL;
+    json_get_string(json, "ParentBackdropItemId", out->parent_backdrop_id,
+                    sizeof(out->parent_backdrop_id));
+    return true;
+}

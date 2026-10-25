@@ -1,0 +1,3 @@
+from pathlib import Path
+p=Path(r'D:\Coding-Projects\PS4\JellyFin-PS4')
+f=p/'source/app.cpp';t=f.read_text().replace('static void append_log(const std::string& path,const char* message){','static void append_log(const std::string& path,const char* message,bool shared=false){').replace('if(file){fprintf(file,','if(file){if(shared)fchmod(fileno(file),0644);fprintf(file,').replace('append_log(diagnostic_log_path,message);','append_log(diagnostic_log_path,message,true);').replace(' mkdir("/data/JellyFin-PS4-logs",0755);',' if(mkdir("/data/JellyFin-PS4-logs",0755)==0)chmod("/data/JellyFin-PS4-logs",0755);');f.write_text(t,newline='\n')

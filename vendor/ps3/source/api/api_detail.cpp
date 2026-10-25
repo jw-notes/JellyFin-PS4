@@ -1,0 +1,1038 @@
+// Per-item detail fetch and PlaybackInfo session ID.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "jellyfin_api.h"
+#include "json_unescape.h"   // \u0027 & co. -> UTF-8
+#include "plog.h"
+#include "hd1080.h"
+#include "surround.h"
+
+// Defined in jellyfin_api.cpp
+int json_get_in_range(const char *start, int len,
+                      const char *key, char *out, int out_size);
+
+static double json_get_double(const char *json, const char *key, double def) {
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *p = strstr(json, search);
+    if (!p) return def;
+    p += strlen(search);
+    while (*p == ' ') p++;
+    if (*p != '-' && (*p < '0' || *p > '9')) return def;
+    return atof(p);
+}
+
+static void json_array_first_string(const char *json, const char *key,
+                                     char *out, int out_size) {
+    out[0] = '\0';
+    char search[80];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *p = strstr(json, search);
+    if (!p) return;
+    p += strlen(search);
+    while (*p == ' ') p++;
+    if (*p != '[') return;
+    p++;
+    while (*p == ' ') p++;
+    if (*p != '"') return;
+    p++;
+    json_unescape(p, p + strlen(p), out, out_size);
+}
+
+static void json_array_strings_join(const char *json, const char *key,
+                                     char *out, int out_size) {
+    out[0] = '\0';
+    char search[80];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *p = strstr(json, search);
+    if (!p) return;
+    p += strlen(search);
+    while (*p == ' ') p++;
+    if (*p != '[') return;
+    p++;
+    int written = 0;
+    while (*p && *p != ']') {
+        while (*p && *p != '"' && *p != ']') p++;
+        if (!*p || *p == ']') break;
+        p++;  // skip opening "
+        if (written > 0 && written < out_size - 3) {
+            out[written++] = ','; out[written++] = ' '; out[written] = '\0';
+        }
+        p = json_unescape(p, p + strlen(p), out + written, out_size - written);
+        written += (int)strlen(out + written);
+    }
+}
+
+static void json_array_obj_names_join(const char *json, const char *array_key,
+                                       char *out, int out_size) {
+    out[0] = '\0';
+    char search[80];
+    snprintf(search, sizeof(search), "\"%s\":", array_key);
+    const char *p = strstr(json, search);
+    if (!p) return;
+    p += strlen(search);
+    while (*p == ' ') p++;
+    if (*p != '[') return;
+    p++;
+    int written = 0;
+    while (*p && *p != ']') {
+        while (*p && *p != '{' && *p != ']') p++;
+        if (!*p || *p == ']') break;
+        const char *obj_start = p;
+        int depth = 0; bool in_str = false, esc = false;
+        while (*p) {
+            char c = *p;
+            if (esc) { esc = false; }
+            else if (in_str) { if (c=='\\') esc=true; else if (c=='"') in_str=false; }
+            else { if (c=='"') in_str=true; else if (c=='{') depth++; else if (c=='}') { if (!--depth) { p++; break; } } }
+            p++;
+        }
+        int olen = (int)(p - obj_start);
+        char name[128] = "";
+        json_get_in_range(obj_start, olen, "Name", name, sizeof(name));
+        if (name[0]) {
+            if (written > 0 && written < out_size - 3) {
+                out[written++] = ','; out[written++] = ' '; out[written] = '\0';
+            }
+            int nl = (int)strlen(name);
+            if (nl > out_size - written - 1) nl = out_size - written - 1;
+            memcpy(out + written, name, nl);
+            written += nl;
+            out[written] = '\0';
+        }
+    }
+}
+
+// Walk the "People" array and fill arr with up to `max` credits (id + name +
+// role/job).  Jellyfin returns cast first, so the first N are the top billing.
+static void parse_people(const char *json, JFPerson *arr, int max, int *count) {
+    *count = 0;
+    const char *p = strstr(json, "\"People\":");
+    if (!p) return;
+    p += sizeof("\"People\":") - 1;
+    while (*p == ' ') p++;
+    if (*p != '[') return;
+    p++;
+    while (*p && *p != ']' && *count < max) {
+        while (*p && *p != '{' && *p != ']') p++;
+        if (!*p || *p == ']') break;
+        const char *obj_start = p;
+        int depth = 0; bool in_str = false, esc = false;
+        while (*p) {
+            char c = *p;
+            if (esc) { esc = false; }
+            else if (in_str) { if (c=='\\') esc=true; else if (c=='"') in_str=false; }
+            else { if (c=='"') in_str=true; else if (c=='{') depth++; else if (c=='}') { if (!--depth) { p++; break; } } }
+            p++;
+        }
+        int olen = (int)(p - obj_start);
+        JFPerson *person = &arr[*count];
+        person->id[0] = person->name[0] = person->role[0] = '\0';
+        json_get_in_range(obj_start, olen, "Name", person->name, sizeof(person->name));
+        json_get_in_range(obj_start, olen, "Id",   person->id,   sizeof(person->id));
+        {
+            char tag[48] = "";
+            json_get_in_range(obj_start, olen, "PrimaryImageTag", tag, sizeof(tag));
+            person->has_image = tag[0] != '\0';
+        }
+        char role[64] = "", type[24] = "";
+        json_get_in_range(obj_start, olen, "Role", role, sizeof(role));
+        json_get_in_range(obj_start, olen, "Type", type, sizeof(type));
+        // Actors carry a character in Role; crew carry only a job in Type.
+        if (role[0])      snprintf(person->role, sizeof(person->role), "%s", role);
+        else if (type[0]) snprintf(person->role, sizeof(person->role), "%s", type);
+        if (person->name[0]) (*count)++;
+    }
+}
+
+static void parse_media_streams(const char *json,
+                                  char *video_out, int vlen,
+                                  char *audio_out, int alen) {
+    video_out[0] = '\0'; audio_out[0] = '\0';
+    const char *arr = strstr(json, "\"MediaStreams\":");
+    if (!arr) return;
+    arr += sizeof("\"MediaStreams\":") - 1;
+    while (*arr == ' ') arr++;
+    if (*arr != '[') return;
+    arr++;
+
+    char first_audio[128] = "";
+    bool found_video = false, found_def_audio = false;
+    const char *p = arr;
+
+    while (*p && *p != ']') {
+        while (*p && *p != '{' && *p != ']') p++;
+        if (!*p || *p == ']') break;
+        const char *obj_start = p;
+        int depth = 0; bool in_str = false, esc = false;
+        while (*p) {
+            char c = *p;
+            if (esc) { esc = false; }
+            else if (in_str) { if (c=='\\') esc=true; else if (c=='"') in_str=false; }
+            else { if (c=='"') in_str=true; else if (c=='{') depth++; else if (c=='}') { if (!--depth) { p++; break; } } }
+            p++;
+        }
+        int olen = (int)(p - obj_start);
+
+        char stype[16] = "";
+        json_get_in_range(obj_start, olen, "Type", stype, sizeof(stype));
+
+        if (!found_video && strcmp(stype, "Video") == 0) {
+            found_video = true;
+            if (!json_get_in_range(obj_start, olen, "DisplayTitle", video_out, vlen) || !video_out[0]) {
+                char codec_s[16] = "", vrange[16] = ""; int width = 0;
+                json_get_in_range(obj_start, olen, "Codec",      codec_s, sizeof(codec_s));
+                json_get_in_range(obj_start, olen, "VideoRange", vrange,  sizeof(vrange));
+                const char *wp = obj_start, *wend = obj_start + olen;
+                while (wp + 8 < wend) {
+                    if (memcmp(wp, "\"Width\":", 8) == 0) { width = atoi(wp + 8); break; }
+                    wp++;
+                }
+                const char *res = width >= 1920 ? "1080p" :
+                                  width >= 1280 ? "720p"  :
+                                  width >= 720  ? "480p"  : "";
+                for (int i = 0; codec_s[i]; i++) codec_s[i] = (char)toupper((unsigned char)codec_s[i]);
+                snprintf(video_out, vlen, "%s %s %s", res, codec_s, vrange);
+                int vl = (int)strlen(video_out);
+                while (vl > 0 && video_out[vl-1] == ' ') video_out[--vl] = '\0';
+            }
+        }
+
+        if (strcmp(stype, "Audio") == 0) {
+            char disp[128] = "";
+            json_get_in_range(obj_start, olen, "DisplayTitle", disp, sizeof(disp));
+            if (!first_audio[0] && disp[0]) snprintf(first_audio, sizeof(first_audio), "%s", disp);
+            if (!found_def_audio) {
+                const char *dp = obj_start, *dend = obj_start + olen;
+                while (dp + 12 < dend) {
+                    if (memcmp(dp, "\"IsDefault\":", 12) == 0) {
+                        dp += 12;
+                        while (*dp == ' ') dp++;
+                        if (memcmp(dp, "true", 4) == 0 && disp[0]) {
+                            found_def_audio = true;
+                            snprintf(audio_out, alen, "%s", disp);
+                        }
+                        break;
+                    }
+                    dp++;
+                }
+            }
+        }
+    }
+
+    if (!found_def_audio && first_audio[0])
+        snprintf(audio_out, alen, "%s", first_audio);
+}
+
+// Integer field within a JSON object slice; def on missing/non-numeric.
+static int json_get_int_in_range(const char *start, int len,
+                                 const char *key, int def) {
+    char search[48];
+    int slen = snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *p = start, *end = start + len;
+    while (p + slen < end) {
+        if (memcmp(p, search, slen) == 0) {
+            p += slen;
+            while (p < end && *p == ' ') p++;
+            if (p < end && (*p == '-' || (*p >= '0' && *p <= '9')))
+                return atoi(p);
+            return def;
+        }
+        p++;
+    }
+    return def;
+}
+
+// Bool field within a JSON object slice; false on missing.
+static bool json_get_bool_in_range(const char *start, int len,
+                                   const char *key) {
+    char search[48];
+    int slen = snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *p = start, *end = start + len;
+    while (p + slen < end) {
+        if (memcmp(p, search, slen) == 0) {
+            p += slen;
+            while (p < end && *p == ' ') p++;
+            return (p + 4 <= end && memcmp(p, "true", 4) == 0);
+        }
+        p++;
+    }
+    return false;
+}
+
+bool jellyfin_fetch_tracks(const char *item_id, JFTracks *out) {
+    memset(out, 0, sizeof(*out));
+
+    char url[512];
+    snprintf(url, sizeof(url),
+        "%s/Users/%s/Items/%s?Fields=MediaStreams",
+        g_server, g_userid, item_id);
+
+    int status = http_request(0, url, NULL, g_token, responseBuffer, RESPONSE_SIZE);
+    if (status != 200) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "fetch_tracks: http %d", status);
+        plog(buf);
+        return false;
+    }
+
+    const char *arr = strstr(responseBuffer, "\"MediaStreams\":");
+    if (!arr) { plog("fetch_tracks: no MediaStreams"); return false; }
+    arr += sizeof("\"MediaStreams\":") - 1;
+    while (*arr == ' ') arr++;
+    if (*arr != '[') return false;
+    arr++;
+
+    const char *p = arr;
+    int file_default = 0;
+    while (*p && *p != ']') {
+        while (*p && *p != '{' && *p != ']') p++;
+        if (!*p || *p == ']') break;
+        const char *obj_start = p;
+        int depth = 0; bool in_str = false, esc = false;
+        while (*p) {
+            char c = *p;
+            if (esc) { esc = false; }
+            else if (in_str) { if (c=='\\') esc=true; else if (c=='"') in_str=false; }
+            else { if (c=='"') in_str=true; else if (c=='{') depth++; else if (c=='}') { if (!--depth) { p++; break; } } }
+            p++;
+        }
+        int olen = (int)(p - obj_start);
+
+        char stype[16] = "";
+        json_get_in_range(obj_start, olen, "Type", stype, sizeof(stype));
+        int idx = json_get_int_in_range(obj_start, olen, "Index", -1);
+        if (idx < 0) continue;
+
+        char disp[64] = "", lang[8] = "";
+        json_get_in_range(obj_start, olen, "DisplayTitle", disp, sizeof(disp));
+        json_get_in_range(obj_start, olen, "Language", lang, sizeof(lang));
+        if (!disp[0]) snprintf(disp, sizeof(disp), "%s", lang);
+
+        int slot = -1;
+        if (strcmp(stype, "Audio") == 0 && (slot = jf_audio_slot(out, lang, disp)) >= 0) {
+            JFStream *s = &out->audio[slot];
+            if (slot == out->n_audio) out->n_audio++;
+            else if (file_default == slot) file_default = 0;   // its track was replaced
+            memset(s, 0, sizeof(*s));
+            s->index = idx;
+            snprintf(s->label, sizeof(s->label), "%s",
+                     disp[0] ? disp : "Audio");
+            snprintf(s->lang, sizeof(s->lang), "%s", lang);
+            if (json_get_bool_in_range(obj_start, olen, "IsDefault"))
+                file_default = slot;
+            {
+                const int br = json_get_int_in_range(obj_start, olen, "BitRate", 0);
+                s->bitrate = br > 0 && br < 100000000 ? (unsigned)br : 0;
+            }
+        } else if (strcmp(stype, "Subtitle") == 0 && out->n_subs < JF_MAX_STREAMS) {
+            JFStream *s = &out->subs[out->n_subs];
+            s->index = idx;
+            snprintf(s->label, sizeof(s->label), "%s",
+                     disp[0] ? disp : "Subtitle");
+            out->n_subs++;
+        }
+    }
+
+    jf_tracks_pick_start(out, file_default);
+
+    char buf[96];
+    snprintf(buf, sizeof(buf), "fetch_tracks: %d audio, %d subs, start=%d (%s)",
+             out->n_audio, out->n_subs, out->default_audio, g_audio_lang);
+    plog(buf);
+    return true;
+}
+
+// Search stubs already opened, and the library items they became.  After the
+// first open the stub id 404s for everything, the item fetch included, so the
+// same card opened again from the search results asks for the real item.
+// Only the details page's loads touch it (one at a time).
+#define STUB_MAP_N 16
+static struct { char stub[33], real[33]; } s_stub_map[STUB_MAP_N];
+static int s_stub_next = 0;
+
+static const char *stub_map_find(const char *id) {
+    for (int i = 0; i < STUB_MAP_N; i++)
+        if (s_stub_map[i].stub[0] && strcmp(s_stub_map[i].stub, id) == 0)
+            return s_stub_map[i].real;
+    return id;
+}
+
+static void stub_map_add(const char *stub, const char *real) {
+    if (strlen(stub) != 32 || strlen(real) != 32) return;
+    for (int i = 0; i < STUB_MAP_N; i++)
+        if (strcmp(s_stub_map[i].stub, stub) == 0) {
+            snprintf(s_stub_map[i].real, sizeof s_stub_map[i].real, "%s", real);
+            return;
+        }
+    snprintf(s_stub_map[s_stub_next].stub, sizeof s_stub_map[0].stub, "%s", stub);
+    snprintf(s_stub_map[s_stub_next].real, sizeof s_stub_map[0].real, "%s", real);
+    s_stub_next = (s_stub_next + 1) % STUB_MAP_N;
+}
+
+bool jellyfin_fetch_item_detail(const char *item_id, XMBItemDetail *out) {
+    memset(out, 0, sizeof(*out));
+    const char *asked = item_id;
+    item_id = stub_map_find(item_id);
+
+    char url[512];
+    snprintf(url, sizeof(url),
+        "%s/Users/%s/Items/%s"
+        "?Fields=Overview,Taglines,People,OfficialRating,CommunityRating"
+        ",CriticRating,Genres,Studios,MediaStreams",
+        g_server, g_userid, item_id);
+
+    int status = http_request(0, url, NULL, g_token, responseBuffer, RESPONSE_SIZE);
+    if (status != 200) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "item_detail: http %d", status);
+        plog(buf);
+        return false;
+    }
+
+    const char *resp = responseBuffer;
+
+    // The first "Id" is the item's own: BaseItemDto lists Name, OriginalTitle
+    // and ServerId before it, and nothing nested.  Kept only if it looks like
+    // one (32 hex digits).
+    {
+        char rid[64] = "";
+        json_get_string(resp, "Id", rid, sizeof(rid));
+        bool ok = strlen(rid) == 32;
+        for (int i = 0; ok && rid[i]; i++)
+            ok = (rid[i] >= '0' && rid[i] <= '9') || (rid[i] >= 'a' && rid[i] <= 'f');
+        if (!ok && item_id != asked) snprintf(rid, sizeof(rid), "%s", item_id);
+        if (ok || item_id != asked) snprintf(out->id, sizeof(out->id), "%s", rid);
+        if (ok && strcmp(rid, asked) != 0) {
+            stub_map_add(asked, rid);
+            char b[128];
+            snprintf(b, sizeof(b), "item_detail: %s answered as %s (search stub)", asked, rid);
+            plog(b);
+        }
+    }
+
+    json_get_string(resp, "Overview",       out->overview,        sizeof(out->overview));
+    json_get_string(resp, "OfficialRating", out->official_rating, sizeof(out->official_rating));
+
+    double cr = json_get_double(resp, "CommunityRating", -1.0);
+    if (cr >= 0.0) snprintf(out->community_rating, sizeof(out->community_rating), "%.1f", cr);
+
+    double xr = json_get_double(resp, "CriticRating", -1.0);
+    if (xr >= 0.0) snprintf(out->critic_rating, sizeof(out->critic_rating), "%.0f%%", xr);
+
+    json_array_first_string(resp,   "Taglines", out->tagline, sizeof(out->tagline));
+    json_array_strings_join(resp,   "Genres",   out->genres,  sizeof(out->genres));
+    json_array_obj_names_join(resp, "Studios",  out->studios, sizeof(out->studios));
+    parse_people(resp, out->people, JF_MAX_PEOPLE, &out->n_people);
+    json_get_string(resp, "SeriesId",   out->series_id,   sizeof(out->series_id));
+    json_get_string(resp, "SeriesName", out->series_name, sizeof(out->series_name));
+    json_get_string(resp, "SeasonId",   out->season_id,   sizeof(out->season_id));
+    out->season_num = json_get_int_in_range(resp, (int)strlen(resp), "ParentIndexNumber", -1);
+    if (!out->series_id[0] || !out->season_id[0]) {
+        // A debrid episode's reply is ~400 KB -- every version and all their
+        // streams -- and is cut off at the buffer before SeriesId / SeasonId
+        // (log 2026-09-27: "body TRUNCATED 396090 -> 393215").  Ask again
+        // through the items query, which leaves the versions out.
+        static char small[24 * 1024];
+        char u2[512];
+        snprintf(u2, sizeof u2, "%s/Users/%s/Items?Ids=%s&Recursive=true", g_server, g_userid, item_id);
+        if (http_request(0, u2, NULL, g_token, small, sizeof small) == 200) {
+            if (!out->series_id[0])   json_get_string(small, "SeriesId",   out->series_id,   sizeof(out->series_id));
+            if (!out->series_name[0]) json_get_string(small, "SeriesName", out->series_name, sizeof(out->series_name));
+            if (!out->season_id[0])   json_get_string(small, "SeasonId",   out->season_id,   sizeof(out->season_id));
+            if (out->season_num < 0)
+                out->season_num = json_get_int_in_range(small, (int)strlen(small), "ParentIndexNumber", -1);
+        }
+    }
+
+    parse_media_streams(resp, out->video_info, sizeof(out->video_info),
+                              out->audio_info, sizeof(out->audio_info));
+    jellyfin_parse_item_identity(resp, &out->identity);
+    // Only UserData carries IsFavorite.
+    out->is_favourite = strstr(resp, "\"IsFavorite\":true") != NULL;
+    plog("item_detail: ok");
+    return true;
+}
+
+void jellyfin_stop_transcode(const char *session_id) {
+    if (!g_server[0] || !session_id || !session_id[0]) return;
+    char url[512];
+    char device_id[192];
+    url_encode_query(jf_device_id(), device_id, sizeof(device_id));
+    snprintf(url, sizeof(url),
+        "%s/Videos/ActiveEncodings?deviceId=%s&playSessionId=%s",
+        g_server, device_id, session_id);
+    // A LOCAL buffer, not the shared responseBuffer.  This runs on the music
+    // stream thread -- at every track end AND every seek -- while the UI
+    // thread browses into that same global.  http_request's mutex serialises
+    // the calls but says nothing about what the callers do with the buffer
+    // afterwards, so the two can shred each other's results.  The response
+    // here is a 204 with no body; 128 bytes is generous.
+    char resp[128];
+    int status = http_request(HTTP_DELETE, url, NULL, g_token,
+                              resp, sizeof resp);
+    char buf[80];
+    snprintf(buf, sizeof(buf), "stop_transcode: http %d session=%s", status, session_id);
+    plog(buf);
+}
+
+bool jellyfin_get_playback_info(const char *item_id,
+                                const char *media_source_id,
+                                char *out_session_id, int out_len,
+                                unsigned *out_total_secs,
+                                JFMediaSources *out_sources,
+                                JFMediaSource *out_selected,
+                                bool auto_open_live_stream) {
+    if (out_total_secs) *out_total_secs = 0;
+    if (out_sources) memset(out_sources, 0, sizeof(*out_sources));
+    if (out_selected) memset(out_selected, 0, sizeof(*out_selected));
+    if (!g_server[0] || !g_userid[0] || !g_token[0]) {
+        plog("playbackinfo: missing server/user/token");
+        return false;
+    }
+
+    // 1080p (Alpha): the device profile the server sees must permit the higher
+    // resolution/level/bitrate, otherwise it caps the transcode back to 720p
+    // baseline regardless of the stream URL.  Gated — OFF sends the exact
+    // shipped 720p profile below.
+    const bool hd = hd1080_enabled();
+    // Surround 5.1 (Alpha): same story for audio — the profile must advertise
+    // AC-3 and 6 channels or the server silently downgrades to stereo MP3.
+    // Gated — OFF sends the exact shipped stereo blobs.  In "DTS" mode the
+    // profile additionally advertises dts, which is what lets the server
+    // stream-copy a DTS / DTS-HD / DTS:X track (see the body_*_dts blobs).
+    const bool surround = surround_enabled();
+    const bool hd_pref = surround_hd_preferred();
+
+    char source_param[320] = "";
+    if (media_source_id && media_source_id[0]) {
+        char encoded[288];
+        url_encode_query(media_source_id, encoded, sizeof(encoded));
+        snprintf(source_param, sizeof(source_param), "&MediaSourceId=%s", encoded);
+    }
+
+    char url[1024];
+    snprintf(url, sizeof(url),
+        "%s/Items/%s/PlaybackInfo"
+        "?UserId=%s"
+        "&MaxStreamingBitrate=%u"
+        "&StartTimeTicks=0"
+        "&AutoOpenLiveStream=%s"
+        "%s",
+        g_server, item_id, g_userid, hd ? 10000000u : 8000000u,
+        auto_open_live_stream ? "true" : "false",
+        source_param);
+
+    // Stored in read-only data — avoids putting ~700 bytes on the stack.
+    static const char body_sd[] =
+        "{\"DeviceProfile\":{"
+          "\"Name\":\"PS3\","
+          "\"MaxStreamingBitrate\":8000000,"
+          "\"MaxStaticBitrate\":8000000,"
+          "\"MusicStreamingTranscodingBitrate\":192000,"
+          "\"DirectPlayProfiles\":[],"
+          "\"TranscodingProfiles\":[{"
+            "\"Type\":\"Video\","
+            "\"Container\":\"ts\","
+            "\"VideoCodec\":\"h264\","
+            "\"AudioCodec\":\"mp3\","
+            "\"Protocol\":\"http\","
+            "\"Context\":\"Streaming\","
+            "\"MaxAudioChannels\":\"2\""
+          "}],"
+          "\"CodecProfiles\":[{"
+            "\"Type\":\"Video\","
+            "\"Codec\":\"h264\","
+            "\"Conditions\":["
+              "{\"Condition\":\"EqualsAny\",\"Property\":\"VideoProfile\","
+               "\"Value\":\"baseline\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoLevel\","
+               "\"Value\":\"31\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"Width\","
+               "\"Value\":\"1280\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"Height\","
+               "\"Value\":\"720\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoBitrate\","
+               "\"Value\":\"4000000\",\"IsRequired\":true}"
+            "]"
+          "},{"
+            "\"Type\":\"VideoAudio\","
+            "\"Codec\":\"mp3\","
+            "\"Conditions\":["
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"AudioChannels\","
+               "\"Value\":\"2\",\"IsRequired\":false},"
+              "{\"Condition\":\"Equals\",\"Property\":\"AudioSampleRate\","
+               "\"Value\":\"48000\",\"IsRequired\":false}"
+            "]"
+          "}],"
+          "\"ContainerProfiles\":[],"
+          // TEXT subtitles are delivered as a separate file and drawn on the
+          // console (player/subtitles.cpp).  Method=Encode burns them into
+          // the video, which forces a transcode and throws away the
+          // stream-copy path -- and with it the source's lossless TrueHD /
+          // DTS-HD MA track.  External keeps the video copied untouched, so
+          // subtitles and lossless audio stop being mutually exclusive.
+          // pgssub and dvdsub are BITMAPS, cannot become text, and still
+          // need the burn-in until there is an RLE decoder and an overlay.
+          "\"SubtitleProfiles\":["
+            "{\"Format\":\"subrip\",\"Method\":\"External\"},"
+            "{\"Format\":\"srt\",\"Method\":\"External\"},"
+            "{\"Format\":\"ass\",\"Method\":\"External\"},"
+            "{\"Format\":\"ssa\",\"Method\":\"External\"},"
+            "{\"Format\":\"vtt\",\"Method\":\"External\"},"
+            "{\"Format\":\"pgssub\",\"Method\":\"Encode\"},"
+            "{\"Format\":\"dvdsub\",\"Method\":\"Encode\"}"
+          "]"
+        "}}";
+
+    // 1080p (Alpha) device profile: identical to body_sd except the video
+    // CodecProfile ceiling is raised to High / level 4.2 / 1920×1080 / 10Mbps
+    // and the streaming/static bitrate caps follow.  See hd1080.h.
+    static const char body_hd[] =
+        "{\"DeviceProfile\":{"
+          "\"Name\":\"PS3\","
+          "\"MaxStreamingBitrate\":10000000,"
+          "\"MaxStaticBitrate\":10000000,"
+          "\"MusicStreamingTranscodingBitrate\":192000,"
+          "\"DirectPlayProfiles\":[],"
+          "\"TranscodingProfiles\":[{"
+            "\"Type\":\"Video\","
+            "\"Container\":\"ts\","
+            "\"VideoCodec\":\"h264\","
+            "\"AudioCodec\":\"mp3\","
+            "\"Protocol\":\"http\","
+            "\"Context\":\"Streaming\","
+            "\"MaxAudioChannels\":\"2\""
+          "}],"
+          "\"CodecProfiles\":[{"
+            "\"Type\":\"Video\","
+            "\"Codec\":\"h264\","
+            "\"Conditions\":["
+              "{\"Condition\":\"EqualsAny\",\"Property\":\"VideoProfile\","
+               "\"Value\":\"high|main|baseline\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoLevel\","
+               "\"Value\":\"42\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"Width\","
+               "\"Value\":\"1920\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"Height\","
+               "\"Value\":\"1080\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoBitrate\","
+               "\"Value\":\"10000000\",\"IsRequired\":true}"
+            "]"
+          "},{"
+            "\"Type\":\"VideoAudio\","
+            "\"Codec\":\"mp3\","
+            "\"Conditions\":["
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"AudioChannels\","
+               "\"Value\":\"2\",\"IsRequired\":false},"
+              "{\"Condition\":\"Equals\",\"Property\":\"AudioSampleRate\","
+               "\"Value\":\"48000\",\"IsRequired\":false}"
+            "]"
+          "}],"
+          "\"ContainerProfiles\":[],"
+          "\"SubtitleProfiles\":["
+            "{\"Format\":\"subrip\",\"Method\":\"External\"},"
+            "{\"Format\":\"srt\",\"Method\":\"External\"},"
+            "{\"Format\":\"ass\",\"Method\":\"External\"},"
+            "{\"Format\":\"ssa\",\"Method\":\"External\"},"
+            "{\"Format\":\"vtt\",\"Method\":\"External\"},"
+            "{\"Format\":\"pgssub\",\"Method\":\"Encode\"},"
+            "{\"Format\":\"dvdsub\",\"Method\":\"Encode\"}"
+          "]"
+        "}}";
+
+    // Surround 5.1 (Alpha) blobs: byte-identical to body_sd/body_hd except
+    // the audio negotiation — "AudioCodec":"ac3,mp3" (AC-3 preferred, server
+    // may still fall back to MP3), MaxAudioChannels 6, and a VideoAudio
+    // CodecProfile for ac3 (<= 6 ch) added ahead of the shipped mp3 entry.
+    static const char body_sd_51[] =
+        "{\"DeviceProfile\":{"
+          "\"Name\":\"PS3\","
+          "\"MaxStreamingBitrate\":8000000,"
+          "\"MaxStaticBitrate\":8000000,"
+          "\"MusicStreamingTranscodingBitrate\":192000,"
+          "\"DirectPlayProfiles\":[],"
+          "\"TranscodingProfiles\":[{"
+            "\"Type\":\"Video\","
+            "\"Container\":\"ts\","
+            "\"VideoCodec\":\"h264\","
+            "\"AudioCodec\":\"ac3,mp3\","
+            "\"Protocol\":\"http\","
+            "\"Context\":\"Streaming\","
+            "\"MaxAudioChannels\":\"6\""
+          "}],"
+          "\"CodecProfiles\":[{"
+            "\"Type\":\"Video\","
+            "\"Codec\":\"h264\","
+            "\"Conditions\":["
+              "{\"Condition\":\"EqualsAny\",\"Property\":\"VideoProfile\","
+               "\"Value\":\"baseline\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoLevel\","
+               "\"Value\":\"31\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"Width\","
+               "\"Value\":\"1280\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"Height\","
+               "\"Value\":\"720\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoBitrate\","
+               "\"Value\":\"4000000\",\"IsRequired\":true}"
+            "]"
+          "},{"
+            "\"Type\":\"VideoAudio\","
+            "\"Codec\":\"ac3\","
+            "\"Conditions\":["
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"AudioChannels\","
+               "\"Value\":\"6\",\"IsRequired\":false},"
+              "{\"Condition\":\"Equals\",\"Property\":\"AudioSampleRate\","
+               "\"Value\":\"48000\",\"IsRequired\":false}"
+            "]"
+          "},{"
+            "\"Type\":\"VideoAudio\","
+            "\"Codec\":\"mp3\","
+            "\"Conditions\":["
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"AudioChannels\","
+               "\"Value\":\"2\",\"IsRequired\":false},"
+              "{\"Condition\":\"Equals\",\"Property\":\"AudioSampleRate\","
+               "\"Value\":\"48000\",\"IsRequired\":false}"
+            "]"
+          "}],"
+          "\"ContainerProfiles\":[],"
+          "\"SubtitleProfiles\":["
+            "{\"Format\":\"subrip\",\"Method\":\"External\"},"
+            "{\"Format\":\"srt\",\"Method\":\"External\"},"
+            "{\"Format\":\"ass\",\"Method\":\"External\"},"
+            "{\"Format\":\"ssa\",\"Method\":\"External\"},"
+            "{\"Format\":\"vtt\",\"Method\":\"External\"},"
+            "{\"Format\":\"pgssub\",\"Method\":\"Encode\"},"
+            "{\"Format\":\"dvdsub\",\"Method\":\"Encode\"}"
+          "]"
+        "}}";
+
+    static const char body_hd_51[] =
+        "{\"DeviceProfile\":{"
+          "\"Name\":\"PS3\","
+          "\"MaxStreamingBitrate\":10000000,"
+          "\"MaxStaticBitrate\":10000000,"
+          "\"MusicStreamingTranscodingBitrate\":192000,"
+          "\"DirectPlayProfiles\":[],"
+          "\"TranscodingProfiles\":[{"
+            "\"Type\":\"Video\","
+            "\"Container\":\"ts\","
+            "\"VideoCodec\":\"h264\","
+            "\"AudioCodec\":\"ac3,mp3\","
+            "\"Protocol\":\"http\","
+            "\"Context\":\"Streaming\","
+            "\"MaxAudioChannels\":\"6\""
+          "}],"
+          "\"CodecProfiles\":[{"
+            "\"Type\":\"Video\","
+            "\"Codec\":\"h264\","
+            "\"Conditions\":["
+              "{\"Condition\":\"EqualsAny\",\"Property\":\"VideoProfile\","
+               "\"Value\":\"high|main|baseline\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoLevel\","
+               "\"Value\":\"42\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"Width\","
+               "\"Value\":\"1920\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"Height\","
+               "\"Value\":\"1080\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoBitrate\","
+               "\"Value\":\"10000000\",\"IsRequired\":true}"
+            "]"
+          "},{"
+            "\"Type\":\"VideoAudio\","
+            "\"Codec\":\"ac3\","
+            "\"Conditions\":["
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"AudioChannels\","
+               "\"Value\":\"6\",\"IsRequired\":false},"
+              "{\"Condition\":\"Equals\",\"Property\":\"AudioSampleRate\","
+               "\"Value\":\"48000\",\"IsRequired\":false}"
+            "]"
+          "},{"
+            "\"Type\":\"VideoAudio\","
+            "\"Codec\":\"mp3\","
+            "\"Conditions\":["
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"AudioChannels\","
+               "\"Value\":\"2\",\"IsRequired\":false},"
+              "{\"Condition\":\"Equals\",\"Property\":\"AudioSampleRate\","
+               "\"Value\":\"48000\",\"IsRequired\":false}"
+            "]"
+          "}],"
+          "\"ContainerProfiles\":[],"
+          "\"SubtitleProfiles\":["
+            "{\"Format\":\"subrip\",\"Method\":\"External\"},"
+            "{\"Format\":\"srt\",\"Method\":\"External\"},"
+            "{\"Format\":\"ass\",\"Method\":\"External\"},"
+            "{\"Format\":\"ssa\",\"Method\":\"External\"},"
+            "{\"Format\":\"vtt\",\"Method\":\"External\"},"
+            "{\"Format\":\"pgssub\",\"Method\":\"Encode\"},"
+            "{\"Format\":\"dvdsub\",\"Method\":\"Encode\"}"
+          "]"
+        "}}";
+
+    // Surround "HD" mode blobs: byte-identical to body_sd_51/body_hd_51
+    // except that the profile also ADVERTISES dts and truehd, which is what
+    // makes the server willing to stream-COPY a DTS / DTS-HD MA / DTS:X or a
+    // TrueHD / Atmos track instead of transcoding it (docs/dts-hd.md §5,
+    // docs/dolby-truehd.md §4).  Two deliberate details:
+    //   * the HD codecs are listed LAST in the transcoding AudioCodec list.
+    //     Copy eligibility only asks whether the codec is in the list, but if
+    //     the server does decide to transcode, first-listed is what it reaches
+    //     for — and ac3 is the one that must win there: ffmpeg's dts
+    //     ENcoder is experimental and its truehd encoder cannot do 7.1.
+    //   * the channel ceiling is 8, not 6 — both in the HD CodecProfile and
+    //     in the transcoding profile.  DTS-HD MA, DTS:X and TrueHD tracks are
+    //     routinely 7.1, and a 6-channel ceiling would refuse to copy them;
+    //     copying them is right, because TrueHD then plays as a real 7.1
+    //     program and what this app decodes out of a DTS-HD track is its 5.1
+    //     core whatever the extension carries.  The stream URL raises its own
+    //     MaxAudioChannels to match (player_session.cpp).
+    static const char body_sd_hd[] =
+        "{\"DeviceProfile\":{"
+          "\"Name\":\"PS3\","
+          "\"MaxStreamingBitrate\":8000000,"
+          "\"MaxStaticBitrate\":8000000,"
+          "\"MusicStreamingTranscodingBitrate\":192000,"
+          "\"DirectPlayProfiles\":[],"
+          "\"TranscodingProfiles\":[{"
+            "\"Type\":\"Video\","
+            "\"Container\":\"ts\","
+            "\"VideoCodec\":\"h264\","
+            "\"AudioCodec\":\"ac3,mp3,dts,truehd\","
+            "\"Protocol\":\"http\","
+            "\"Context\":\"Streaming\","
+            "\"MaxAudioChannels\":\"8\""
+          "}],"
+          "\"CodecProfiles\":[{"
+            "\"Type\":\"Video\","
+            "\"Codec\":\"h264\","
+            "\"Conditions\":["
+              "{\"Condition\":\"EqualsAny\",\"Property\":\"VideoProfile\","
+               "\"Value\":\"baseline\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoLevel\","
+               "\"Value\":\"31\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"Width\","
+               "\"Value\":\"1280\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"Height\","
+               "\"Value\":\"720\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoBitrate\","
+               "\"Value\":\"4000000\",\"IsRequired\":true}"
+            "]"
+          "},{"
+            "\"Type\":\"VideoAudio\","
+            "\"Codec\":\"dts,truehd\","
+            "\"Conditions\":["
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"AudioChannels\","
+               "\"Value\":\"8\",\"IsRequired\":false}"
+            "]"
+          "},{"
+          "\"Type\":\"VideoAudio\","
+            "\"Codec\":\"ac3\","
+            "\"Conditions\":["
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"AudioChannels\","
+               "\"Value\":\"6\",\"IsRequired\":false},"
+              "{\"Condition\":\"Equals\",\"Property\":\"AudioSampleRate\","
+               "\"Value\":\"48000\",\"IsRequired\":false}"
+            "]"
+          "},{"
+            "\"Type\":\"VideoAudio\","
+            "\"Codec\":\"mp3\","
+            "\"Conditions\":["
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"AudioChannels\","
+               "\"Value\":\"2\",\"IsRequired\":false},"
+              "{\"Condition\":\"Equals\",\"Property\":\"AudioSampleRate\","
+               "\"Value\":\"48000\",\"IsRequired\":false}"
+            "]"
+          "}],"
+          "\"ContainerProfiles\":[],"
+          "\"SubtitleProfiles\":["
+            "{\"Format\":\"subrip\",\"Method\":\"External\"},"
+            "{\"Format\":\"srt\",\"Method\":\"External\"},"
+            "{\"Format\":\"ass\",\"Method\":\"External\"},"
+            "{\"Format\":\"ssa\",\"Method\":\"External\"},"
+            "{\"Format\":\"vtt\",\"Method\":\"External\"},"
+            "{\"Format\":\"pgssub\",\"Method\":\"Encode\"},"
+            "{\"Format\":\"dvdsub\",\"Method\":\"Encode\"}"
+          "]"
+        "}}";
+
+    static const char body_hd_hd[] =
+        "{\"DeviceProfile\":{"
+          "\"Name\":\"PS3\","
+          "\"MaxStreamingBitrate\":10000000,"
+          "\"MaxStaticBitrate\":10000000,"
+          "\"MusicStreamingTranscodingBitrate\":192000,"
+          "\"DirectPlayProfiles\":[],"
+          "\"TranscodingProfiles\":[{"
+            "\"Type\":\"Video\","
+            "\"Container\":\"ts\","
+            "\"VideoCodec\":\"h264\","
+            "\"AudioCodec\":\"ac3,mp3,dts,truehd\","
+            "\"Protocol\":\"http\","
+            "\"Context\":\"Streaming\","
+            "\"MaxAudioChannels\":\"8\""
+          "}],"
+          "\"CodecProfiles\":[{"
+            "\"Type\":\"Video\","
+            "\"Codec\":\"h264\","
+            "\"Conditions\":["
+              "{\"Condition\":\"EqualsAny\",\"Property\":\"VideoProfile\","
+               "\"Value\":\"high|main|baseline\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoLevel\","
+               "\"Value\":\"42\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"Width\","
+               "\"Value\":\"1920\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"Height\","
+               "\"Value\":\"1080\",\"IsRequired\":true},"
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoBitrate\","
+               "\"Value\":\"10000000\",\"IsRequired\":true}"
+            "]"
+          "},{"
+            "\"Type\":\"VideoAudio\","
+            "\"Codec\":\"dts,truehd\","
+            "\"Conditions\":["
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"AudioChannels\","
+               "\"Value\":\"8\",\"IsRequired\":false}"
+            "]"
+          "},{"
+          "\"Type\":\"VideoAudio\","
+            "\"Codec\":\"ac3\","
+            "\"Conditions\":["
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"AudioChannels\","
+               "\"Value\":\"6\",\"IsRequired\":false},"
+              "{\"Condition\":\"Equals\",\"Property\":\"AudioSampleRate\","
+               "\"Value\":\"48000\",\"IsRequired\":false}"
+            "]"
+          "},{"
+            "\"Type\":\"VideoAudio\","
+            "\"Codec\":\"mp3\","
+            "\"Conditions\":["
+              "{\"Condition\":\"LessThanEqual\",\"Property\":\"AudioChannels\","
+               "\"Value\":\"2\",\"IsRequired\":false},"
+              "{\"Condition\":\"Equals\",\"Property\":\"AudioSampleRate\","
+               "\"Value\":\"48000\",\"IsRequired\":false}"
+            "]"
+          "}],"
+          "\"ContainerProfiles\":[],"
+          "\"SubtitleProfiles\":["
+            "{\"Format\":\"subrip\",\"Method\":\"External\"},"
+            "{\"Format\":\"srt\",\"Method\":\"External\"},"
+            "{\"Format\":\"ass\",\"Method\":\"External\"},"
+            "{\"Format\":\"ssa\",\"Method\":\"External\"},"
+            "{\"Format\":\"vtt\",\"Method\":\"External\"},"
+            "{\"Format\":\"pgssub\",\"Method\":\"Encode\"},"
+            "{\"Format\":\"dvdsub\",\"Method\":\"Encode\"}"
+          "]"
+        "}}";
+
+    const char *body;
+    if (surround && hd_pref) body = hd ? body_hd_hd : body_sd_hd;
+    else if (surround)        body = hd ? body_hd_51  : body_sd_51;
+    else                      body = hd ? body_hd     : body_sd;
+
+    int status = http_request(1, url, body, g_token, responseBuffer, RESPONSE_SIZE);
+    if (status != 200) {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "playbackinfo: http status %d", status);
+        plog(buf);
+        char errbuf[280];
+        snprintf(errbuf, sizeof(errbuf), "playbackinfo_err: %.256s", responseBuffer);
+        plog(errbuf);
+        return false;
+    }
+
+    // Media duration (RunTimeTicks is in 100-ns units → 10,000,000 ticks/sec).
+    if (out_sources)
+        jellyfin_parse_media_sources(responseBuffer, out_sources);
+
+    JFMediaSource selected;
+    bool have_selected = jellyfin_parse_selected_media_source(
+        responseBuffer, media_source_id, &selected);
+    if (out_selected && have_selected) *out_selected = selected;
+
+    if (out_total_secs) {
+        // A top-level search sees the first source's RunTimeTicks.  Prefer the
+        // requested/opened source so switching versions also switches runtime.
+        if (have_selected && selected.runtime_secs > 0)
+            *out_total_secs = selected.runtime_secs;
+        else {
+            double ticks = json_get_double(responseBuffer, "RunTimeTicks", 0.0);
+            if (ticks > 0.0) *out_total_secs = (unsigned)(ticks / 10000000.0);
+        }
+        char buf[64];
+        snprintf(buf, sizeof(buf), "playbackinfo: runtime=%us", *out_total_secs);
+        plog(buf);
+    }
+
+    if (!json_get_string(responseBuffer, "PlaySessionId", out_session_id, out_len)) {
+        plog("playbackinfo: PlaySessionId not found in response");
+        return false;
+    }
+
+    char buf[96];
+    snprintf(buf, sizeof(buf), "playbackinfo: session=%s", out_session_id);
+    plog(buf);
+    return true;
+}
+
+bool jellyfin_get_play_session_id(const char *item_id,
+                                   char *out_session_id, int out_len,
+                                   unsigned *out_total_secs) {
+    return jellyfin_get_playback_info(item_id, NULL,
+                                      out_session_id, out_len,
+                                      out_total_secs, NULL, NULL, true);
+}
+
+bool jellyfin_fetch_media_sources_buf(const char *item_id, JFMediaSources *out,
+                                      char *buf, int cap) {
+    if (!out || !buf || cap <= 0) return false;
+    memset(out, 0, sizeof(*out));
+    if (!g_server[0] || !g_userid[0] || !g_token[0]) return false;
+    char url[768];
+    snprintf(url, sizeof(url), "%s/Users/%s/Items/%s?Fields=MediaSources,MediaStreams",
+             g_server, g_userid, item_id);
+    const int status = http_request(HTTP_GET, url, NULL, g_token, buf, cap);
+    return status == 200 && jellyfin_parse_media_sources(buf, out) > 0;
+}
+
+bool jellyfin_fetch_media_sources(const char *item_id, JFMediaSources *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!g_server[0] || !g_userid[0] || !g_token[0]) return false;
+
+    char url[768];
+    snprintf(url, sizeof(url),
+             "%s/Users/%s/Items/%s?Fields=MediaSources,MediaStreams",
+             g_server, g_userid, item_id);
+    int status = http_request(HTTP_GET, url, NULL, g_token,
+                              responseBuffer, RESPONSE_SIZE);
+    if (status == 200 && jellyfin_parse_media_sources(responseBuffer, out) > 0) {
+        char b[72];
+        snprintf(b, sizeof(b), "media_sources: item dto count=%d",
+                 out->n_sources);
+        plog(b);
+        return true;
+    }
+    // Only Gelato's placeholder: its stream lookup found nothing for this
+    // title.  PlaybackInfo would only list the same placeholder again.
+    if (status == 200 && out->n_placeholder > 0) {
+        plog("media_sources: only Gelato's placeholder (no streams found)");
+        return false;
+    }
+
+    // Some older servers omit MediaSources from BaseItemDto even when asked.
+    // Listing does not need to resolve/open a remote source, so keep auto-open
+    // false and avoid holding a plugin stream while the user reads the page.
+    char session[64] = "";
+    bool ok = jellyfin_get_playback_info(item_id, NULL, session,
+                                         sizeof(session), NULL, out, NULL,
+                                         false);
+    char b[80];
+    snprintf(b, sizeof(b), "media_sources: playback fallback count=%d ok=%d",
+             out->n_sources, ok ? 1 : 0);
+    plog(b);
+    return ok && out->n_sources > 0;
+}

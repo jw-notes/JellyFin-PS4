@@ -1,0 +1,13 @@
+# Local build output, logs and development history
+build/
+logs/
+dist/*
+!dist/v1.09/
+
+# Large third-party toolchains (re-downloadable)
+*.tar.gz
+tools/OpenOrbis/
+tools/pacbrew-base-107/
+tools/ps4-portlibs-107/
+tools/llvm-local/
+tools/lld.deb

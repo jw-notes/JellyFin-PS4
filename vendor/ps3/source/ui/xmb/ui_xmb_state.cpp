@@ -1,0 +1,115 @@
+// XMB tab / item / navigation state — the shared globals declared in
+// ui_visuals.h.  All mutation happens in the xmb/ input handlers.
+
+#include "ui_internal.h"
+#include "i18n.h"
+
+// Only the three fixed app screens are seeded here.  Every library tab from
+// XMB_TAB_LIB0 up is filled in by xmb_detect_tabs() once the server's Views
+// are known, so the count and the labels come from the user's own library
+// names rather than from this table.
+XMBTab g_tabs[XMB_TAB_COUNT] = {
+    {TRN("Search"),   "?", "", TABKIND_SEARCH,   true},
+    {TRN("Home"),     ">", "", TABKIND_HOME,     true},
+    {TRN("Settings"), "*", "", TABKIND_SETTINGS, true},
+};
+
+// The names Jellyfin gives the libraries it creates, and the app's own tabs.  A tab's label is the
+// library's name as the server has it; tr() turns these into the interface language and leaves any
+// name the user chose alone.  Never read: it is what marks the strings for tools/i18n.py.
+static const char *const k_server_names[] = {
+    TRN("Movies"), TRN("Shows"), TRN("TV Shows"), TRN("Music"), TRN("Playlists"), TRN("Collections"),
+    TRN("Live TV"), TRN("Media"), TRN("Library"),
+};
+const char *const *xmb_server_names(int *n) { *n = (int)(sizeof k_server_names / sizeof k_server_names[0]); return k_server_names; }
+
+XMBTabKind xmb_kind(int tab) {
+    if (tab < 0 || tab >= XMB_TAB_COUNT) return TABKIND_GENERIC;
+    return g_tabs[tab].kind;
+}
+
+int xmb_tab_of_kind(XMBTabKind k) {
+    for (int t = 0; t < XMB_TAB_COUNT; t++)
+        if (g_tabs[t].enabled && g_tabs[t].kind == k) return t;
+    return -1;
+}
+
+// Display order: Search, Home, the libraries in the order the server listed
+// them, then Settings.  Settings sits at index 2 for the benefit of the
+// compile-time constant but must render last, so it is appended, not indexed.
+int xmb_tab_order(int *order) {
+    int n = 0;
+    if (g_tabs[XMB_TAB_SEARCH].enabled) order[n++] = XMB_TAB_SEARCH;
+    if (g_tabs[XMB_TAB_HOME].enabled)   order[n++] = XMB_TAB_HOME;
+    for (int t = XMB_TAB_LIB0; t < XMB_TAB_COUNT; t++)
+        if (g_tabs[t].enabled) order[n++] = t;
+    if (g_tabs[XMB_TAB_SETTINGS].enabled) order[n++] = XMB_TAB_SETTINGS;
+    return n;
+}
+
+XMBItem g_items[XMB_TAB_COUNT][XMB_ITEMS_MAX];
+int     g_item_count[XMB_TAB_COUNT];
+bool    g_items_loaded[XMB_TAB_COUNT];
+
+// UI navigation state
+int  g_active_tab = XMB_TAB_HOME;
+int  g_sel        = 0;
+int  g_scroll_top = 0;
+
+// Triangle info overlay sets this so its closing press doesn't re-trigger.
+u64 g_info_cooldown_until = 0;
+
+// TV sub-screen state (Series→Seasons→Episodes)
+int  g_tv_depth       = 0;
+char g_tv_series_id[64];
+char g_tv_series_name[128];
+char g_tv_season_id[64];
+char g_tv_season_name[64];
+XMBItem g_tv_sub_items[XMB_ITEMS_MAX];
+int     g_tv_sub_count  = 0;
+int     g_tv_sub_sel    = 0;
+int     g_tv_sub_scroll = 0;
+
+// Music tab state (sub-tab header + Artist/Genre→Albums sub-screen)
+int  g_music_subtab = 0;              // MUSIC_ST_* — which content shows
+bool g_music_header = false;          // d-pad focus is on the sub-tab row
+int  g_music_depth  = 0;              // 0 = sub-tab root, 1 = albums-of-parent
+char g_music_parent_id[64];
+char g_music_parent_name[128];
+XMBItem g_music_sub_items[XMB_ITEMS_MAX];
+int     g_music_sub_count  = 0;
+int     g_music_sub_sel    = 0;
+int     g_music_sub_scroll = 0;
+int     g_music_sub_total  = 0;
+
+// Collections sub-screen state (Collection→Movies)
+int  g_col_depth      = 0;
+char g_col_id[64];
+char g_col_name[128];
+XMBItem g_col_sub_items[XMB_ITEMS_MAX];
+int     g_col_sub_count  = 0;
+int     g_col_sub_sel    = 0;
+int     g_col_sub_scroll = 0;
+
+// Pagination state — sliding window per main tab
+int g_tab_start[XMB_TAB_COUNT];
+int g_tab_total[XMB_TAB_COUNT];
+
+// Pagination state for TV and collections sub-lists
+int g_tv_sub_start  = 0;
+int g_tv_sub_total  = 0;
+int g_col_sub_start = 0;
+int g_col_sub_total = 0;
+
+// Jump bar state
+bool g_jumpbar_active = false;
+int  g_jumpbar_sel    = 1;
+char g_tab_name_filter[XMB_TAB_COUNT][4];
+
+// Settings tab state
+int   g_settings_sel      = 0;
+bool  g_settings_confirm  = false;
+int   g_settings_cat      = -1;
+int   g_settings_catsel   = 0;
+bool  g_overscan_calib    = false;
+float g_overscan_calib_prev = 0.0f;

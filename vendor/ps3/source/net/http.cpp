@@ -1,0 +1,810 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <malloc.h>   // memalign -- libnet pool alignment
+#include <unistd.h>   // usleep: waiting for the shared reply buffer
+
+#include "plog.h"   // truncated-body warning
+
+#include <ppu-types.h>
+#include <net/net.h>
+#include <net/socket.h>
+#include <net/poll.h>
+#include <net/netctl.h>
+#include <netinet/in.h>
+#include <sys/time.h>
+#include <sysmodule/sysmodule.h>
+#include <sys/mutex.h>
+#include <sys/thread.h>
+
+#include "http.h"
+#include "https_client.h"
+#include "jf_paths.h"
+
+// Jellyfin-layer hooks (api_auth.cpp): the per-install device id sent in the
+// MediaBrowser identity, and the expired-session flag raised on any
+// authenticated 401 so the UI can bounce back to the login screen.
+extern const char *jf_device_id(void);
+extern volatile bool g_auth_expired;
+
+static char s_raw_buf[RESPONSE_SIZE + 4096];
+
+// Serializes resolve + connect, the part of the net stack that is not
+// reentrant (see http_fetch_binary).  Only that part: holding it for a whole
+// request would make the UI wait behind a 24 s search or a 60 s Live TV open.
+// Until 10-11 this lock never existed -- the attr was memset to 0, which lv2
+// rejects -- so every thread shared s_raw_buf with nothing in between.
+static sys_mutex_t s_http_mtx;
+static bool        s_http_mtx_ok = false;
+
+// Response staging.  The static buffer serves the usual single request; a
+// request that finds it in use gets a heap copy rather than writing into
+// another thread's reply.
+static volatile int s_raw_busy = 0;
+#define RAW_CAP ((int)sizeof(s_raw_buf))
+
+static char *raw_claim(void) {
+    // Another request is reading into the static buffer.  Wait for it, briefly,
+    // rather than ask a nearly full heap for 388 KB in the middle of playback
+    // (the overlap there is a progress report or a segment lookup: milliseconds).
+    // A long holder -- the details page's background PlaybackInfo, 13-15 s on a
+    // debrid server, or a search -- is not worth waiting for: this used to wait
+    // 2 s, so "Back to Season" (two requests on the render thread) froze for 4 s
+    // before either request was even sent.
+    for (int i = 0; i < 10; i++) {
+        if (__sync_lock_test_and_set(&s_raw_busy, 1) == 0) return s_raw_buf;
+        usleep(2000);
+    }
+    return (char *)malloc(RAW_CAP);
+}
+
+static void raw_release(char *b) {
+    if (b == s_raw_buf) __sync_lock_release(&s_raw_busy);
+    else free(b);
+}
+
+// Bounds so a slow/unreachable/keep-alive server can never hang us forever.
+#define HTTP_CONNECT_TIMEOUT_MS 5000
+#define HTTP_IO_TIMEOUT_SEC        8
+
+// SO_RCVTIMEO is an IDLE timeout, but on the FIRST read it is really a
+// time-to-first-byte limit, and those are very different budgets.
+//
+// Measured against this user's server (a debrid/AIOStreams-backed library):
+// a browse/tab request answers in 35 ms, but a `searchTerm` query takes
+// 2.5-8.4 s to emit its first byte, varying run to run for the same term.
+// Eight seconds sits right on top of that spread, so search timed out
+// constantly while everything else was nowhere near the limit -- and no
+// rearrangement of the query helps, because Limit, SortBy, Fields and
+// EnableTotalRecordCount were each measured and none of them is what costs
+// the time.
+//
+// So let the FIRST byte wait longer, and go straight back to failing fast on
+// an idle socket the moment any data has arrived. A server that is simply
+// down still fails at connect() in 5 s; this only extends the case where the
+// server accepted the connection and is thinking about it.
+#define HTTP_FIRST_BYTE_TRIES      3   // x HTTP_IO_TIMEOUT_SEC = 24 s
+
+// A Live TV PlaybackInfo opens and probes the channel before it answers, which
+// can take longer than 24 s.  Callers raise the budget around that one request.
+static volatile int s_first_byte_tries = HTTP_FIRST_BYTE_TRIES;
+
+static bool s_wireless = false;
+bool http_net_wireless(void) { return s_wireless; }
+
+void http_set_first_byte_secs(int secs) {
+    int tries = secs > 0 ? (secs + HTTP_IO_TIMEOUT_SEC - 1) / HTTP_IO_TIMEOUT_SEC : 0;
+    s_first_byte_tries = tries > HTTP_FIRST_BYTE_TRIES ? tries : HTTP_FIRST_BYTE_TRIES;
+}
+
+// One cancellable request at a time (see http.h).  s_cx_lock keeps fire's
+// shutdown from landing on a socket number that was closed and reused.
+static volatile int       s_cx_lock  = 0;
+static volatile bool      s_cx_armed = false, s_cx_fired = false;
+static volatile int       s_cx_sock  = -1;
+static sys_ppu_thread_t   s_cx_tid;
+
+static void cx_lock(void)   { while (__sync_lock_test_and_set(&s_cx_lock, 1)) usleep(100); }
+static void cx_unlock(void) { __sync_lock_release(&s_cx_lock); }
+
+static bool cx_mine(void) {
+    if (!s_cx_armed) return false;
+    sys_ppu_thread_t me;
+    return sysThreadGetId(&me) == 0 && me == s_cx_tid;
+}
+
+void http_cancel_arm(void) {
+    cx_lock();
+    sysThreadGetId((sys_ppu_thread_t *)&s_cx_tid);
+    s_cx_fired = false;
+    s_cx_sock  = -1;
+    s_cx_armed = true;
+    cx_unlock();
+}
+
+void http_cancel_disarm(void) {
+    cx_lock();
+    s_cx_armed = false;
+    s_cx_sock  = -1;
+    cx_unlock();
+}
+
+void http_cancel_fire(void) {
+    cx_lock();
+    if (s_cx_armed) {
+        s_cx_fired = true;
+        if (s_cx_sock >= 0) netShutdown(s_cx_sock, SHUT_RDWR);
+    }
+    cx_unlock();
+}
+
+// Register (sock >= 0) or forget (-1) the armed thread's socket.  False when
+// the request was already given up on.
+static bool cx_track(int sock) {
+    if (!cx_mine()) return true;
+    cx_lock();
+    s_cx_sock = sock;
+    const bool fired = s_cx_fired;
+    cx_unlock();
+    return !fired;
+}
+
+static void url_parse(const char *url, char *host, int hsz,
+                      int *port, char *path, int psz) {
+    const char *p = url;
+    bool https = false;
+    if      (strncmp(p, "http://",  7) == 0) p += 7;
+    else if (strncmp(p, "https://", 8) == 0) { p += 8; https = true; }
+    const char *h = p;
+    while (*p && *p != ':' && *p != '/') p++;
+    int hl = p - h;
+    if (hl >= hsz) hl = hsz - 1;
+    if (hl < 0) hl = 0;
+    memcpy(host, h, hl);
+    host[hl] = '\0';
+    *port = https ? 443 : 8096;
+    if (*p == ':') { p++; *port = atoi(p); while (*p && *p != '/') p++; }
+    strncpy(path, *p ? p : "/", psz - 1); path[psz - 1] = '\0';
+}
+
+// -------------------------------------------------------
+// Host resolution — accepts dotted-quad IPs *and* hostnames (DNS), so
+// remote / reverse-proxied servers entered by domain name work.
+// Returns the address in network byte order, or 0 on failure.
+// -------------------------------------------------------
+static bool host_is_ipv4(const char *h) {
+    int dots = 0;
+    for (const char *p = h; *p; p++) {
+        if (*p == '.') dots++;
+        else if (*p < '0' || *p > '9') return false;
+    }
+    return dots == 3;
+}
+
+static u32 resolve_host(const char *host) {
+    if (host_is_ipv4(host)) {
+        unsigned a=0, b=0, c=0, d=0;
+        sscanf(host, "%u.%u.%u.%u", &a, &b, &c, &d);
+        return htonl((a<<24)|(b<<16)|(c<<8)|d);
+    }
+    struct net_hostent *he = netGetHostByName(host);
+    if (he) {
+        u32 *addr_list = (u32*)(u64)he->h_addr_list;
+        if (addr_list && addr_list[0]) {
+            u32 *in = (u32*)(u64)addr_list[0];
+            return *in;   // already network byte order
+        }
+    }
+    return 0;
+}
+
+// -------------------------------------------------------
+// Connect with a bounded timeout, then arm idle read/write timeouts.
+// Returns a connected blocking socket, or -1.  rcvbuf > 0 sets SO_RCVBUF,
+// which has to happen BEFORE netConnect: the window scale is negotiated in
+// the SYN (see stream.cpp's receive-buffer note).
+// -------------------------------------------------------
+static int http_connect(const char *host, int port, int rcvbuf = 0) {
+    u32 ip = resolve_host(host);
+    if (ip == 0) return -1;
+
+    int sock = netSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) return -1;
+    if (rcvbuf > 0)
+        netSetSockOpt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons((u16)port);
+    addr.sin_addr.s_addr = ip;
+
+    // Non-blocking connect so we can bound the wait.
+    int nb = 1;
+    netSetSockOpt(sock, SOL_SOCKET, SO_NBIO, &nb, sizeof(nb));
+
+    int cr = netConnect(sock, (struct sockaddr*)&addr, sizeof(addr));
+    if (cr < 0) {
+        struct pollfd pfd;
+        pfd.fd = sock; pfd.events = POLLOUT; pfd.revents = 0;
+        int pr = netPoll(&pfd, 1, HTTP_CONNECT_TIMEOUT_MS);
+        if (pr <= 0 || !(pfd.revents & POLLOUT)) { netClose(sock); return -1; }
+        int soerr = 0; socklen_t sl = sizeof(soerr);
+        if (netGetSockOpt(sock, SOL_SOCKET, SO_ERROR, &soerr, &sl) < 0 || soerr != 0) {
+            netClose(sock); return -1;
+        }
+    }
+
+    // Back to blocking, with idle timeouts on both directions.
+    nb = 0;
+    netSetSockOpt(sock, SOL_SOCKET, SO_NBIO, &nb, sizeof(nb));
+    struct timeval tv; tv.tv_sec = HTTP_IO_TIMEOUT_SEC; tv.tv_usec = 0;
+    netSetSockOpt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    netSetSockOpt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    return sock;
+}
+
+// The net stack's one lock, for code that opens sockets of its own (wake-on-LAN,
+// server discovery): socket setup there is not reentrant either.
+void http_net_lock(void)   { if (s_http_mtx_ok) sysMutexLock(s_http_mtx, 0); }
+void http_net_unlock(void) { if (s_http_mtx_ok) sysMutexUnlock(s_http_mtx); }
+
+static int http_connect_locked(const char *host, int port, int rcvbuf = 0) {
+    if (s_http_mtx_ok) sysMutexLock(s_http_mtx, 0);
+    const int sock = http_connect(host, port, rcvbuf);
+    if (s_http_mtx_ok) sysMutexUnlock(s_http_mtx);
+    return sock;
+}
+
+// Returns true only when every byte went out.
+//
+// It used to return void and `break` on failure, which made a half-sent
+// request look exactly like a sent one.  That is worse than it sounds for a
+// POST: the server has the headers, so it sits waiting for the Content-Length
+// bytes that will never arrive, and the client sits waiting for a response
+// the server will not send until it gives up on the body.  Kestrel gives up
+// via MinRequestBodyDataRate after a five-second grace and answers 500 --
+// which is exactly the "playstate: http=500" this client was logging while
+// the music thread sat blocked behind it.
+static bool send_all(int sock, const char *buf, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = netSend(sock, buf + sent, len - sent, 0);
+        if (n <= 0) return false;
+        sent += n;
+    }
+    return true;
+}
+
+// Case-insensitive substring search over a fixed-length region (needle is lowercase).
+static const char *ci_find(const char *hay, int hlen, const char *needle) {
+    int nlen = (int)strlen(needle);
+    for (int i = 0; i + nlen <= hlen; i++) {
+        int j = 0;
+        for (; j < nlen; j++) {
+            char a = hay[i + j];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (a != needle[j]) break;
+        }
+        if (j == nlen) return hay + i;
+    }
+    return NULL;
+}
+
+// Decode a Transfer-Encoding: chunked body in place. Returns decoded length.
+static int dechunk(char *body, int len) {
+    // A body announced as chunked that does not start with a chunk-size line
+    // is not chunk-framed; decoding it would discard it. Keep it as it is.
+    if (len > 0 && !isxdigit((unsigned char)body[0])) return len;
+    int ri = 0, wi = 0;
+    while (ri < len) {
+        int sz = 0; bool any = false;
+        while (ri < len && isxdigit((unsigned char)body[ri])) {
+            int c = tolower((unsigned char)body[ri]);
+            sz = sz * 16 + ((c <= '9') ? c - '0' : c - 'a' + 10);
+            ri++; any = true;
+        }
+        if (!any) break;
+        while (ri + 1 < len && !(body[ri] == '\r' && body[ri+1] == '\n')) ri++;
+        ri += 2;                                  // skip CRLF after size
+        if (sz == 0) break;                       // terminating chunk
+        if (ri + sz > len) sz = len - ri;         // truncation guard
+        memmove(body + wi, body + ri, sz);
+        wi += sz; ri += sz;
+        if (ri + 1 < len && body[ri] == '\r' && body[ri+1] == '\n') ri += 2;
+    }
+    return wi;
+}
+
+// Read a full HTTP response. Returns status code (or -1) and, via out params,
+// the byte offset and length of the (decoded) body within buf. Bounded by the
+// socket's idle timeout, and stops early on Content-Length so keep-alive
+// connections don't stall waiting for a close.
+// Why a read ended the way it did.  Filled in unconditionally (it is a handful
+// of stores), but only ever LOGGED when the result is anomalous -- see the
+// "200 but EMPTY body" case in http_request().  Thumbnail fetches run this
+// path constantly, so a log line per request is not acceptable; a log line per
+// impossible-looking result is.
+struct RespDiag {
+    int  total;         // bytes read from the socket in all
+    int  header_end;    // offset of the body, -1 if headers never completed
+    int  reads;         // successful netRecv calls
+    int  last_n;        // what the final netRecv returned (0/-1 = close/timeout)
+    long content_len;   // -1 when the server framed it chunked instead
+    bool chunked;
+    bool cap_hit;       // ran out of buffer rather than out of response
+};
+
+static int read_response(int sock, char *buf, int cap,
+                         int *body_off, int *body_len, RespDiag *dg) {
+    int  total = 0, header_end = -1;
+    long content_len = -1;
+    bool chunked = false, parsed = false;
+    int  reads = 0, last_n = 0, first_byte_tries = 0;
+    *body_off = 0; *body_len = 0;
+
+    while (total < cap - 1) {
+        if (parsed && !chunked && content_len >= 0 &&
+            (long)(total - header_end) >= content_len)
+            break;
+
+        int n = netRecv(sock, buf + total, cap - 1 - total, 0);
+        last_n = n;
+        if (n <= 0) {
+            // Close, error, or timeout.  While NOTHING has arrived yet this is
+            // a time-to-first-byte timeout rather than an idle one, so spend
+            // the larger budget before giving up -- see HTTP_FIRST_BYTE_TRIES.
+            if (total == 0 && !s_cx_fired && ++first_byte_tries < s_first_byte_tries)
+                continue;
+            break;
+        }
+        reads++;
+        total += n;
+        buf[total] = '\0';
+
+        if (!parsed) {
+            char *he = strstr(buf, "\r\n\r\n");   // headers are ASCII
+            if (he) {
+                header_end = (int)(he - buf) + 4;
+                const char *cl = ci_find(buf, header_end, "content-length:");
+                if (cl) content_len = atol(cl + strlen("content-length:"));
+                chunked = ci_find(buf, header_end, "transfer-encoding:") &&
+                          ci_find(buf, header_end, "chunked");
+                parsed = true;
+            }
+        }
+    }
+
+    if (dg) {
+        dg->total       = total;
+        dg->header_end  = header_end;
+        dg->reads       = reads;
+        dg->last_n      = last_n;
+        dg->content_len = content_len;
+        dg->chunked     = chunked;
+        dg->cap_hit     = (total >= cap - 1);
+    }
+
+    // `total` guards the status parse, and it is not paranoia -- it is the bug
+    // that hid the search failure for a whole session.
+    //
+    // `buf` is s_raw_buf, a STATIC buffer reused by every request. When a read
+    // fails outright (total == 0) nothing is written into it, so it still holds
+    // the PREVIOUS response -- which began "HTTP/1.1 200 OK". The parse below
+    // happily read that and returned 200 for a request that received zero
+    // bytes, so a hard timeout was reported to callers as a successful empty
+    // result. The search screen then showed "No results" instead of an error,
+    // and the log said `status=200 count=0`, which is why this looked for a
+    // long time like the server returning nothing.
+    int status = -1;
+    if (total >= 12 && strncmp(buf, "HTTP/", 5) == 0) {
+        char *sp = strchr(buf, ' ');
+        if (sp) status = atoi(sp + 1);
+    }
+    if (header_end < 0) return status;
+
+    int blen = total - header_end;
+    if (chunked)                                   blen = dechunk(buf + header_end, blen);
+    else if (content_len >= 0 && content_len < blen) blen = (int)content_len;
+
+    *body_off = header_end;
+    *body_len = blen;
+    return status;
+}
+
+static void build_auth(char *auth, int cap, const char *token) {
+    if (token && token[0])
+        snprintf(auth, cap,
+            "MediaBrowser Client=\"PS3\", Device=\"PS3\","
+            " DeviceId=\"%s\", Version=\"0.1\", Token=\"%s\"",
+            jf_device_id(), token);
+    else
+        snprintf(auth, cap,
+            "MediaBrowser Client=\"PS3\", Device=\"PS3\","
+            " DeviceId=\"%s\", Version=\"0.1\"", jf_device_id());
+}
+
+static int build_headers(char *req, int cap, const char *method,
+                         const char *path, const char *host, int port,
+                         const char *token, const char *accept, int blen,
+                         const char *ctype = NULL) {
+    // Always send the full client identity (Client/Device/DeviceId/Version),
+    // appending the access token when we have one.  Sending only the token —
+    // without DeviceId — means Jellyfin can't bind the request to a device
+    // session: the PS3 never appears in the dashboard, and the PlaySessionId
+    // used for seeking isn't tied to a tracked session, so StartTimeTicks is
+    // ignored and seeks fall back to offset 0.  stream.cpp already does this.
+    char auth[400];
+    build_auth(auth, sizeof auth, token);
+
+    int rlen = 0;
+    rlen += snprintf(req+rlen, cap-rlen,
+        "%s %s HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Authorization: %s\r\n"
+        "Accept: %s\r\n"
+        "Accept-Encoding: identity\r\n"
+        "User-Agent: " HTTP_USER_AGENT "\r\n",
+        method, path, host, port, auth, accept);
+    if (blen > 0)
+        rlen += snprintf(req+rlen, cap-rlen,
+            "Content-Type: %s\r\n"
+            "Content-Length: %d\r\n",
+            ctype ? ctype : "application/json", blen);
+    rlen += snprintf(req+rlen, cap-rlen, "Connection: close\r\n\r\n");
+    return rlen;
+}
+
+int http_init(void) {
+    int ret;
+    ret = sysModuleLoad(SYSMODULE_NET); if (ret < 0) return ret;
+
+    // How libnet's MEMORY POOL is sized, and why this is a switch rather than
+    // a decision.
+    //
+    // netInitialize() hands libnet a hardcoded 128 KB pool (LIBNET_MEMORY_SIZE
+    // in ppu/sprx/libnet/init.c) shared by every socket in the process, and
+    // socket receive buffers are charged against it.  The theory was that this
+    // was the real 25 Mbps receive ceiling: SO_RCVBUF=512KB was accepted and
+    // read back as 524288, but nothing said there was 512 KB of pool to back
+    // it.  netInitializeNetworkEx() is exported, so a bigger pool is one call
+    // away.
+    //
+    // MEASURED ON HARDWARE 2026-09-18, AND THE THEORY IS WRONG.  With a 4 MB
+    // pool, against the identical build and movie at 1080p 25 Mbps:
+    //
+    //            net= median   net= peak   heartbeats with ring empty
+    //   stock      25.0 Mbps    62.2 Mbps             8%
+    //   4 MB       12.0 Mbps    18.7 Mbps            55%
+    //
+    // Throughput HALVED, and getsockopt(SO_RCVBUF) -- the same call, on the
+    // same line -- went from returning 524288 to failing outright, as did
+    // netGetSockInfo.  Both are libnet telling us it is in a worse state than
+    // the stock init leaves it in, not a coincidence of load.  A pool that is
+    // merely too big would not break getsockopt.
+    //
+    // So the default is stock, exactly as v1.0 shipped.  The pool stays
+    // reachable because the experiment is worth finishing -- 128 here would
+    // isolate whether the damage is the SIZE or the Ex path itself -- but it
+    // is opt-in, set at runtime, and never on unless someone asks for it.
+    //
+    // Size in KB in jellyfin_netpool.txt; 0 or absent means stock.
+    {
+        u32 kb = 0;
+        FILE *f = fopen(jf_data_path("jellyfin_netpool.txt"), "r");
+        if (f) {
+            unsigned v = 0;
+            if (fscanf(f, "%u", &v) != 1) v = 0;
+            fclose(f);
+            if (v > 8192) v = 8192;     // 8 MB is already absurd; cap it
+            kb = v;
+        }
+
+        bool up = false;
+        if (kb) {
+            // 64 KB alignment rather than whatever malloc happens to give.
+            // Alignment is the other candidate explanation for the damage
+            // above, and PSL1GHT's 128 KB malloc may simply land aligned by
+            // luck where a 4 MB one does not.
+            void *mem = memalign(64 * 1024, (size_t)kb << 10);
+            if (mem) {
+                netInitParam pp;
+                memset(&pp, 0, sizeof(pp));
+                pp.memory      = (u32)(u64)mem;
+                pp.memory_size = (u32)kb << 10;
+                pp.flags       = 0;
+                const s32 rc = netInitializeNetworkEx(&pp);
+                char b[112];
+                snprintf(b, sizeof(b), "net: libnet pool %u KB rc=%d addr=0x%08x",
+                         (unsigned)kb, (int)rc, (unsigned)(u64)mem);
+                plog(b);
+                if (rc == 0) up = true;
+                else         free(mem);
+            } else {
+                plog("net: pool allocation refused, using stock netInitialize()");
+            }
+        }
+        if (!up) {
+            ret = netInitialize();
+            if (ret < 0) { sysModuleUnload(SYSMODULE_NET); return ret; }
+            plog("net: libnet stock (PSL1GHT 128 KB pool)");
+        }
+    }
+
+    // Prove the socket layer is healthy BEFORE any playback depends on it.
+    // This is the exact pair of calls that regressed under the 4 MB pool, so
+    // running them on a throwaway socket at startup turns "is libnet in a good
+    // state?" into one line at the top of the log instead of something only
+    // visible once a stream is already stuttering.
+    {
+        int s = netSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s < 0) {
+            plog("net: probe socket failed");
+        } else {
+            int want = 512 * 1024, got = 0;
+            socklen_t gl = sizeof(got);
+            const int src = setsockopt(s, SOL_SOCKET, SO_RCVBUF, &want, sizeof(want));
+            const int grc = getsockopt(s, SOL_SOCKET, SO_RCVBUF, &got, &gl);
+            char b[112];
+            snprintf(b, sizeof(b), "net: probe set=%d get=%d rcvbuf=%d",
+                     src, grc, (grc == 0) ? got : -1);
+            plog(b);
+            netClose(s);
+        }
+    }
+    sys_mutex_attr_t attr;
+    sysMutexAttrInitialize(attr);   // a zeroed attr is rejected by lv2
+    attr.attr_protocol  = SYS_MUTEX_PROTOCOL_PRIO_INHERIT;   // the lowest-priority taker is the poster thread
+    attr.attr_recursive = SYS_MUTEX_ATTR_NOT_RECURSIVE;
+    s_http_mtx_ok = (sysMutexCreate(&s_http_mtx, &attr) == 0);
+    if (!s_http_mtx_ok) {                 // never go without the lock over the protocol
+        attr.attr_protocol = SYS_MUTEX_PROTOCOL_PRIO;
+        s_http_mtx_ok = (sysMutexCreate(&s_http_mtx, &attr) == 0);
+        plog(s_http_mtx_ok ? "net: http mutex without priority inheritance"
+                           : "net: http mutex create FAILED");
+    }
+    https_rt_init();
+    // Wired or Wi-Fi decides the stream's receive window (stream.cpp).
+    if (sysModuleLoad(SYSMODULE_NETCTL) == 0 && netCtlInit() == 0) {
+        union net_ctl_info info;
+        if (netCtlGetInfo(NET_CTL_INFO_DEVICE, &info) == 0)
+            s_wireless = info.device == NET_CTL_DEVICE_WIRELESS;
+        plog(s_wireless ? "net: connected over Wi-Fi" : "net: connected by cable");
+    } else {
+        plog("net: connection type unknown");
+    }
+    return HTTP_SUCCESS;
+}
+
+void http_end(void) {
+    netDeinitialize();
+    sysModuleUnload(SYSMODULE_NET);
+}
+
+static int http_request_once(int method, const char *url, const char *body,
+                             const char *token, char *out, int out_size,
+                             const char *ctype = NULL, bool note_401 = true) {
+    if (https_url(url)) {
+        // API over TLS (firmware cellHttp); streaming stays on plain sockets.
+        char auth[400];
+        build_auth(auth, sizeof auth, token);
+        const char *verb = (method == HTTP_POST)   ? "POST"   :
+                           (method == HTTP_DELETE) ? "DELETE" : "GET";
+        int blen = 0;
+        int status = https_request(verb, url, method == HTTP_POST ? body : NULL, ctype, auth,
+                                   "application/json", out, out_size, &blen,
+                                   s_first_byte_tries * HTTP_IO_TIMEOUT_SEC);
+        if (blen > out_size - 1) plog("http: body TRUNCATED (https; raise RESPONSE_SIZE)");
+        if (status == 401 && token && token[0] && note_401) g_auth_expired = true;
+        return status;
+    }
+    char host[256]; int port; char path[512];
+    url_parse(url, host, sizeof(host), &port, path, sizeof(path));
+
+    if (cx_mine() && s_cx_fired) return -1;
+    int sock = http_connect_locked(host, port);
+    if (sock < 0) return -1;
+    if (!cx_track(sock)) { cx_track(-1); netClose(sock); return -1; }
+    char *raw = raw_claim();
+    if (!raw) {
+        plog("http: no memory for a second response buffer");
+        cx_track(-1);
+        netClose(sock);
+        return -1;
+    }
+
+    const char *verb = (method == HTTP_POST)   ? "POST"   :
+                       (method == HTTP_DELETE) ? "DELETE" : "GET";
+    int  blen = (method == HTTP_POST && body) ? (int)strlen(body) : 0;
+    char req[4096];
+    int  rlen = build_headers(req, sizeof(req), verb,
+                              path, host, port, token, "application/json", blen, ctype);
+
+    // ONE send for headers AND body.
+    //
+    // They used to go as two writes, and Nagle is on: the body is a small
+    // segment queued behind an unacknowledged one, so it waits for the peer's
+    // delayed ACK before it leaves the console.  The server meanwhile has a
+    // complete header block announcing a Content-Length it has not received,
+    // which is precisely the state Kestrel's MinRequestBodyDataRate exists to
+    // kill.  A JSON playstate body is a few hundred bytes and the headers are
+    // under 1 KB, so both fit in one buffer and therefore one segment.
+    bool sent;
+    if (blen > 0 && rlen + blen < (int)sizeof(req)) {
+        memcpy(req + rlen, body, (size_t)blen);
+        sent = send_all(sock, req, rlen + blen);
+    } else {
+        sent = send_all(sock, req, rlen);
+        if (sent && blen > 0) sent = send_all(sock, body, blen);
+    }
+    if (!sent) {
+        // Do not wait for a response to a request that never fully left: that
+        // wait is the whole stall.  -2 distinguishes it from a failed connect.
+        char b[128];
+        snprintf(b, sizeof(b), "http: send failed (%d hdr + %d body) %.60s",
+                 rlen, blen, path);
+        plog(b);
+        cx_track(-1);
+        netClose(sock);
+        raw_release(raw);
+        return -2;
+    }
+
+    int body_off, body_len;
+    RespDiag dg; memset(&dg, 0, sizeof(dg));
+    int status = read_response(sock, raw, RAW_CAP,
+                               &body_off, &body_len, &dg);
+    cx_track(-1);
+    netClose(sock);
+    if (cx_mine() && s_cx_fired) {
+        if (out_size > 0) out[0] = '\0';
+        raw_release(raw);
+        return -1;
+    }
+
+    // A 200 with nothing in it is not a thing a server does, so when it
+    // happens the interesting facts are on THIS side of the socket and they
+    // are gone the moment this function returns.  The search screen hit
+    // exactly this -- "search status: 200 count: 0" with a provably non-empty
+    // response on the wire (24 items, 57 KB, confirmed against the server) --
+    // and there was no way to tell whether the body never arrived, arrived and
+    // failed to dechunk, or arrived and overflowed.  Now there is.
+    if (status == 200 && body_len <= 0) {
+        char b[224];
+        snprintf(b, sizeof(b),
+                 "http: 200 EMPTY body -- total=%d hdr_end=%d reads=%d "
+                 "last_n=%d chunked=%d clen=%ld cap_hit=%d raw=%.28s | %.60s",
+                 dg.total, dg.header_end, dg.reads, dg.last_n,
+                 dg.chunked ? 1 : 0, dg.content_len, dg.cap_hit ? 1 : 0,
+                 dg.header_end > 0 ? raw + dg.header_end : "(no body)",
+                 path);
+        plog(b);
+    }
+
+    // 401 on a request that carried a token: the saved session is dead
+    // (revoked server-side).  Login itself sends no token, so a wrong
+    // password can't trip this.
+    if (status == 401 && token && token[0] && note_401) g_auth_expired = true;
+
+    memset(out, 0, out_size);
+    if (body_len > out_size - 1) {
+        // Truncating JSON produces a parse that "works" and quietly returns
+        // fewer items — the version list losing everything past the cut is
+        // exactly that bug.  Say so.
+        char b[96];
+        snprintf(b, sizeof(b),
+                 "http: body TRUNCATED %d -> %d bytes (raise RESPONSE_SIZE)",
+                 body_len, out_size - 1);
+        plog(b);
+        body_len = out_size - 1;
+    }
+    if (body_len > 0) memcpy(out, raw + body_off, body_len);
+    out[body_len > 0 ? body_len : 0] = '\0';
+
+    raw_release(raw);
+    return status;
+}
+
+// A GET that answers 200 with an empty body is a reply cut short, not an
+// answer: the server closed the connection mid-body (a cold Gelato item, 2026-
+// 09-27: 49.6 of 52.7 KB arrived, the chunked decode came out empty).  Callers
+// took the 200 at its word and parsed nothing -- a details page with no
+// synopsis, cast or versions.  Ask once more; if it is still empty, report a
+// failure (-3) so the caller's error path runs instead.
+int http_request(int method, const char *url, const char *body,
+                 const char *token, char *out, int out_size) {
+    int status = http_request_once(method, url, body, token, out, out_size);
+    if (method != HTTP_GET || status != 200 || !out || out_size <= 0 || out[0])
+        return status;
+    plog("http: 200 with an empty body -- retrying once");
+    status = http_request_once(method, url, body, token, out, out_size);
+    if (status == 200 && !out[0]) {
+        plog("http: still empty -- reported as a failure (-3)");
+        return -3;
+    }
+    return status;
+}
+
+// A GET to a server that may not be ours (server_discovery.cpp): a 401 there
+// says nothing about our session, so it must not log the user out.
+int http_probe_get(const char *url, const char *token, char *out, int out_size) {
+    return http_request_once(HTTP_GET, url, NULL, token, out, out_size, NULL, false);
+}
+
+// POST a text/plain body (a log file); the body must be NUL-terminated.
+int http_post_text(const char *url, const char *body, const char *token,
+                   char *out, int out_size) {
+    return http_request_once(HTTP_POST, url, body, token, out, out_size,
+                             "text/plain");
+}
+
+int http_open_socket(const char *host, int port, int rcvbuf_bytes) {
+    // Only the resolve + connect is serialised -- that is the part of the
+    // net stack that is not reentrant (see http_fetch_binary below).  The
+    // caller's own reads run unlocked, so a long download never holds up the
+    // UI's requests.
+    return http_connect_locked(host, port, rcvbuf_bytes);
+}
+
+int http_fetch_binary(const char *url, const char *token,
+                      uint8_t *out, int out_size) {
+    // Connects under the same lock as http_request().  This runs on the
+    // thumbnail fetch thread; the UI/seek/progress paths run http_request()
+    // on other threads.  The PS3 sys/net resolver + connection setup are not
+    // reentrant, so two concurrent connects corrupt shared net-stack state —
+    // observed as a thumbnail fetch that hangs PAST the socket timeouts (the
+    // socket timeouts can't bound a wedged netGetHostByName / connect).  The
+    // read goes into the caller's buffer, so it needs no lock.
+
+    if (https_url(url)) {
+        char auth[400];
+        build_auth(auth, sizeof auth, token);
+        int blen = 0;
+        const int status = https_request("GET", url, NULL, NULL, auth, "image/jpeg,image/*",
+                                         (char *)out, out_size, &blen, HTTP_IO_TIMEOUT_SEC * 3);
+        // A short buffer would hand stb a truncated image; fail instead.
+        if (status != 200 || blen <= 0 || blen > out_size - 1) return -1;
+        return blen;
+    }
+
+    char host[256]; int port; char path[512];
+    url_parse(url, host, sizeof(host), &port, path, sizeof(path));
+
+    int sock = http_connect_locked(host, port);
+    if (sock < 0) {
+        char b[160];
+        snprintf(b, sizeof b, "http: image connect failed %.60s:%d", host, port);
+        plog(b);
+        return -1;
+    }
+
+    char req[2048];
+    int  rlen = build_headers(req, sizeof(req), "GET", path, host, port,
+                              token, "image/jpeg,image/*", 0);
+    send_all(sock, req, rlen);
+
+    // Read the response directly into the caller's buffer.  The old 64KB
+    // staging buffer silently TRUNCATED anything bigger, which stbi would
+    // then reject with "outofdata" — a real trap for full-size art, and 64KB
+    // of BSS besides.  (It was NOT the blank-poster bug, despite the earlier
+    // hunch: those failures were all reason=outofmem on 12-25KB images, i.e.
+    // heap exhaustion — see img_arena.h.  Keeping this anyway: it's correct.)
+    int body_off, body_len;
+    RespDiag dg; memset(&dg, 0, sizeof(dg));
+    int status = read_response(sock, (char*)out, out_size,
+                               &body_off, &body_len, &dg);
+    netClose(sock);
+
+    // A short buffer would hand stb a truncated image; fail, and say why.
+    if (status != 200 || body_len <= 0 || dg.cap_hit) {
+        char b[200];
+        snprintf(b, sizeof b, "http: image %s status=%d body=%d read=%d clen=%ld | %.100s",
+                 dg.cap_hit ? "LARGER THAN BUFFER" : "failed", status, body_len, dg.total,
+                 dg.content_len, path);
+        plog(b);
+        return -1;
+    }
+    memmove(out, out + body_off, body_len);
+    return body_len;
+}

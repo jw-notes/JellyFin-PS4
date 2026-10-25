@@ -1,0 +1,335 @@
+// Background GitHub release check — fetches the latest release tag once at
+// startup and compares it against APP_VERSION.
+//
+// The GitHub API is HTTPS-only, which net/http.cpp (raw sockets) can't speak,
+// so this module uses the firmware HTTPS stack (libhttp/libssl — already
+// linked for the app).  The whole exchange runs on a low-priority thread with
+// 2-second connect/send/recv timeouts; any failure just leaves the "no update"
+// default in place, so the UI never sees an error from this path.
+//
+// Every step is traced to UPDATE_LOG_PATH (independent of the Debug Logging
+// setting) so a silent failure on real hardware can be located after the
+// fact — including a dump of whatever the API returned.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <strings.h>
+
+#include <ppu-types.h>
+#include <sys/thread.h>
+#include <sysmodule/sysmodule.h>
+#include <http/https.h>
+#include <http/util.h>
+#include <ssl/ssl.h>
+
+#include "update_check.h"
+#include "release_version.h"
+#include "release_asset.h"
+#include "jf_paths.h"
+#include "https_client.h"
+#include "http.h"    // HTTP_USER_AGENT (GitHub rejects requests without one)
+#include "timing.h"
+#include "plog.h"
+
+// This fork's own releases.  Use the repo's exact current name: a renamed repo
+// answers with a 301 redirect, which the console's firmware HTTP client does
+// not reliably follow, and the update popup would silently never appear.
+#define UPDATE_URL "https://api.github.com/repos/" UPDATE_REPO "/releases/latest"
+#define UPDATE_TIMEOUT_US (2 * 1000 * 1000)
+
+#define UPDATE_LOG_PATH "/dev_hdd0/tmp/update_detection.txt"
+
+static sys_ppu_thread_t s_thread  = 0;
+static bool             s_started = false;
+
+// Results — written by the worker, then s_done is set last (after a barrier)
+// so readers polling update_check_result() only ever see a complete result.
+static volatile bool s_done  = false;
+static bool          s_newer = false;
+static bool          s_disabled = false;
+static bool          s_ok    = false;   // a release tag was read, newer or not
+static char          s_latest[64];
+static release_asset s_asset;          // the release's package, when it has one
+static bool          s_have_asset = false;
+
+// The tag_name field sits near the front of the response; 16K is plenty even
+// with long release notes before it.
+static char s_resp[16 * 1024];
+
+// -------------------------------------------------------
+// Trace log — always on, unlike plog.  Same open/write/close-per-line
+// pattern as crash_log() so the last line survives a hang; first call
+// truncates, every call after that appends.  Lines carry the ms elapsed
+// since the check started, which makes timeout stalls obvious.
+// -------------------------------------------------------
+
+static bool s_log_started = false;
+static u64  s_log_t0      = 0;
+
+static void ulog(const char *fmt, ...) {
+    FILE *f = fopen(UPDATE_LOG_PATH, s_log_started ? "a" : "w");
+    if (!f) return;
+    fprintf(f, "[+%5llums] ", (unsigned long long)((timing_get_us() - s_log_t0) / 1000));
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+    s_log_started = true;
+}
+
+// Raw dump (no printf formatting — the response body contains '%').
+static void ulog_raw(const char *buf, u32 len) {
+    FILE *f = fopen(UPDATE_LOG_PATH, s_log_started ? "a" : "w");
+    if (!f) return;
+    fwrite(buf, 1, len, f);
+    fputc('\n', f);
+    fclose(f);
+    s_log_started = true;
+}
+
+// -------------------------------------------------------
+// Version comparison
+// -------------------------------------------------------
+
+// Split "v2.0-beta" into up to three numeric fields (missing = 0) and the
+// trailing suffix ("-beta", or "" for a plain release).
+// -------------------------------------------------------
+// Fetch
+// -------------------------------------------------------
+
+// Extract a "key":"value" string field from a JSON buffer.  Enough for
+// tag_name — release tags never contain escapes.
+static bool json_str_field(const char *json, const char *key,
+                           char *out, int out_size) {
+    char pat[32];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return false;
+    p += strlen(pat);
+    while (*p == ' ' || *p == ':') p++;
+    if (*p != '"') return false;
+    p++;
+    int i = 0;
+    while (*p && *p != '"' && *p != '\\' && i < out_size - 1)
+        out[i++] = *p++;
+    out[i] = '\0';
+    return i > 0;
+}
+
+// The firmware CA bundle predates GitHub's current root certificates, so
+// strict verification can fail even when the connection itself is fine.
+// Nothing sensitive is sent and the result is display-only, so accept the
+// certificate; transport errors still fail the check quietly.  Being called
+// at all proves the TLS handshake itself got as far as the server's
+// certificate — worth a trace line.
+static int ssl_accept_cb(s32 verErr, sslCert const certs[], int certNum,
+                         const char *host, httpSslId id, void *arg) {
+    (void)certs; (void)id; (void)arg;
+    ulog("ssl cb: verErr=0x%08x certs=%d host=%s -> accepting",
+         (u32)verErr, certNum, host ? host : "(null)");
+    return 0;
+}
+
+// One GET of the latest-release JSON.  Mirrors the canonical PSL1GHT https
+// flow (init pools -> firmware certs -> client -> transaction), with every
+// step bailing to cleanup on failure.  netInitialize() has already run
+// (http_init() in main), so only the HTTP/SSL layers are set up here.
+static void do_check(void) {
+    void *uri_pool = NULL;
+    bool  have_rt = false;
+    httpClientId client = 0;
+    httpTransId  trans  = 0;
+    s32 rc;
+
+    ulog("update check: app=%s", APP_VERSION);
+    ulog("url: %s", UPDATE_URL);
+
+    // The firmware HTTP/SSL runtime is shared with the API client.
+    if (!https_rt_acquire()) { ulog("FAIL https runtime"); goto cleanup; }
+    have_rt = true;
+    ulog("https runtime up");
+
+    rc = httpCreateClient(&client);
+    if (rc < 0) { ulog("FAIL httpCreateClient: 0x%08x", (u32)rc); client = 0; goto cleanup; }
+    httpClientSetConnTimeout(client, UPDATE_TIMEOUT_US);
+    httpClientSetSendTimeout(client, UPDATE_TIMEOUT_US);
+    httpClientSetRecvTimeout(client, UPDATE_TIMEOUT_US);
+    httpClientSetUserAgent(client, HTTP_USER_AGENT);
+    httpClientSetAutoRedirect(client, 1);   // repo renames answer with a 301
+    httpClientSetSslCallback(client, ssl_accept_cb, NULL);
+    ulog("client ready (timeouts %dms)", UPDATE_TIMEOUT_US / 1000);
+
+    {
+        httpUri uri;
+        u32 pool_size = 0;
+        rc = httpUtilParseUri(&uri, UPDATE_URL, NULL, 0, &pool_size);
+        if (rc < 0) { ulog("FAIL uri size query: 0x%08x", (u32)rc); goto cleanup; }
+        uri_pool = malloc(pool_size);
+        if (!uri_pool) { ulog("FAIL uri pool alloc"); goto cleanup; }
+        rc = httpUtilParseUri(&uri, UPDATE_URL, uri_pool, pool_size, NULL);
+        if (rc < 0) { ulog("FAIL uri parse: 0x%08x", (u32)rc); goto cleanup; }
+        rc = httpCreateTransaction(&trans, client, HTTP_METHOD_GET, &uri);
+        if (rc < 0) { ulog("FAIL httpCreateTransaction: 0x%08x", (u32)rc); trans = 0; goto cleanup; }
+    }
+
+    // DNS, TCP connect, and the TLS handshake all happen inside this call —
+    // if the console's SSL stack can't talk to GitHub, this is where it dies.
+    rc = httpSendRequest(trans, NULL, 0, NULL);
+    if (rc < 0) { ulog("FAIL httpSendRequest (dns/tcp/tls): 0x%08x", (u32)rc); goto cleanup; }
+    ulog("request sent");
+
+    {
+        s32 code = 0;
+        rc = httpResponseGetStatusCode(trans, &code);
+        if (rc < 0) { ulog("FAIL get status code: 0x%08x", (u32)rc); goto cleanup; }
+        ulog("http status: %d", (int)code);
+        if (code != 200) {
+            // Still capture the body — GitHub explains 403/404/redirect
+            // failures in JSON, and that explanation is the diagnosis.
+            u32 got = 0, n = 0;
+            while (got < sizeof(s_resp) - 1 &&
+                   httpRecvResponse(trans, s_resp + got,
+                                    sizeof(s_resp) - 1 - got, &n) == 0 && n > 0)
+                got += n;
+            s_resp[got] = '\0';
+            ulog("---- response body (%u bytes) ----", got);
+            if (got) ulog_raw(s_resp, got);
+            ulog("---- end ----");
+            goto cleanup;
+        }
+    }
+
+    {
+        u32 got = 0;
+        while (got < sizeof(s_resp) - 1) {
+            u32 n = 0;
+            rc = httpRecvResponse(trans, s_resp + got,
+                                  sizeof(s_resp) - 1 - got, &n);
+            if (rc != 0) { ulog("recv stopped: 0x%08x after %u bytes", (u32)rc, got); break; }
+            if (n == 0) break;
+            got += n;
+        }
+        s_resp[got] = '\0';
+        ulog("---- response body (%u bytes) ----", got);
+        if (got) ulog_raw(s_resp, got);
+        ulog("---- end ----");
+    }
+
+    {
+        char tag[64];
+        if (!json_str_field(s_resp, "tag_name", tag, sizeof(tag))) {
+            ulog("FAIL no tag_name in response");
+            goto cleanup;
+        }
+        s_ok = true;
+        int cmp = release_version_cmp(tag, APP_VERSION);
+        ulog("tag=%s app=%s cmp=%d -> %s", tag, APP_VERSION, cmp,
+             cmp > 0 ? "UPDATE AVAILABLE" : "up to date");
+        if (cmp > 0) {
+            snprintf(s_latest, sizeof(s_latest), "%s", tag);
+            s_newer = true;
+            s_have_asset = release_asset_find(s_resp, "JellyFin-PS3.pkg", &s_asset);
+            ulog("asset: %s size=%u sha256=%s", s_have_asset ? s_asset.url : "(none)",
+                 s_asset.size, s_asset.sha256[0] ? s_asset.sha256 : "(none)");
+        }
+        char msg[96];
+        snprintf(msg, sizeof(msg), "update: latest=%s newer=%d",
+                 s_newer ? s_latest : "(none)", (int)s_newer);
+        plog(msg);
+    }
+
+cleanup:
+    if (trans)      httpDestroyTransaction(trans);
+    if (client)     httpDestroyClient(client);
+    if (uri_pool)   free(uri_pool);
+    if (have_rt)    https_rt_release();
+    ulog("done (newer=%d)", (int)s_newer);
+}
+
+static void check_thread_fn(void *arg) {
+    (void)arg;
+    do_check();
+    __sync_synchronize();   // result fields land before the done flag
+    s_done = true;
+    sysThreadExit(0);
+}
+
+void update_check_start(void) {
+    if (s_started) return;
+    s_done = false;
+    s_newer = false;
+    s_have_asset = false;
+    s_ok = false;
+    s_latest[0] = '\0';
+    s_log_t0 = timing_get_us();
+    s_disabled = false;
+    FILE *gate = fopen(jf_data_path("jellyfin_updatecheck.txt"), "r");
+    if (gate) {
+        int enabled = 1;
+        if (fscanf(gate, "%d", &enabled) == 1) s_disabled = enabled == 0;
+        fclose(gate);
+    }
+    if (s_disabled) {
+        ulog("update check disabled by diagnostic setting");
+        __sync_synchronize();
+        s_done = true;
+        return;
+    }
+    s32 rc = sysThreadCreate(&s_thread, check_thread_fn, NULL,
+                             1500, 65536, THREAD_JOINABLE, "upd_check");
+    if (rc == 0)
+        s_started = true;
+    else {
+        ulog("FAIL sysThreadCreate: 0x%08x", (u32)rc);
+        __sync_synchronize();
+        s_done = true;
+    }
+}
+
+void update_check_shutdown(void) {
+    if (!s_started) return;
+    u64 tret;
+    sysThreadJoin(s_thread, &tret);
+    s_started = false;
+    s_thread  = 0;
+}
+
+bool update_check_result(char *out, int out_size) {
+    if (!s_done || !s_newer) return false;
+    snprintf(out, out_size, "%s", s_latest);
+    return true;
+}
+
+bool update_check_done(void) {
+    return s_done;
+}
+
+bool update_check_asset(release_asset *out) {
+    if (!s_done || !s_newer || !s_have_asset) return false;
+    *out = s_asset;
+    return true;
+}
+
+int update_check_state(void) {
+    if (s_disabled) return UPD_IDLE;
+    if (!s_started && !s_done) return UPD_IDLE;
+    if (!s_done)  return UPD_CHECKING;
+    if (s_newer)  return UPD_AVAILABLE;
+    return s_ok ? UPD_CURRENT : UPD_FAILED;
+}
+
+bool update_check_again(void) {
+    if (s_started && !s_done) return false;   // one at a time
+    update_check_shutdown();                  // reap the finished worker
+    s_done  = false;
+    s_newer = false;
+    s_ok    = false;
+    s_log_started = false;                    // a fresh trace file
+    __sync_synchronize();
+    update_check_start();
+    return s_started;
+}

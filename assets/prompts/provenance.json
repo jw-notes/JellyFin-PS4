@@ -1,0 +1,42 @@
+{
+  "source": "vendor/ps3/source/ui/fonts/ps_buttons_png.h",
+  "tile_mapping": "original PS3 ui_widgets.cpp PS_TILES",
+  "tiles": {
+    "cross": [
+      10,
+      5
+    ],
+    "circle": [
+      11,
+      7
+    ],
+    "square": [
+      10,
+      11
+    ],
+    "triangle": [
+      9,
+      1
+    ],
+    "dpad": [
+      9,
+      3
+    ],
+    "l1": [
+      6,
+      3
+    ],
+    "r1": [
+      6,
+      11
+    ],
+    "l2": [
+      6,
+      7
+    ],
+    "r2": [
+      5,
+      3
+    ]
+  }
+}

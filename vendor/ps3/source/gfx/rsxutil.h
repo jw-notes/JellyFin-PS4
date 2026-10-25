@@ -1,0 +1,47 @@
+#ifndef __RSXUTIL_H__
+#define __RSXUTIL_H__
+
+#include <ppu-types.h>
+
+#include <rsx/rsx.h>
+
+#define CB_SIZE		0x100000
+#define HOST_SIZE	(32*1024*1024)
+
+extern gcmContextData *context;
+extern u32 display_width;
+extern u32 display_height;
+// Pixel aspect ratio of the current video mode (width/height of one pixel,
+// as num/den).  1:1 on HD modes; SD modes (720×576 / 720×480) have
+// non-square pixels, so anything that must look round/undistorted on the
+// TV — the video letterbox fit in particular — has to factor this in.
+extern u32 display_par_num;
+extern u32 display_par_den;
+extern u32 curr_fb;
+
+extern u32  color_pitch;
+extern u32  color_offset[2];
+extern u32 *color_buffer[2];   // CPU-writable RSX VRAM pointers
+
+extern u32 depth_pitch;
+extern u32 depth_offset;
+
+void setRenderTarget(u32 index);
+void init_screen(void *host_addr,u32 size);
+void waitflip();
+// waitflip() with a deadline: false if the flip did not complete in time
+// (the display head is not delivering vblanks).  Never blocks past it.
+bool waitflip_timeout(u32 timeout_us);
+// Re-register the two scan-out buffers and flip mode exactly as
+// init_screen() did after its videoConfigure().  For use after a display
+// mode change, which may drop the registration.
+void rsx_rebind_display(void);
+void flip();
+void rsxSync(void); // flush + stall until RSX has finished all queued commands
+
+#endif
+
+// Log every display mode the panel advertises, plus which resolution ids
+// are available.  Read-only; changes nothing.  Call after plog is open.
+void video_log_capabilities(void);
+

@@ -1,0 +1,292 @@
+#pragma once
+#include <stddef.h>   // NULL, for the default arguments below
+#include "http.h"
+
+#define JF_MAX   100
+#define JF_PAGE  18
+
+typedef struct {
+    char id[64];
+    char name[128];
+    char type[32];
+} JFItem;
+
+// Global session state (defined in jellyfin_api.cpp)
+extern char g_server[256];
+extern char g_username[64];
+extern char g_token[256];
+extern char g_userid[64];
+extern char responseBuffer[RESPONSE_SIZE];
+
+// JSON helpers
+int  json_get_string(const char *json, const char *key, char *out, int out_size);
+void url_encode_query(const char *in, char *out, int out_size);
+
+// Item helpers
+bool is_container(const char *type);
+int  parse_jf_items(const char *json, JFItem *arr, int max);
+
+// Config
+void save_config(void);
+int  load_config(void);
+
+// Per-install device identity (api_auth.cpp).  Generated once and persisted;
+// a fixed id let any other login (e.g. an RPCS3 test run) take over this
+// install's Jellyfin device slot and revoke its token.
+const char *jf_device_id(void);
+// Settings > Share Sign-in: this sign-in lent to the PS3 users with none of
+// their own (on).  Borrowed: this PS3 user is using another's shared sign-in.
+bool jf_login_shared(void);
+bool jf_login_borrowed(void);
+// Another PS3 user's account is shared: this one cannot be as well.
+bool jf_login_share_taken(void);
+// End that share (its owner may have been deleted with their save data).
+void jf_login_end_other_share(void);
+void jf_login_set_shared(bool on);
+
+// Raised by the http layer when an authenticated request comes back 401 —
+// the saved token is dead.  The XMB loop drops the session and returns to
+// the login screen instead of silently rendering an empty library.
+extern volatile bool g_auth_expired;
+
+// Source frame rate from the server (MediaStreams[Video].RealFrameRate), in
+// milli-fps: 23.976 fps is 23976.  0 when unknown.
+//
+// The PS3's VDEC does not always report a frame-rate code.  On a TRANSCODE it
+// does, because ffmpeg writes a clean SPS; on a STREAM COPY of a Blu-ray remux
+// it comes back 0 and the player fell back to 30 fps -- pacing 23.976 fps film
+// as 30, which judders permanently no matter how full the buffer is.  The
+// server already knows the answer, so ask it instead of guessing.
+extern int g_source_fps_milli;
+
+// One credited person (cast/crew) for the detail page's Cast & Crew row.
+#define JF_MAX_PEOPLE 30   // the cast row scrolls (Classic)
+typedef struct {
+    char id[64];      // person item id (for the headshot image)
+    char name[64];    // "Arnold Schwarzenegger"
+    char role[64];    // "as The Terminator" / "Director" (character or job)
+    bool has_image;   // the server has a photo (PrimaryImageTag); else a silhouette
+} JFPerson;
+
+// Identity of an item beyond its name -- what an offline copy needs to be
+// shown without the server (series / season / episode, year, runtime) and
+// where its artwork comes from.  Parsed from the same item DTO the info
+// screen already fetches, so it costs no extra request.
+typedef struct {
+    char     series_name[128];   // "" for non-episodes
+    char     series_id[64];
+    int      season;             // ParentIndexNumber, -1 = n/a
+    int      episode;            // IndexNumber, -1 = n/a
+    int      year;               // ProductionYear, 0 = unknown
+    unsigned runtime_secs;       // RunTimeTicks / 10^7, 0 = unknown
+    bool     has_backdrop;       // the item has its own BackdropImageTags
+    char     parent_backdrop_id[64];  // ParentBackdropItemId (episodes), or ""
+} JFItemIdentity;
+
+// Pure: never fails on missing fields (they keep their "unknown" values).
+// Returns false only for a NULL/empty document.
+bool jellyfin_parse_item_identity(const char *json, JFItemIdentity *out);
+
+// Full per-item detail (populated by jellyfin_fetch_item_detail)
+typedef struct {
+    // The reply's own Id.  It can differ from the id asked for: a Gelato title
+    // found by Search is a stub that the server turns into a library item when
+    // it is first opened, and from then on only the new item's id has sources,
+    // images and PlaybackInfo.  "" when the reply carried none.
+    char id[64];
+    char overview[1024];       // Plot summary
+    char tagline[256];         // "How fast do you like it?"
+    char official_rating[16];  // "NZ-M" / "PG-13" / etc.
+    char community_rating[8];  // "6.5"
+    char critic_rating[8];     // "37%"
+    char video_info[64];       // "1080p H264 SDR"
+    char audio_info[128];      // "English EAC3 5.1"
+    char genres[128];          // "Action, Crime, Thriller"
+    char studios[256];         // "Universal Pictures, Original Film"
+    JFPerson people[JF_MAX_PEOPLE];  // top-billed cast + key crew
+    int      n_people;
+    // Episodes: where they live (the details page's "Back to Season" button).
+    char     series_id[64];
+    char     series_name[128];
+    char     season_id[64];
+    int      season_num;             // ParentIndexNumber; -1 unknown, 0 = Specials
+    bool     is_favourite;           // UserData.IsFavorite
+    JFItemIdentity identity;   // offline downloads (dl_request.cpp)
+} XMBItemDetail;
+
+bool jellyfin_fetch_item_detail(const char *item_id, XMBItemDetail *out);
+
+// -------------------------------------------------------
+// Selectable media streams (audio tracks + subtitles)
+// -------------------------------------------------------
+#define JF_MAX_STREAMS 8        // subtitles
+#define JF_MAX_AUDIO   16       // audio: a dubbed remux lists 9 Russian tracks before the English
+#define JF_MAX_SOURCES 48
+
+typedef struct {
+    int  index;       // Jellyfin MediaStream Index (for AudioStreamIndex= etc.)
+    char label[64];   // DisplayTitle, e.g. "English - EAC3 - 5.1 - Default"
+    char codec[16];   // "subrip", "ass", "pgssub" ... -- see jf_sub_is_text()
+    char lang[16];    // MediaStream Language ("eng", "rus", sometimes "Japanese"); "" when untagged
+    unsigned bitrate; // MediaStream BitRate, bits/s (audio; 0 = not reported).
+                      // Budgeted inside the quality step (stream_budget.h).
+} JFStream;
+
+// Can this subtitle be drawn on the console, or must the server burn it in?
+// Text formats are fetched as SubRip and rendered by player/subtitles.cpp;
+// bitmap ones (PGS, VOBSUB) have no text to fetch and still cost a transcode.
+bool jf_sub_is_text(const char *codec);
+
+// PGS is also drawn on the console now (source/player/subtitles_pgs.h), via
+// the raw .sup elementary stream rather than SubRip -- a separate check from
+// jf_sub_is_text() because the fetch and decode paths are entirely
+// different. VOBSUB ("dvdsub") is neither: still burn-in only.
+bool jf_sub_is_pgs(const char *codec);
+
+typedef struct {
+    JFStream audio[JF_MAX_AUDIO];
+    int      n_audio;
+    int      default_audio;   // position in audio[] playback starts on: see jf_tracks_pick_start()
+    JFStream subs[JF_MAX_STREAMS];
+    int      n_subs;
+} JFTracks;
+
+// The audio language playback prefers: the console's system language, as an
+// ISO 639-2 code ("eng" until jf_audio_lang_from_system runs).
+extern char g_audio_lang[4];
+// SYSUTIL_SYSTEMPARAM_ID_LANG value -> g_audio_lang.  Unknown values -> "eng".
+void jf_audio_lang_from_system(int sysutil_lang);
+// Is a track's Language tag ("eng", "en", "fre", "fra" ...) or, untagged, its
+// label's first word ("English - DTS - 5.1") the language `pref` names?
+bool jf_lang_matches(const char *track_lang, const char *label, const char *pref);
+// Where the next parsed audio track goes: the next slot, or -- once the list is
+// full -- the last slot, if the track is in the preferred language and no kept
+// one is.  -1 = dropped.
+int  jf_audio_slot(const JFTracks *t, const char *lang, const char *label);
+// Sets t->default_audio, the track playback starts on: the file's default
+// (`file_default`) when it is in g_audio_lang, else the first track in that
+// language that is not a commentary, else the file's default.  2026-10-17:
+// Avatar's Russian remuxes flag a Russian dub as default; an English console
+// played it.
+void jf_tracks_pick_start(JFTracks *t, int file_default);
+
+// One playable version from PlaybackInfo.MediaSources.  Jellyfin plugins such
+// as Gelato/AIOStreams expose their alternatives this way, just like local
+// multi-version movies do.  Tracks belong to the source: stream indices are
+// not stable across versions.
+typedef struct {
+    char     id[96];             // MediaSourceId used by stream.ts
+    char     live_stream_id[128]; // populated after opening remote/live sources (98 chars: see stream_request.h)
+    char     label[128];         // MediaSource.Name (HUD display text)
+    char     summary[96];        // "1080p · REMUX · DTS-HD MA 7.1 · 38.8 GB" (api/version_summary.h)
+    unsigned runtime_secs;
+    unsigned long long size_bytes;   // MediaSource.Size; 0 = not reported
+    // Gelato's placeholder, not a version: what the ITEM lists for a title
+    // whose stream lookup found nothing (Path "gelato://stub/tmdb:N").
+    // Playing it is the server's HTTP 500.  Only the item says so:
+    // PlaybackInfo gives every Gelato source, real ones too, Path "/stub".
+    bool     placeholder;
+    JFTracks tracks;
+} JFMediaSource;
+
+typedef struct {
+    JFMediaSource source[JF_MAX_SOURCES];
+    int           n_sources;
+    int           n_placeholder;   // Gelato placeholders left out of source[]
+} JFMediaSources;
+
+// Pure JSON parsers (also exercised by the host-side tests).
+int  jellyfin_parse_media_sources(const char *json, JFMediaSources *out);
+bool jellyfin_parse_selected_media_source(const char *json,
+                                           const char *requested_id,
+                                           JFMediaSource *out);
+
+// Fetch the complete version list for an item's info screen.  The item DTO's
+// MediaSources field is preferred (it is what Jellyfin's details UI uses);
+// PlaybackInfo is retained as a compatibility fallback.
+bool jellyfin_fetch_media_sources(const char *item_id, JFMediaSources *out);
+// The same item request into the caller's buffer, for a worker thread: it never
+// touches responseBuffer, and it has no PlaybackInfo fallback (which does).
+bool jellyfin_fetch_media_sources_buf(const char *item_id, JFMediaSources *out,
+                                      char *buf, int cap);
+
+// GET the item's MediaStreams and fill out with every audio and subtitle
+// stream (index + display label).  Returns true if the fetch succeeded
+// (counts may still be 0).
+bool jellyfin_fetch_tracks(const char *item_id, JFTracks *out);
+
+// Playback session
+// POST /Users/{userId}/Items/{item_id}/PlaybackInfo with a PS3 device profile.
+// Extracts PlaySessionId from the response.
+// Returns true and fills out_session_id on success; false on any failure.
+// out_total_secs (may be NULL) receives the media duration in seconds, parsed
+// from the response's RunTimeTicks; set to 0 if unavailable.
+bool jellyfin_get_play_session_id(const char *item_id,
+                                   char *out_session_id, int out_len,
+                                   unsigned *out_total_secs);
+
+// Source-aware PlaybackInfo request.  media_source_id may be NULL/empty for
+// the server default.  out_sources is used on the initial request to collect
+// the version menu; out_selected receives the opened/resolved source (notably
+// its LiveStreamId) and may be NULL.  Either output may be omitted.
+bool jellyfin_get_playback_info(const char *item_id,
+                                const char *media_source_id,
+                                char *out_session_id, int out_len,
+                                unsigned *out_total_secs,
+                                JFMediaSources *out_sources,
+                                JFMediaSource *out_selected,
+                                bool auto_open_live_stream = true);
+
+// Stop the active transcoding job for this play session
+// (DELETE /Videos/ActiveEncodings).  Must be called before re-requesting the
+// stream at a new StartTimeTicks, otherwise Jellyfin keeps serving the existing
+// transcode (which began at offset 0) and the seek appears to reset to 0:00.
+void jellyfin_stop_transcode(const char *session_id);
+
+// Playback-state reporting (POST /Sessions/Playing{,/Progress,/Stopped}).
+// pos_ticks is the absolute position in Jellyfin 100-ns ticks.  These keep
+// the server's Continue Watching / resume positions up to date.
+// live_stream_id non-empty = a Live TV channel: the report carries the
+// LiveStreamId, no position and CanSeek=false.
+void jellyfin_report_playing(const char *item_id, const char *session_id,
+                             unsigned long long pos_ticks,
+                             const char *live_stream_id = NULL);
+void jellyfin_report_progress(const char *item_id, const char *session_id,
+                              unsigned long long pos_ticks, bool paused,
+                              const char *live_stream_id = NULL);
+void jellyfin_report_stopped(const char *item_id, const char *session_id,
+                             unsigned long long pos_ticks,
+                             const char *live_stream_id = NULL);
+
+// The same progress report, handed to a worker thread instead of being waited
+// on.  For callers that must not block: the music pump thread (it is the only
+// thing refilling a 683 ms PCM ring) and anything on the render loop.
+//
+// One-slot mailbox -- a report is absolute state, so a newer one replaces an
+// unsent older one rather than queueing behind it.  Call jellyfin_report_flush()
+// before tearing a session down.
+// Call once, from a single-threaded moment, before any async report.  Without
+// it the first report falls back to the blocking path rather than racing two
+// threads through a lazy init.
+void jellyfin_report_init(void);
+void jellyfin_report_progress_async(const char *item_id, const char *session_id,
+                                    unsigned long long pos_ticks, bool paused);
+void jellyfin_report_flush(void);
+
+// Log out of the current session.  Best-effort notifies the server
+// (POST /Sessions/Logout), clears the in-memory credentials, and removes the
+// saved config so the next launch returns to the login screen.  The server URL
+// is preserved so the user only needs to re-enter their credentials.
+void jellyfin_logout(void);
+
+// Handle a server-revoked session: clear the saved login, tell the user why,
+// and return so the caller can go back to the login screen.  Call it when
+// g_auth_expired is set — see the definition for why an unhandled one shows
+// up as an empty library rather than an error.
+void jellyfin_session_expired(void);
+
+// Screens (each blocks until the user navigates away)
+int  do_login(void);   // 1 signed in, 0 refused / unreachable, -1 backed out
+void show_library_browser(void);
+void show_search(void);
+void show_main_menu(void);

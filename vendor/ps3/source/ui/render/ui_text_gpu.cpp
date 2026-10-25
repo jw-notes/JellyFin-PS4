@@ -1,0 +1,607 @@
+// GPU text runs -- see ui_text_gpu.h for the measurement that motivates this.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <rsx/rsx.h>
+#include <rsx/gcm_sys.h>
+
+#include "rsxutil.h"
+#include "video_shaders.h"     // video_vp_data / video_fp_data (passthrough)
+#include "ui.h"                // cpu_rt_on, g_cpu_clip_top/bot
+#include "ui_text_gpu.h"
+#include "plog.h"
+#include "jf_paths.h"
+#include "text_shadow.h"
+
+extern void crash_log(const char *msg);
+
+// --- sizing ---------------------------------------------------------------
+//
+// ATLAS: a run at 22 px is roughly 190x26 -- 832-byte pitch x 26 rows, 21 KB.
+// A busy screen is 40-60 distinct runs, so 4 MB holds about 200 of them: every
+// run on screen, plus the colour variants the selection produces as it moves,
+// with room to spare.  When it fills, the whole cache is dropped in one go
+// rather than evicted entry by entry; that costs exactly one frame of the work
+// this path replaces, which is what the frame used to cost every frame.
+//
+// RUN_MAX_W/H bound the staging buffer.  Anything larger falls back to the
+// per-glyph CPU path, so an unexpectedly huge string degrades to today's
+// behaviour instead of failing.
+//
+// 2026-09-24: 12 MB and 1024 slots (were 4 MB and 512).  Under the spine the
+// log showed "run cache flushed (atlas full)" every 2-5 s on busy screens --
+// the quantised fades give every animating label up to 16 colour variants --
+// and each flush makes the next frames re-rasterise and re-upload everything
+// on screen (tm=293 tkb=3567 in one second), a visible hitch every time.
+// VRAM is not what is short on this console; if 12 MB cannot be had, the old
+// 4 MB is used instead (losing the GPU text path would be far worse).
+//
+// 2026-10-14: still flushing every few seconds while flicking between tabs (13
+// whole-cache flushes in two minutes, each a visible hitch), because the table
+// fills at 70% of RUN_SLOTS long before the atlas does.  So nothing is flushed
+// whole any more.  The atlas is ATLAS_SEGS segments filled in turn; when the
+// current one fills, or the table gets dense, the OLDEST segment's runs are
+// dropped and the rest -- including everything still on screen that was drawn
+// recently -- stay.  That happens only in ui_text_gpu_begin(), when no draw is
+// queued, so no queued draw can lose its texture or its slot.  A run that
+// cannot be placed mid-frame takes the CPU path for that frame, as before.
+#define ATLAS_SEGS       8
+#define ATLAS_BYTES_WANT (12u * 1024u * 1024u)
+#define ATLAS_BYTES_MIN  (4u * 1024u * 1024u)
+#define RUN_SLOTS     1024           // power of two, open-addressed
+#define RUN_KEY_MAX   120            // longer strings use the CPU path
+#define RUN_MAX_W     1920
+#define RUN_MAX_H     96             // biggest UI face is ~30 px; 96 is slack
+#define QUEUE_MAX     512
+
+// Texture pitch must be 64-byte aligned -- same rule the thumbnail VRAM
+// mirrors follow (thumbnail_cache.cpp), and the same reason: RSX linear
+// textures have no sub-64-byte pitch.
+#define VRAM_PITCH(w) ((((u32)(w) * 4u) + 63u) & ~63u)
+
+typedef struct {
+    u32   hash;
+    float px;
+    u32   colour;
+    u32   off;                 // RSX offset of this run's texture
+    u32   pitch;               // bytes per row, 64-byte aligned
+    s16   w, h, ox, oy;
+    u8    face;
+    u8    len;
+    bool  used;
+    char  key[RUN_KEY_MAX];
+} RunSlot;
+
+typedef struct {
+    u16 slot;
+    s16 x, y;                  // top-left of the ink, framebuffer pixels
+    s16 clip_top, clip_bot;    // g_cpu_clip_* at the time it was queued
+    s16 clip_left;             // g_text_clip_left at the time it was queued
+} RunDraw;
+
+int g_text_clip_left = 0;
+
+static RunSlot  s_runs[RUN_SLOTS];
+static u32      s_run_count = 0;
+
+static u8      *s_atlas      = NULL;   // rsxMemalign'd VRAM
+static u32      s_atlas_off  = 0;
+static u32      s_atlas_bytes = 0;     // what was allocated: WANT, else MIN
+static u32      s_seg_bytes  = 0;      // s_atlas_bytes / ATLAS_SEGS, 128-aligned
+static u32      s_seg_cur    = 0;      // segment new runs go into
+static u32      s_seg_used   = 0;      // bytes used in it
+static bool     s_seg_full   = false;  // a run did not fit this frame: move on
+// A queued draw holds only a RunSlot index, and that slot's texture points
+// into this atlas.  Resetting either while a frame still has queued draws
+// would make an earlier label disappear or (worse) draw a later label at its
+// coordinates.  Defer a needed reset until the next collection window, when
+// the prior frame has been submitted.
+static bool     s_reset_pending = false;
+
+static u32     *s_stage      = NULL;   // main-memory rasterization scratch
+static RunDraw  s_queue[QUEUE_MAX];
+static u32      s_queued     = 0;
+
+static bool     s_ready      = false;
+static bool     s_window     = false;  // inside begin()/flush()
+static u32      s_fp_off     = 0;
+static u32     *s_fp_buf     = NULL;
+
+static u32 s_st_runs, s_st_misses, s_st_bytes, s_st_flushes;
+
+// --- the gate -------------------------------------------------------------
+//
+// Was OPT-IN, for the same reason ui_card_gpu.cpp was: this
+// binds RSX textures from a part of the app that historically bound none, and
+// a bad bind on this hardware does not fail politely -- it wedges the GPU,
+// takes the console off the network and needs a power cycle.  Put "0" in
+// /dev_hdd0/tmp/jellyfin_gputext.txt to fall back to the CPU path.
+#define GPUTEXT_FILE "jellyfin_gputext.txt"
+// ON by default since 2026-09-27 (proven on hardware); "0" turns it off.
+static bool gputext_enabled(void)
+{
+    FILE *f = fopen(jf_data_path(GPUTEXT_FILE), "r");
+    if (!f) return true;
+    int v = 1;
+    bool on = !(fscanf(f, "%d", &v) == 1 && v == 0);
+    fclose(f);
+    return on;
+}
+
+void ui_text_gpu_init(void)
+{
+    if (s_ready) return;
+    if (!gputext_enabled()) {
+        plog("text_gpu: disabled (jellyfin_gputext.txt absent) -- CPU glyph blits");
+        crash_log("text_gpu: OFF (CPU glyphs)");
+        return;
+    }
+
+    s_stage = (u32 *)malloc((size_t)RUN_MAX_W * RUN_MAX_H * 4u);
+    if (!s_stage) {
+        plog("text_gpu: staging alloc FAILED -- staying on the CPU path");
+        return;
+    }
+
+    s_atlas_bytes = ATLAS_BYTES_WANT;
+    s_atlas = (u8 *)rsxMemalign(128, s_atlas_bytes);
+    if (!s_atlas) {
+        s_atlas_bytes = ATLAS_BYTES_MIN;
+        s_atlas = (u8 *)rsxMemalign(128, s_atlas_bytes);
+    }
+    if (!s_atlas) {
+        free(s_stage); s_stage = NULL;
+        plog("text_gpu: VRAM atlas alloc FAILED -- staying on the CPU path");
+        return;
+    }
+    rsxAddressToOffset(s_atlas, &s_atlas_off);
+    s_seg_bytes = (s_atlas_bytes / ATLAS_SEGS) & ~127u;
+
+    // Private copy of the passthrough fragment program, so this does not
+    // depend on when the video path happens to have uploaded its own.
+    rsxFragmentProgram *fpo = (rsxFragmentProgram *)video_fp_data;
+    void *ucode; u32 size;
+    rsxFragmentProgramGetUCode(fpo, &ucode, &size);
+    s_fp_buf = (u32 *)rsxMemalign(256, size);
+    if (!s_fp_buf) {
+        rsxFree(s_atlas); s_atlas = NULL;
+        free(s_stage);    s_stage = NULL;
+        plog("text_gpu: fragment program alloc FAILED -- staying on the CPU path");
+        return;
+    }
+    memcpy(s_fp_buf, ucode, size);
+    rsxAddressToOffset(s_fp_buf, &s_fp_off);
+
+    s_ready = true;
+    {
+        char line[96];
+        snprintf(line, sizeof(line),
+                 "text_gpu: ready -- %u KB atlas, text runs go through the RSX",
+                 (unsigned)(s_atlas_bytes / 1024u));
+        plog(line);
+    }
+    // crash_log is synchronous and survives a power cycle; plog's buffered
+    // tail is the first thing lost if a bad bind takes the console down.
+    crash_log("text_gpu: ON (RSX run textures)");
+}
+
+bool ui_text_gpu_ready(void) { return s_ready; }
+
+void ui_text_gpu_stats_reset(void)
+{
+    s_st_runs = s_st_misses = s_st_bytes = s_st_flushes = 0;
+}
+
+void ui_text_gpu_stats_get(u32 *runs, u32 *misses, u32 *bytes, u32 *flushes)
+{
+    if (runs)    *runs    = s_st_runs;
+    if (misses)  *misses  = s_st_misses;
+    if (bytes)   *bytes   = s_st_bytes;
+    if (flushes) *flushes = s_st_flushes;
+}
+
+// --- run cache ------------------------------------------------------------
+
+static u32 run_hash(const char *text, int len, float px, int face, u32 colour)
+{
+    u32 h = 2166136261u;
+    for (int i = 0; i < len; i++) { h ^= (u8)text[i]; h *= 16777619u; }
+    h ^= (u32)(px * 4.0f + 0.5f) * 40503u;
+    h ^= (u32)face * 2246822519u;
+    h ^= colour * 2654435761u;
+    h ^= h >> 15;
+    return h;
+}
+
+static void runs_flush_all(void)
+{
+    memset(s_runs, 0, sizeof(s_runs));
+    s_run_count  = 0;
+    s_seg_cur    = 0;
+    s_seg_used   = 0;
+    s_seg_full   = false;
+    s_reset_pending = false;
+    plog("text_gpu: run cache flushed");
+}
+
+static inline u32 run_seg(const RunSlot *s) { return (s->off - s_atlas_off) / s_seg_bytes; }
+
+// Put every live run back into a clean table.  Slots move, so this runs only
+// with nothing queued (ui_text_gpu_begin).
+static void table_rebuild(void)
+{
+    static RunSlot keep[RUN_SLOTS];
+    u32 n = 0;
+    for (u32 i = 0; i < RUN_SLOTS; i++)
+        if (s_runs[i].used) keep[n++] = s_runs[i];
+    memset(s_runs, 0, sizeof(s_runs));
+    const u32 mask = RUN_SLOTS - 1;
+    for (u32 k = 0; k < n; k++) {
+        u32 i = keep[k].hash & mask;
+        while (s_runs[i].used) i = (i + 1) & mask;
+        s_runs[i] = keep[k];
+    }
+    s_run_count = n;
+}
+
+static u32 seg_drop(u32 seg)
+{
+    u32 n = 0;
+    for (u32 i = 0; i < RUN_SLOTS; i++)
+        if (s_runs[i].used && run_seg(&s_runs[i]) == seg) { s_runs[i].used = false; n++; }
+    return n;
+}
+
+// Called with an empty queue.  Moves to the next segment when the current one
+// is mostly used (or a run did not fit), dropping what that segment held --
+// the oldest runs -- and keeps the table at most half full by dropping the
+// next-oldest segments.
+static void runs_maintain(void)
+{
+    u32 dropped = 0;
+    bool changed = false;
+    if (s_seg_full || s_seg_used > s_seg_bytes / 4u * 3u) {
+        s_seg_cur  = (s_seg_cur + 1) % ATLAS_SEGS;
+        s_seg_used = 0;
+        dropped += seg_drop(s_seg_cur);
+        changed = true;
+    }
+    s_seg_full = false;
+    for (u32 d = 1; d < ATLAS_SEGS && (s_run_count - dropped) * 2 > RUN_SLOTS; d++) {
+        dropped += seg_drop((s_seg_cur + d) % ATLAS_SEGS);
+        changed = true;
+    }
+    if (changed) {
+        table_rebuild();
+        if (dropped) {
+            char b[80];
+            snprintf(b, sizeof b, "text_gpu: aged out %u runs (%u kept)", (unsigned)dropped,
+                     (unsigned)s_run_count);
+            plog(b);
+        }
+    }
+}
+
+// Copy a rasterized run from main-memory staging into the VRAM atlas.
+//
+// Rasterizing straight into video memory would be exactly the mistake this
+// whole path exists to avoid: glyph compositing is scattered read-modify-write
+// and VRAM reads are ~100x slower than writes.  Staging in main memory keeps
+// the RMW where it is cheap and turns the VRAM traffic into one sequential
+// write per row, which is the case write-gathering handles well (767 MB/s
+// measured, faster than main->main memcpy).
+static bool atlas_upload(const u32 *src, int w, int h, u32 *out_off, u32 *out_pitch)
+{
+    const u32 pitch = VRAM_PITCH(w);
+    const u32 need  = pitch * (u32)h;
+    const u32 padded_need = (need + 127u) & ~127u;
+
+    if (padded_need > s_seg_bytes) return false;        // absurd: use the CPU path
+    if (s_seg_used + padded_need > s_seg_bytes) {
+        // The segment is full.  This run takes the CPU path for this frame;
+        // the next frame's begin() moves to the next segment.
+        s_seg_full = true;
+        return false;
+    }
+
+    const u32 at = s_seg_cur * s_seg_bytes + s_seg_used;
+    u8 *dst = s_atlas + at;
+    for (int row = 0; row < h; row++)
+        memcpy(dst + (size_t)row * pitch, src + (size_t)row * w, (size_t)w * 4u);
+
+    *out_off   = s_atlas_off + at;
+    *out_pitch = pitch;
+    s_seg_used += padded_need;                          // keep offsets aligned
+    s_st_bytes   += need;
+    return true;
+}
+
+// Light text gets a soft dark shadow baked in when it is rasterized, so titles
+// stay readable over the XMB wave -- see text_shadow.h.
+static u8 s_shadow_cov[RUN_MAX_W * RUN_MAX_H];
+
+// Face id for icon entries.  Out of band with the real faces (0..4) so the
+// existing hash and the memcmp on `key` separate icons from text with no
+// change to either.
+#define RUN_FACE_ICON 0xEE
+
+// Find, or build, the cached run for this exact (text, px, face, colour).
+//
+// `icon_cp` >= 0 selects the icon seam instead of the text one: the key bytes
+// are then the codepoint rather than a string, and measurement/rasterization
+// go through ttf_icon_box()/ttf_icon_raster(), which skip the gamma bake.
+static const RunSlot *run_get(const char *text, int len, float px, int face,
+                              u32 colour, int icon_cp)
+{
+    const u32 mask = RUN_SLOTS - 1;
+    const u32 hash = run_hash(text, len, px, face, colour);
+    u32 i = hash & mask;
+
+    for (u32 p = 0; p < RUN_SLOTS; p++, i = (i + 1) & mask) {
+        RunSlot *s = &s_runs[i];
+        if (s->used) {
+            if (s->hash == hash && s->len == (u8)len && s->px == px &&
+                s->face == (u8)face && s->colour == colour &&
+                memcmp(s->key, text, (size_t)len) == 0)
+                return s;
+            continue;                                   // collision: keep probing
+        }
+
+        // Miss.  Measure, rasterize into staging, upload.
+        TtfRunBox box;
+        if (icon_cp >= 0) {
+            if (!ttf_icon_box(icon_cp, px, &box)) return NULL;  // no ink
+        } else {
+            if (!ttf_run_box(text, px, face, &box)) return NULL;
+        }
+        if (box.w <= 0 || box.h <= 0)            return NULL;
+        const bool shadow = icon_cp < 0 && text_shadow_wanted(colour);
+        const int  sh_px  = text_shadow_px(display_height);
+        if (shadow) { box.w += sh_px; box.h += sh_px; }
+        if (box.w > RUN_MAX_W || box.h > RUN_MAX_H) return NULL;
+
+        // A dense table probes badly.  begin() keeps it at most half full;
+        // a frame that adds this many runs draws the rest on the CPU.
+        if ((s_run_count + 1) * 10 > RUN_SLOTS * 7) {
+            s_seg_full = true;
+            return NULL;
+        }
+
+        if (icon_cp >= 0) ttf_icon_raster(icon_cp, px, colour, s_stage, &box);
+        else              ttf_run_raster(text, px, face, colour, s_stage, &box);
+        if (shadow) text_shadow_bake(s_stage, box.w, box.h, sh_px, s_shadow_cov);
+
+        u32 off, pitch;
+        if (!atlas_upload(s_stage, box.w, box.h, &off, &pitch)) return NULL;
+
+        i = hash & mask;
+        while (s_runs[i].used) i = (i + 1) & mask;
+        s = &s_runs[i];
+
+        s->hash   = hash;
+        s->px     = px;
+        s->colour = colour;
+        s->off    = off;
+        s->pitch  = pitch;
+        s->w      = (s16)box.w;  s->h  = (s16)box.h;
+        s->ox     = (s16)box.ox; s->oy = (s16)box.oy;
+        s->face   = (u8)face;
+        s->len    = (u8)len;
+        s->used   = true;
+        memcpy(s->key, text, (size_t)len);
+        s_run_count++;
+        s_st_misses++;
+        return s;
+    }
+    return NULL;   // table full even after a flush -- cannot happen in practice
+}
+
+// --- the collecting window ------------------------------------------------
+
+void ui_text_gpu_begin(void)
+{
+    if (!s_ready) return;
+    // Drop the queue FIRST, then recycle: once nothing references a slot the
+    // reset is unconditionally safe, and the previous frame's quads are long
+    // since consumed -- flip() queued the buffer swap behind them and
+    // waitflip() plus rsxSync() have both been through since.
+    s_queued = 0;
+    if (s_reset_pending) runs_flush_all();
+    else                 runs_maintain();
+    s_window = true;
+}
+
+// Append one resolved slot to the frame's draw queue.  Shared by the text and
+// icon entry points so they cannot drift in how they anchor the quad.
+static void queue_run(const RunSlot *r, u32 x, u32 y)
+{
+    RunDraw *d = &s_queue[s_queued++];
+    d->slot     = (u16)(r - s_runs);
+    d->x        = (s16)((int)x + r->ox);
+    d->y        = (s16)((int)y + r->oy);
+    d->clip_top  = (s16)g_cpu_clip_top;
+    d->clip_bot  = (s16)g_cpu_clip_bot;
+    d->clip_left = (s16)g_text_clip_left;
+    s_st_runs++;
+}
+
+bool ui_text_gpu_run(u32 x, u32 y, const char *text, float px, u32 colour,
+                     int face)
+{
+    if (!s_ready || !s_window) return false;
+    // While a CPU compose target is bound (the player HUD's overlay), drawing
+    // must land in that main-memory buffer, not on the screen.
+    if (cpu_rt_on()) return false;
+    if (s_queued >= QUEUE_MAX) return false;
+    if (!text || !*text) return true;          // nothing to draw either way
+
+    size_t len = strlen(text);
+    if (len == 0 || len > RUN_KEY_MAX) return false;
+
+    const RunSlot *r = run_get(text, (int)len, px, face, colour, -1);
+    if (!r) return false;
+
+    queue_run(r, x, y);
+    return true;
+}
+
+bool ui_text_gpu_icon(u32 x, u32 y, int codepoint, float px, u32 colour)
+{
+    if (!s_ready || !s_window) return false;
+    if (cpu_rt_on()) return false;
+    if (s_queued >= QUEUE_MAX) return false;
+    if (codepoint <= 0) return false;
+
+    // The codepoint IS the key.  Four raw bytes rather than a UTF-8 encoding,
+    // so nothing downstream is tempted to read it as text.
+    char key[4];
+    key[0] = (char)( (u32)codepoint        & 0xFF);
+    key[1] = (char)(((u32)codepoint >>  8) & 0xFF);
+    key[2] = (char)(((u32)codepoint >> 16) & 0xFF);
+    key[3] = (char)(((u32)codepoint >> 24) & 0xFF);
+
+    const RunSlot *r = run_get(key, 4, px, RUN_FACE_ICON, colour, codepoint);
+    if (!r) return false;
+
+    queue_run(r, x, y);
+    return true;
+}
+
+// Bind one run's texture.  Same descriptor as ui_card_gpu's bind_card, with
+// NEAREST filtering for the same reason: the CPU blit this replaces did no
+// filtering, and the brief is explicit that the existing design must not
+// shift.  Runs are drawn 1:1, so there is nothing to gain from linear anyway.
+static void bind_run(const RunSlot *r)
+{
+    gcmTexture tex;
+    memset(&tex, 0, sizeof(tex));
+    tex.format    = GCM_TEXTURE_FORMAT_A8R8G8B8 | GCM_TEXTURE_FORMAT_LIN;
+    tex.mipmap    = 1;
+    tex.dimension = GCM_TEXTURE_DIMS_2D;
+    tex.cubemap   = GCM_FALSE;
+    tex.remap     =
+        ((u32)GCM_TEXTURE_REMAP_TYPE_REMAP << GCM_TEXTURE_REMAP_TYPE_A_SHIFT)
+      | ((u32)GCM_TEXTURE_REMAP_TYPE_REMAP << GCM_TEXTURE_REMAP_TYPE_R_SHIFT)
+      | ((u32)GCM_TEXTURE_REMAP_COLOR_R    << GCM_TEXTURE_REMAP_COLOR_R_SHIFT)
+      | ((u32)GCM_TEXTURE_REMAP_TYPE_REMAP << GCM_TEXTURE_REMAP_TYPE_G_SHIFT)
+      | ((u32)GCM_TEXTURE_REMAP_COLOR_G    << GCM_TEXTURE_REMAP_COLOR_G_SHIFT)
+      | ((u32)GCM_TEXTURE_REMAP_TYPE_REMAP << GCM_TEXTURE_REMAP_TYPE_B_SHIFT)
+      | ((u32)GCM_TEXTURE_REMAP_COLOR_B    << GCM_TEXTURE_REMAP_COLOR_B_SHIFT);
+    tex.width    = (u16)r->w;
+    tex.height   = (u16)r->h;
+    tex.depth    = 1;
+    tex.location = GCM_LOCATION_RSX;
+    tex.pitch    = r->pitch;
+    tex.offset   = r->off;
+
+    rsxInvalidateTextureCache(context, GCM_INVALIDATE_TEXTURE);
+    rsxLoadTexture(context, 0, &tex);
+    rsxTextureControl(context, 0, GCM_TRUE, 0, 12 << 8, GCM_TEXTURE_MAX_ANISO_1);
+    rsxTextureFilter(context, 0, 0,
+        GCM_TEXTURE_NEAREST, GCM_TEXTURE_NEAREST,
+        GCM_TEXTURE_CONVOLUTION_QUINCUNX);
+    rsxTextureWrapMode(context, 0,
+        GCM_TEXTURE_CLAMP_TO_EDGE, GCM_TEXTURE_CLAMP_TO_EDGE,
+        GCM_TEXTURE_CLAMP_TO_EDGE, 0, GCM_TEXTURE_ZFUNC_LESS, 0);
+}
+
+static void submit_queue(void)
+{
+    if (!s_queued) return;
+
+    // These quads BLEND, so the RSX reads back the pixels the PPU has just
+    // written to the framebuffer this frame.  Those writes went through the
+    // PPU's write-gather buffer; drain it before the RSX can look.  In
+    // practice rsxFlushBuffer() in flip() would order it anyway -- that is why
+    // scanout never shows a torn CPU draw -- but a barrier here is free once a
+    // frame and makes the dependency explicit rather than incidental.
+    __asm__ __volatile__ ("sync" ::: "memory");
+
+    rsxVertexProgram   *vpo = (rsxVertexProgram *)  video_vp_data;
+    rsxFragmentProgram *fpo = (rsxFragmentProgram *)video_fp_data;
+    void *vp_ucode; u32 vp_size;
+    rsxVertexProgramGetUCode(vpo, &vp_ucode, &vp_size);
+    rsxLoadVertexProgram(context, vpo, vp_ucode);
+    rsxSetVertexAttribOutputMask(context, vpo->output_mask);
+    rsxLoadFragmentProgramLocation(context, fpo, s_fp_off, GCM_LOCATION_RSX);
+
+    rsxSetDepthTestEnable(context, GCM_FALSE);
+    rsxSetDepthWriteEnable(context, GCM_FALSE);
+    rsxSetBlendFunc(context,
+        GCM_SRC_ALPHA, GCM_ONE_MINUS_SRC_ALPHA,
+        GCM_SRC_ALPHA, GCM_ONE_MINUS_SRC_ALPHA);
+    rsxSetBlendEquation(context, GCM_FUNC_ADD, GCM_FUNC_ADD);
+    rsxSetBlendEnable(context, GCM_TRUE);
+
+    const float W = (float)display_width, H = (float)display_height;
+    int cur_top = -1, cur_bot = -1, cur_left = -1;
+
+    for (u32 q = 0; q < s_queued; q++) {
+        const RunDraw *d = &s_queue[q];
+        const RunSlot *r = &s_runs[d->slot];
+        if (!r->used) continue;          // defensive: slots change only in begin()
+
+        // The vertical scissor the CPU primitives honour through
+        // cpu_row_clipped() has to mean the same thing here, or a Home shelf
+        // scrolling out of its band would write its labels over the tab bar.
+        int top = d->clip_top, bot = d->clip_bot;
+        if (top < 0) top = 0;
+        if (bot <= 0 || bot > (int)display_height) bot = (int)display_height;
+        if (bot <= top) { top = 0; bot = (int)display_height; }
+        int left = d->clip_left;
+        if (left < 0 || left >= (int)display_width) left = 0;
+        if (top != cur_top || bot != cur_bot || left != cur_left) {
+            rsxSetScissor(context, (u16)left, (u16)top,
+                          (u16)((int)display_width - left), (u16)(bot - top));
+            cur_top = top; cur_bot = bot; cur_left = left;
+        }
+
+        bind_run(r);
+
+        const float x0 = (2.0f * (float)d->x            / W) - 1.0f;
+        const float x1 = (2.0f * (float)(d->x + r->w)   / W) - 1.0f;
+        const float y0 = 1.0f - (2.0f * (float)d->y          / H);
+        const float y1 = 1.0f - (2.0f * (float)(d->y + r->h) / H);
+
+        // TEX0 before POS: the POS write latches the vertex.  Backwards and
+        // the attribute is silently dropped -- same rule as ui_card_gpu.cpp.
+        const float uv_tl[4] = { 0.f, 0.f, 0.f, 1.f }, p_tl[4] = { x0, y0, 0.f, 1.f };
+        const float uv_tr[4] = { 1.f, 0.f, 0.f, 1.f }, p_tr[4] = { x1, y0, 0.f, 1.f };
+        const float uv_bl[4] = { 0.f, 1.f, 0.f, 1.f }, p_bl[4] = { x0, y1, 0.f, 1.f };
+        const float uv_br[4] = { 1.f, 1.f, 0.f, 1.f }, p_br[4] = { x1, y1, 0.f, 1.f };
+
+        rsxDrawVertexBegin(context, GCM_TYPE_TRIANGLE_STRIP);
+        rsxDrawVertex4f(context, GCM_VERTEX_ATTRIB_TEX0, uv_tl);
+        rsxDrawVertex4f(context, GCM_VERTEX_ATTRIB_POS,  p_tl);
+        rsxDrawVertex4f(context, GCM_VERTEX_ATTRIB_TEX0, uv_tr);
+        rsxDrawVertex4f(context, GCM_VERTEX_ATTRIB_POS,  p_tr);
+        rsxDrawVertex4f(context, GCM_VERTEX_ATTRIB_TEX0, uv_bl);
+        rsxDrawVertex4f(context, GCM_VERTEX_ATTRIB_POS,  p_bl);
+        rsxDrawVertex4f(context, GCM_VERTEX_ATTRIB_TEX0, uv_br);
+        rsxDrawVertex4f(context, GCM_VERTEX_ATTRIB_POS,  p_br);
+        rsxDrawVertexEnd(context);
+    }
+
+    // Leave the scissor covering the whole surface.  A stale scissor would
+    // silently clip the wave and the video quad on later frames, which reads
+    // as a rendering fault rather than the state leak it is.
+    rsxSetScissor(context, 0, 0, (u16)display_width, (u16)display_height);
+    s_queued = 0;
+    s_st_flushes++;
+}
+
+void ui_text_gpu_flush(void)
+{
+    if (!s_ready) return;
+    submit_queue();
+    s_window = false;
+}
+
+void ui_text_gpu_flush_fenced(void)
+{
+    if (!s_ready || !s_queued) return;
+    submit_queue();
+    rsxSync();   // CPU framebuffer writes follow; they must not race the quads
+}

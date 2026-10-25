@@ -1,0 +1,127 @@
+#pragma once
+// Shared state and constants internal to the HUD (hud_core / hud_dim /
+// hud_draw).  The public API is player_hud.h.
+
+#include <ppu-types.h>
+
+// -------------------------------------------------------
+// Visual constants
+// -------------------------------------------------------
+// Matches the XMB palette (ui_visuals.h): violet accent, indigo dims.
+#define HUD_ACCENT          0x008F6FE8UL
+#define HUD_ACCENT_DIM      0x00232950UL
+#define HUD_DIMMED          0x00555C84UL   // unfocused when another slot is active
+#define HUD_FOCUSED         0x00FFFFFFUL   // white for focused control
+#define HUD_SHOW_US         4000000ULL
+#define HUD_SHOW_PAUSED_US  8000000ULL   // paused: the bar still goes, after a longer idle
+
+#define HUD_STRIP_H          64
+#define CTRL_Y_OFF  (HUD_STRIP_H / 2)      // control row centred in the strip
+#define TRACK_H               4
+#define SCRUB_R               6
+#define LEFT_PAD             50
+#define RIGHT_PAD            50
+#define CTRL_GAP             10            // gap between transport control glyphs
+#define TIME_GAP             12            // gap between time label edge and seek bar
+#define RCTRL_GAP            12            // gap between remaining time and right controls
+
+#define ROW_ICON_PX          36.0f         // L2/R2 button sprite height
+#define ROW_TEXT_PX          18.0f         // time + audio label text size
+#define MUSIC_ICON_PX        24.0f
+#define SPK_ICON_PX          24.0f         // volume/speaker glyph height
+#define CC_TEXT_PX           20.0f
+#define ICON_LABEL_GAP        6
+#define AUDIO_SEP            16            // horizontal gap between audio btn and CC btn
+
+// Trickplay scrub-preview card (shown above the seek bar while hold-scrubbing)
+#define CARD_PAD              6             // backdrop margin around the tile
+#define CARD_GAP             14             // gap between card bottom and the track
+
+// Volume slider (shown above the speaker control while adjusting)
+#define VOL_STEP              5            // % per d-pad step
+#define VOL_TRACK_W           6            // slider track width
+#define VOL_TRACK_H          90            // slider track height
+#define VOL_KNOB_R            7            // slider knob radius
+
+#define PP_H                 22            // play/pause primitive bounding height (px)
+#define PP_W                 22            // play/pause primitive bounding width  (px)
+
+// Title overlay (top-left while paused)
+#define TITLE_PX           24.0f           // a touch under the subtitle size
+#define TITLE_TOP_PAD        34
+
+// Popup menu (track selection)
+#define MENU_MAX              49           // the chapter list (JF_MAX_CHAPTERS + 1); tracks need 17 (JF_MAX_AUDIO)
+#define MENU_TITLE_PX      22.0f
+#define MENU_TITLE_H         38            // title row height incl. padding
+#define MENU_ROW_H           30
+#define MENU_PAD             16            // popup inner padding
+#define MENU_DOT_COL         22            // width of the current-entry dot column
+
+#define MATERIAL_MUSIC_NOTE  ICON_MUSIC   // Tabler music glyph (icons.h)
+
+// Focus slot indices — screen order across the control row.
+#define FOCUS_REW    0
+#define FOCUS_PP     1
+#define FOCUS_FF     2
+#define FOCUS_AUDIO  3
+#define FOCUS_VOLUME 4
+#define FOCUS_CC     5
+#define FOCUS_ASPECT 6          // the picture-shape chip, bottom right
+#define FOCUS_COUNT  7
+
+// -------------------------------------------------------
+// State (defined in hud_core.cpp)
+// -------------------------------------------------------
+
+struct HudState {
+    u32  total_secs;
+    char audio_label[64];
+    char title[128];
+    bool visible;
+    u64  show_us;
+    int  seek_delta;
+    int  focus;        // -1=none, 0..FOCUS_COUNT-1=focused slot
+    int  incr_idx;     // 0=10s  1=30s  2=5min
+    bool cc_active;    // subtitles on -> underline the CC button
+    bool vol_active;   // volume slider open (speaker control clicked)
+
+    // Live TV (hud_set_live*)
+    bool live;
+    char live_title[96];
+    char live_times[24];
+    int  live_permille;     // -1 = unknown
+    u32  live_epoch;        // bumped when any live text changes (the compose key)
+    char banner[160];
+    char banner_sub[160];
+    u64  banner_until_us;
+    bool banner_solo;       // the banner alone, no bar (hud_set_picture_banner)
+
+    // Popup menu state.  Items are caller-owned pointers (track labels live
+    // in the player's static JFTracks, so they outlive the menu).
+    bool        menu_visible;
+    char        menu_title[24];
+    const char *menu_items[MENU_MAX];
+    int         menu_n;
+    int         menu_sel;      // cursor row
+    int         menu_cur;      // active entry (accent dot)
+    int         menu_choice;   // last X-selected row
+    u32         menu_epoch;    // forces recompose when a different menu opens
+};
+
+extern HudState g_hud;
+
+// Make the HUD visible and restart its auto-hide timer (hud_core.cpp).
+void hud_show(void);
+
+// Darken the rectangle on the framebuffer.  Selects the configured dim path
+// (inline GPU quad by default) and fences the GPU paths with rsxSync before
+// returning, so CPU pixel writes may follow immediately (hud_dim.cpp).
+// Note: hud_draw no longer uses this — the HUD is composed into a texture
+// and GPU-blended (hud_draw.cpp); kept for the compile-define fallbacks.
+void hud_dim_rect(u32 rx, u32 ry, u32 rw, u32 rh, u8 alpha);
+
+// Overlay texture + staging buffer for the GPU-composited HUD (hud_draw.cpp).
+// Allocated/freed with the other HUD GPU resources in hud_gpu_init/shutdown.
+void hud_overlay_alloc(void);
+void hud_overlay_free(void);

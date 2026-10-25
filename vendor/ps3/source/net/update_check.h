@@ -1,0 +1,50 @@
+#pragma once
+
+// Version built into this binary.  Keep in step with the GitHub release tag
+// (leading 'v'/'V' is ignored when comparing, so "2.0-beta" matches
+// "V2.0-beta").  Bump this when cutting a release.
+#define APP_VERSION "3.4.3"
+
+// The GitHub repository releases and updates come from.
+#define UPDATE_REPO "jw-notes/JellyFin-PS3"
+
+// Where a newer release is, as the popup and Settings show it.
+#include "update_page.h"
+
+// One-shot background check of the project's GitHub releases.  Runs entirely
+// on its own low-priority thread: start it once after http_init() succeeds
+// and it never blocks or slows the caller.  Every failure (no network, DNS,
+// TLS handshake, timeout, bad JSON) is treated as "no update available".
+// Each run traces its steps and the raw API response to
+// /dev_hdd0/tmp/update_detection.txt regardless of the Debug Logging setting.
+void update_check_start(void);
+
+// Join the worker before tearing the network down at exit.  Safe to call
+// even if update_check_start() was never called.
+void update_check_shutdown(void);
+
+// True once the worker has finished (whether or not it found an update).  At
+// that point it has already unloaded the HTTP/HTTPS/SSL modules and freed its
+// pools, so callers that ran the check early (before reserving big buffers) can
+// poll this to know its memory is released again.
+bool update_check_done(void);
+
+// True once the check has finished AND found a release newer than
+// APP_VERSION; copies the release tag (e.g. "V2.1") into out.  Poll it from
+// a render loop — it never blocks.
+bool update_check_result(char *out, int out_size);
+
+// The newer release's package (download URL, size, SHA-256), for
+// net/update_install.cpp.  False when there is no newer release or it has no
+// .pkg asset.
+struct release_asset;
+bool update_check_asset(struct release_asset *out);
+
+// Where the check stands, for Settings > Software Update.
+enum { UPD_IDLE, UPD_CHECKING, UPD_CURRENT, UPD_AVAILABLE, UPD_FAILED };
+int update_check_state(void);
+
+// Settings: run the check again (X on Software Update).  False while one is
+// still running.  Its memory (~0.5 MB for HTTPS/SSL) comes from the heap as
+// it is then; if that is short the check fails and says so, nothing worse.
+bool update_check_again(void);

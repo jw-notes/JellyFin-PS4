@@ -1,0 +1,239 @@
+#include "video.h"
+#include "video_internal.h"
+#include "plog.h"
+#include "hd1080.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <malloc.h>
+#include <sys/mutex.h>
+
+// -------------------------------------------------------
+// Jitter buffer
+// -------------------------------------------------------
+// Single producer (decode thread, via the video_internal.h producer API),
+// single consumer (display thread, via the public jbuf_* API).
+// s_jbuf_mtx guards s_jb_n and the read/write indices.
+
+sys_mutex_t s_jbuf_mtx;
+
+static u8  *s_jbuf_data[JBUF_MAX_SLOTS] = {};
+static u64  s_jbuf_pts[JBUF_MAX_SLOTS]  = {};
+static s64  s_jbuf_dur[JBUF_MAX_SLOTS]  = {};  // remaining display duration per slot (us)
+static u32  s_jbuf_seq[JBUF_MAX_SLOTS]  = {};
+static u32  s_seq_counter          = 0;
+static u32  s_jbuf_fw = 0, s_jbuf_fh = 0;
+static int  s_jb_wr = 0, s_jb_rd = 0;
+static volatile int s_jb_n = 0;
+
+// Slot buffers are CACHED once allocated: jbuf_reserve() grabs them at boot
+// (before the UI fragments the heap) and jbuf_free() keeps them.  The big
+// three (VDEC arena, these slots, HUD overlay) total ~162MB against a heap
+// with only a few MB of slack, so allocating them per-session made every
+// session a dice roll on whatever the UI had done to the heap layout.
+static u32 s_jbuf_slot_bytes = 0;     // capacity of each cached slot
+static int s_jb_cap = JBUF_SD_SLOTS;  // active ring capacity (set by jbuf_reserve)
+
+// Active ring capacity: fewer slots for 1080p so the big frames fit.  The ring
+// modulus/full-checks below all use this, so slots >= s_jb_cap are never
+// touched even though the static arrays are always JBUF_MAX_SLOTS long.
+//
+// Keyed off the SLOT SIZE, not the 1080p toggle.  Since the info screen gained
+// a quality row, the frame size no longer follows that toggle: asking for
+// 1080p with the toggle off used to leave the capacity at the 24-slot SD
+// figure while each slot held a 3.13 MB 1080p frame — a 75 MB jitter buffer,
+// which is more than the console has left at that point.
+// 1080p is 3.13 MB a slot, 720p 1.32 MB; anything above 2 MB is the big path.
+static int jbuf_cap_for_bytes(u32 slot_bytes) {
+    return (slot_bytes > 2u * 1024u * 1024u) ? JBUF_1080_SLOTS : JBUF_SD_SLOTS;
+}
+
+int jbuf_cap(void) { return s_jb_cap; }
+
+// Prefill target must not exceed the capacity or the prefill loop can never
+// reach it (it would spin the whole guard budget forever at 1080p).
+int jbuf_prefill_target(void) {
+    int cap = jbuf_cap();
+    return JBUF_PREFILL < cap ? JBUF_PREFILL : cap;
+}
+
+// Planar YUV420P, 1.5 bpp — the universal frame format.  The decoder writes
+// tight planar YUV (picsize == fw*fh*3/2); round the height up to a macroblock
+// (16) for headroom.  This sizes the jitter-buffer slot that holds the whole
+// planar frame (Y|Cb|Cr); the RSX plane textures are sized separately.
+u32 vid_frame_bytes(u32 fw, u32 fh) {
+    u32 fh_pad = (fh + 15u) & ~15u;
+    return fw * fh_pad * 3u / 2u;
+}
+
+// Allocate the slot buffers if not already cached (or cached too small).
+// Returns false with NOTHING left allocated on failure (the old code leaked
+// the partial slots, so each failed attempt made the next one worse).
+//
+// Only the first jbuf_cap() slots are allocated — the 1080p path caches fewer,
+// larger slots.  When the capacity later grows back (1080p -> 720p) the extra
+// slots are (re)allocated here, and when it shrinks the surplus is freed, so
+// the producer never dereferences a NULL slot below the active capacity.
+bool jbuf_reserve(u32 fw, u32 fh) {
+    u32 need = vid_frame_bytes(fw, fh);
+    // From the size about to be reserved, not from any toggle — see
+    // jbuf_cap_for_bytes.
+    int cap  = jbuf_cap_for_bytes(need);
+    s_jb_cap = cap;
+
+    // Drop any slots beyond the active capacity (saves RAM at 1080p).
+    for (int i = cap; i < JBUF_MAX_SLOTS; i++) {
+        if (s_jbuf_data[i]) { free(s_jbuf_data[i]); s_jbuf_data[i] = NULL; }
+    }
+    // If the cached slots are too small for this frame size, they must all be
+    // re-grabbed at the new size.
+    if (s_jbuf_slot_bytes < need) {
+        for (int i = 0; i < JBUF_MAX_SLOTS; i++) {
+            if (s_jbuf_data[i]) { free(s_jbuf_data[i]); s_jbuf_data[i] = NULL; }
+        }
+        s_jbuf_slot_bytes = 0;
+    }
+    // Ensure every active slot is allocated (>= need bytes).
+    for (int i = 0; i < cap; i++) {
+        if (s_jbuf_data[i]) continue;
+        s_jbuf_data[i] = (u8*)memalign(128, need);
+        if (!s_jbuf_data[i]) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "jbuf_reserve: slot %d of %d FAILED (%u KB)",
+                     i, cap, need / 1024);
+            plog(buf);
+            for (int j = 0; j < i; j++) { free(s_jbuf_data[j]); s_jbuf_data[j] = NULL; }
+            s_jbuf_slot_bytes = 0;
+            return false;
+        }
+    }
+    s_jbuf_slot_bytes = need;
+    return true;
+}
+
+bool jbuf_alloc(u32 fw, u32 fh) {
+    if (!jbuf_reserve(fw, fh)) return false;
+    s_jbuf_fw = fw; s_jbuf_fh = fh;
+    s_jb_wr = s_jb_rd = s_jb_n = 0;
+    memset(s_jbuf_pts, 0, sizeof(s_jbuf_pts));
+    memset(s_jbuf_dur, 0, sizeof(s_jbuf_dur));
+    // A zeroed attr is rejected by lv2: until 10-11 this mutex never existed,
+    // and the decode thread's s_jb_n++ raced the display thread's s_jb_n--.
+    sys_mutex_attr_t attr;
+    sysMutexAttrInitialize(attr);
+    attr.attr_protocol  = SYS_LWMUTEX_ATTR_PROTOCOL;
+    attr.attr_recursive = SYS_MUTEX_ATTR_RECURSIVE;
+    if (sysMutexCreate(&s_jbuf_mtx, &attr) != 0) plog("jbuf: mutex create FAILED");
+    return true;
+}
+
+void jbuf_free(void) {
+    // Slot buffers stay cached (see jbuf_reserve) — only session state dies.
+    s_jb_wr = s_jb_rd = s_jb_n = 0;
+    sysMutexDestroy(s_jbuf_mtx);
+}
+
+void jbuf_clear(void) {
+    sysMutexLock(s_jbuf_mtx, 0);
+    s_jb_rd = s_jb_wr = s_jb_n = 0;
+    sysMutexUnlock(s_jbuf_mtx);
+}
+
+const u8 *jbuf_peek(void)     { return (s_jb_n > 0) ? s_jbuf_data[s_jb_rd] : NULL; }
+void      jbuf_pop(void) {
+    sysMutexLock(s_jbuf_mtx, 0);
+    s_jb_rd = (s_jb_rd + 1) % s_jb_cap;
+    s_jb_n--;
+    sysMutexUnlock(s_jbuf_mtx);
+}
+u32       jbuf_fw(void)       { return s_jbuf_fw; }
+u32       jbuf_fh(void)       { return s_jbuf_fh; }
+int       jbuf_count(void)    { return s_jb_n; }
+int       jbuf_rd(void)       { return s_jb_rd; }
+u64       jbuf_peek_pts_us(void) { return (s_jb_n > 0) ? s_jbuf_pts[s_jb_rd] : 0; }
+u32       jbuf_peek_seq(void) { return (s_jb_n > 0) ? s_jbuf_seq[s_jb_rd] : 0; }
+const u8 *jbuf_slot_ptr(int i) { return (i >= 0 && i < JBUF_MAX_SLOTS) ? s_jbuf_data[i] : NULL; }
+
+s64       jbuf_peek_dur(void)      { return (s_jb_n > 0) ? s_jbuf_dur[s_jb_rd] : 0; }
+s64       jbuf_peek_next_dur(void) { return (s_jb_n > 1) ? s_jbuf_dur[(s_jb_rd + 1) % s_jb_cap] : 0; }
+const u8 *jbuf_peek_next(void)     { return (s_jb_n > 1) ? s_jbuf_data[(s_jb_rd + 1) % s_jb_cap] : NULL; }
+
+void jbuf_consume_dur(s64 us) {
+    if (s_jb_n > 0) s_jbuf_dur[s_jb_rd] -= us;
+}
+
+void jbuf_advance(void) {
+    sysMutexLock(s_jbuf_mtx, 0);
+    if (s_jb_n > 0 && s_jbuf_dur[s_jb_rd] <= 0) {
+        s_jb_rd = (s_jb_rd + 1) % s_jb_cap;
+        s_jb_n--;
+    }
+    sysMutexUnlock(s_jbuf_mtx);
+}
+
+// ---- Producer side (decode thread only; see video_internal.h) ----
+
+bool jbuf_full(void) {
+    sysMutexLock(s_jbuf_mtx, 0);
+    bool full = (s_jb_n >= s_jb_cap);
+    sysMutexUnlock(s_jbuf_mtx);
+    return full;
+}
+
+u8  *jbuf_write_ptr(void) { return s_jbuf_data[s_jb_wr]; }
+int  jbuf_write_idx(void) { return s_jb_wr; }
+
+void jbuf_set_dims(u32 fw, u32 fh) { s_jbuf_fw = fw; s_jbuf_fh = fh; }
+u32  jbuf_slot_bytes(void) { return s_jbuf_slot_bytes; }
+
+static int s_front_locked = 2;   // front slots the consumers may be reading
+static u32 s_reordered = 0;   // pictures moved back into timestamp order
+static u32 s_too_late  = 0;   // pictures that arrived behind a slot already in use
+
+void jbuf_set_front_locked(int n) { s_front_locked = (n < 1) ? 1 : n; }
+
+void jbuf_order_stats(u32 *reordered, u32 *too_late) {
+    if (reordered) *reordered = s_reordered;
+    if (too_late)  *too_late  = s_too_late;
+}
+
+static void jbuf_swap(int a, int b) {
+    u8 *d = s_jbuf_data[a]; s_jbuf_data[a] = s_jbuf_data[b]; s_jbuf_data[b] = d;
+    u64 p = s_jbuf_pts[a];  s_jbuf_pts[a]  = s_jbuf_pts[b];  s_jbuf_pts[b]  = p;
+    s64 u = s_jbuf_dur[a];  s_jbuf_dur[a]  = s_jbuf_dur[b];  s_jbuf_dur[b]  = u;
+    u32 q = s_jbuf_seq[a];  s_jbuf_seq[a]  = s_jbuf_seq[b];  s_jbuf_seq[b]  = q;
+}
+
+// VDEC hands pictures out in DECODE order when the stream uses a B-frame
+// pyramid (PTS 1650, 1566, 1525, 1608, ...).  Each new picture is moved back
+// past any queued picture with a later timestamp.  The front slots in use are
+// never touched (jbuf_set_front_locked): the display shows the first, and the
+// upload thread also stages the second when blending.  Slots only trade
+// buffer pointers, never pixels.
+void jbuf_push(u64 pts_us, s64 dur_us) {
+    s_jbuf_pts[s_jb_wr] = pts_us;
+    s_jbuf_dur[s_jb_wr] = dur_us;
+    s_jbuf_seq[s_jb_wr] = ++s_seq_counter;
+    sysMutexLock(s_jbuf_mtx, 0);
+    int k = s_jb_n;                                   // the new picture is front + k
+    s_jb_wr = (s_jb_wr + 1) % s_jb_cap;
+    s_jb_n++;
+    if (pts_us != 0) {
+        bool moved = false;
+        while (k > 0) {
+            const int cur  = (s_jb_rd + k) % s_jb_cap;
+            const int prev = (s_jb_rd + k - 1) % s_jb_cap;
+            if (s_jbuf_pts[prev] <= pts_us) break;
+            // A timestamp a second or more earlier is a discontinuity (a live
+            // stream restarting), not a B-frame: leave it in arrival order.
+            if (s_jbuf_pts[prev] - pts_us >= 1000000ULL) break;
+            if (k - 1 < s_front_locked) { s_too_late++; break; }
+            jbuf_swap(cur, prev);
+            moved = true;
+            k--;
+        }
+        if (moved) s_reordered++;
+    }
+    sysMutexUnlock(s_jbuf_mtx);
+}

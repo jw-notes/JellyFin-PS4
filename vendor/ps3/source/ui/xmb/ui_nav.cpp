@@ -1,0 +1,808 @@
+// XMB navigation — tab switching and the browse-mode input handlers
+// (settings, TV sub-screens, collections sub-screens, jump bar, item lists).
+
+#include "user_prefs.h"
+#include "menusnow.h"
+#include "autoskip.h"
+#include "display_24p.h"
+#include "month_bg.h"
+#include "ui_wave_audio.h"
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "ui_internal.h"
+#include "settings_model.h"   // the Settings rows
+#include "dl_manager.h"       // dl_manager_ready(): the season sheet
+#include "ui_spine.h"        // each category remembers its focus
+#include "ui_sfx.h"          // the menu sounds
+#include "thumbnail_cache.h"
+#include "jellyfin_api.h"
+#include "player.h"
+#include "music_screen.h"
+#include "plog.h"
+#include "timing.h"
+#include "hd1080.h"
+#include "surround.h"
+#include "centermix.h"
+#include "subfont.h"
+#include "subcolor.h"
+#include "statsovl.h"
+#include "update_check.h"
+
+// -------------------------------------------------------
+// Tab switching
+// -------------------------------------------------------
+
+void xmb_switch_tab(int new_tab) {
+    if (new_tab < 0 || new_tab >= XMB_TAB_COUNT) return;
+    if (!g_tabs[new_tab].enabled) return;
+    int old = g_active_tab;
+    // Leaving Settings: this PS3 user's settings go into their save.
+    if (old == XMB_TAB_SETTINGS && new_tab != old) user_prefs_save();
+    // Under the spine each category remembers where it was (render/depth.h).
+    // A tab whose paged window or name filter is dropped just below starts
+    // from its top again, so its old position is forgotten, not restored.
+    spine_focus_leave(old, old != XMB_TAB_SEARCH && old != XMB_TAB_SETTINGS &&
+                           (g_tab_start[old] > 0 || g_tab_name_filter[old][0]));
+    if (old != XMB_TAB_SEARCH && old != XMB_TAB_SETTINGS
+        && (g_tab_start[old] > 0 || g_tab_name_filter[old][0])) {
+        g_items_loaded[old]       = false;
+        g_item_count[old]         = 0;
+        g_tab_start[old]          = 0;
+        g_tab_total[old]          = 0;
+        g_tab_name_filter[old][0] = '\0';
+    }
+    g_jumpbar_active = false;
+    thumb_cache_retarget();
+    g_active_tab = new_tab;
+    g_sel = 0;
+    g_scroll_top = 0;
+    g_tv_depth = 0; g_tv_sub_sel = 0; g_tv_sub_scroll = 0; g_tv_sub_start = 0; g_tv_sub_total = 0;
+    g_col_depth = 0; g_col_sub_sel = 0; g_col_sub_scroll = 0; g_col_sub_start = 0; g_col_sub_total = 0;
+    // Music keeps its sub-tab across visits and lands with the header
+    // focused, so Albums/Artists/Playlists/... is one LEFT/RIGHT away.
+    g_music_depth = 0; g_music_header = (xmb_kind(new_tab) == TABKIND_MUSIC);
+    g_music_sub_sel = 0; g_music_sub_scroll = 0;
+    g_music_sub_count = 0; g_music_sub_total = 0;
+    if (new_tab == XMB_TAB_SEARCH) {
+        g_osk_row = 0; g_osk_col = 0; g_osk_sym = false;
+    }
+    if (new_tab == XMB_TAB_SETTINGS) {
+        g_settings_sel = 0; g_settings_confirm = false;
+        g_settings_cat = -1; g_settings_catsel = 0;     // start on the list of categories
+    }
+    if (xmb_kind(new_tab) == TABKIND_LIVETV) xmb_livetv_on_enter();
+    if (xmb_kind(new_tab) == TABKIND_LOCAL) xmb_media_on_enter();
+    spine_focus_enter(new_tab);     // no-op with the gate off, or first visit
+    xmb_classic_library_enter(new_tab);
+    // Home: reset focus and refetch the dynamic rows (Continue Watching /
+    // Next Up change after every playback).
+    if (new_tab == XMB_TAB_HOME)
+        xmb_home_on_enter();
+}
+
+// Step one tab in DISPLAY order.  Must go through xmb_tab_order(), not raw
+// array indices: Settings holds a low index but renders last, and library
+// tabs are appended in server order.
+//
+// This also wraps, which the old index walk did not — it bailed at the array
+// end, so R1 could never get past the last tab round to Search (the reported
+// "r1 stops at Settings" behaviour).  A tab bar is a ring; treat it as one.
+int xmb_next_enabled(int start, int dir) {
+    int order[XMB_TAB_COUNT];
+    int n = xmb_tab_order(order);
+    if (n <= 1) return start;
+
+    int pos = -1;
+    for (int i = 0; i < n; i++)
+        if (order[i] == start) { pos = i; break; }
+    if (pos < 0) return order[0];
+
+    int next = (pos + (dir > 0 ? 1 : -1) + n) % n;
+    return order[next];
+}
+
+// Launch the player for one list item, mapping XMBItem -> JFItem.
+// resume_secs > 0 starts playback at that position (Continue Watching).
+// Bumped by every playback start and every mark-as-watched, so screens
+// holding Continue Watching / Next Up know those rows have gone stale.
+unsigned g_play_gen = 0;
+
+void xmb_play_item(const XMBItem *it, u32 resume_secs,
+                   const char *media_source_id) {
+    g_play_gen++;
+    JFItem jf; memset(&jf, 0, sizeof(jf));
+    strncpy(jf.id,   it->id,   sizeof(jf.id)-1);
+    strncpy(jf.name, it->name, sizeof(jf.name)-1);
+    strncpy(jf.type, it->type, sizeof(jf.type)-1);
+    show_player(&jf, resume_secs, media_source_id);
+    xmb_resume_note(it->id, player_last_position_secs(), player_last_total_secs());
+}
+
+// Play items[idx] and keep advancing through the list while the user
+// accepts the player's end-of-item NEXT prompt (SELECT during the last
+// 90 s).  Used for movies in a collection; episodes go through
+// xmb_play_episode_with_next so the follower comes from the server.
+static void xmb_play_list_with_next(const XMBItem *items, int count, int idx,
+                                    const char *label, const char *hint) {
+    for (;;) {
+        if (idx + 1 < count) player_arm_next(label, hint);
+        xmb_play_item(&items[idx], 0);
+        if (idx + 1 >= count || !player_take_next_request()) break;
+        idx++;
+    }
+}
+
+// Play an episode and keep advancing while the user accepts the NEXT prompt
+// (or the end-of-episode countdown fires).  The follower is resolved from
+// the server before each playback, so this works no matter where the episode
+// was launched from and keeps going across season boundaries.
+// Words of a version label, lower-cased, for matching one episode's version
+// to the next's ("[PM] MediaFusion 1080p / WEB-DL / HEVC ..." etc.).
+static int label_words(const char *s, char w[][24], int max) {
+    int n = 0;
+    while (*s && n < max) {
+        while (*s && !isalnum((unsigned char)*s)) s++;
+        int k = 0;
+        while (*s && isalnum((unsigned char)*s)) {
+            if (k < 23) w[n][k++] = (char)tolower((unsigned char)*s);
+            s++;
+        }
+        w[n][k] = '\0';
+        if (k >= 2) n++;
+    }
+    return n;
+}
+
+// The next episode's version most like the one just watched: most shared
+// words (resolution, source, codec, provider, release group), at least two,
+// ties to the earlier (server-preferred) one.  NULL: let the server choose.
+static const char *match_version(const char *item_id, const char *want_label) {
+    static JFMediaSources vs;
+    if (!want_label || !want_label[0]) return NULL;
+    memset(&vs, 0, sizeof vs);
+    if (!jellyfin_fetch_media_sources(item_id, &vs) || vs.n_sources < 2) return NULL;
+    static char want[24][24], have[24][24];
+    const int nw = label_words(want_label, want, 24);
+    int best = -1, best_score = 1;
+    for (int i = 0; i < vs.n_sources; i++) {
+        const int nh = label_words(vs.source[i].label, have, 24);
+        int score = 0;
+        for (int a = 0; a < nw; a++)
+            for (int b = 0; b < nh; b++)
+                if (strcmp(want[a], have[b]) == 0) { score++; break; }
+        if (score > best_score) { best_score = score; best = i; }
+    }
+    if (best < 0) return NULL;
+    static char id[96];
+    snprintf(id, sizeof id, "%s", vs.source[best].id);
+    char b[200];
+    snprintf(b, sizeof b, "next episode: version %d/%d matched (%d shared words): %.80s",
+             best + 1, vs.n_sources, best_score, vs.source[best].label);
+    plog(b);
+    return id;
+}
+
+void xmb_play_episode_with_next(const XMBItem *first, u32 resume_secs,
+                                const char *media_source_id) {
+    g_play_gen++;
+    XMBItem cur = *first;
+    u32 resume = resume_secs;
+    // One chain: each episode after the first keeps the last one's audio
+    // language, quality (vquality is not reset between them) and, as near as
+    // the server's versions allow, the same version (2026-09-26).
+    player_chain_begin();
+    for (;;) {
+        XMBItem next;
+        bool have = xmb_fetch_next_episode(cur.id, &next);
+        if (have)
+            player_arm_next(TR("NEXT EPISODE"), TR("Press SELECT for next episode"));
+        xmb_play_item(&cur, resume, media_source_id);
+        if (!have || !player_take_next_request()) break;
+        cur    = next;
+        resume = 0;
+        // The follower: the version most like what was just watched, else
+        // the server's default.  (Copied: match_version returns a static
+        // buffer that later calls reuse.)
+        static char msid[100];
+        const char *pick = match_version(cur.id, player_chain_source_label());
+        if (pick) { snprintf(msid, sizeof msid, "%s", pick); media_source_id = msid; }
+        else        media_source_id = NULL;
+    }
+    player_chain_end();
+}
+
+// -------------------------------------------------------
+// Per-screen input handlers.  Each returns true when the XMB
+// loop should exit (only the settings Log Out path does).
+// -------------------------------------------------------
+
+// Settings tab — account actions (Log Out).
+static bool xmb_input_settings(void) {
+    if (g_overscan_calib) {
+        // Modal calibration: d-pad L/R adjusts the inset, X saves, O restores.
+        if (BTN_REPEAT(left))  overscan_set_frac(overscan_frac() - OVERSCAN_STEP_FRAC);
+        if (BTN_REPEAT(right)) overscan_set_frac(overscan_frac() + OVERSCAN_STEP_FRAC);
+        if (BTN_PRESSED(cross))  { overscan_save(); g_overscan_calib = false; }
+        if (BTN_PRESSED(circle)) { overscan_set_frac(g_overscan_calib_prev);
+                                   g_overscan_calib = false; }
+        return false;
+    }
+    if (g_settings_confirm) {
+        // Modal confirm: swallow all other input until resolved.
+        if (BTN_PRESSED(cross)) {
+            jellyfin_logout();
+            return true;   // exit the XMB; main loop returns to the login screen
+        }
+        if (BTN_PRESSED(circle)) g_settings_confirm = false;
+        return false;
+    }
+    if (BTN_PRESSED(l1)) { xmb_switch_tab(xmb_next_enabled(g_active_tab, -1)); return false; }
+    if (BTN_PRESSED(r1)) { xmb_switch_tab(xmb_next_enabled(g_active_tab, +1)); return false; }
+
+    const int ncat = settings_category_count();
+    if (g_settings_cat < 0) {
+        // The categories.  X (or Right) opens one.
+        if (BTN_REPEAT(up)   && g_settings_catsel > 0)        { g_settings_catsel--; ui_sfx_play(SFX_CURSOR); }
+        if (BTN_REPEAT(down) && g_settings_catsel < ncat - 1) { g_settings_catsel++; ui_sfx_play(SFX_CURSOR); }
+        if (BTN_PRESSED(cross) || BTN_PRESSED(right)) {
+            const setting_section sec = settings_category_at(g_settings_catsel);
+            g_settings_cat = (int)sec;
+            g_settings_sel = settings_category_row(sec, 0);
+            ui_sfx_play(SFX_DECIDE);
+        }
+        return false;
+    }
+
+    // Inside a category: its settings.  O goes back to the list.
+    const setting_section sec = (setting_section)g_settings_cat;
+    const int nrows = settings_category_row_count(sec);
+    int k = settings_row_in_category(g_settings_sel);
+    if (BTN_PRESSED(circle)) { g_settings_cat = -1; ui_sfx_play(SFX_CANCEL); return false; }
+    if (BTN_REPEAT(up)   && k > 0)         { g_settings_sel = settings_category_row(sec, k - 1); ui_sfx_play(SFX_CURSOR); }
+    if (BTN_REPEAT(down) && k < nrows - 1) { g_settings_sel = settings_category_row(sec, k + 1); ui_sfx_play(SFX_CURSOR); }
+    // L2 / R2: the previous / next category, without going back to the list.
+    if (BTN_PRESSED(l2) || BTN_PRESSED(r2)) {
+        const int ci = settings_category_index(sec) + (BTN_PRESSED(r2) ? 1 : -1);
+        if (ci >= 0 && ci < ncat) {
+            const setting_section to = settings_category_at(ci);
+            g_settings_catsel = ci;
+            g_settings_cat    = (int)to;
+            g_settings_sel    = settings_category_row(to, 0);
+            ui_sfx_play(SFX_CURSOR);
+        }
+    }
+    // X: activate / next value.  Left / Right: previous / next value on value
+    // rows (toggles flip either way, action rows ignore them).
+    if (BTN_PRESSED(cross)) settings_activate(g_settings_sel);
+    if (BTN_PRESSED(left))  settings_step(g_settings_sel, -1);
+    if (BTN_PRESSED(right)) settings_step(g_settings_sel, +1);
+    return false;
+}
+
+// See ui_internal.h.  The one place that opens a Series.
+bool xmb_open_series(const XMBItem *it) {
+    if (!it) return false;
+    int tvt = xmb_tab_of_kind(TABKIND_TV);
+    if (tvt < 0) return false;          // no TV tab on this server/profile
+    g_active_tab = tvt;
+    strncpy(g_tv_series_id,   it->id,   sizeof(g_tv_series_id) - 1);
+    strncpy(g_tv_series_name, it->name, sizeof(g_tv_series_name) - 1);
+    g_tv_series_id[sizeof(g_tv_series_id) - 1]     = ' ';
+    g_tv_series_name[sizeof(g_tv_series_name) - 1] = ' ';
+    g_tv_sub_start = 0; g_tv_sub_total = 0;
+    g_tv_sub_count = xmb_fetch_seasons(g_tv_series_id, g_tv_sub_items,
+                                       XMB_ITEMS_MAX, 0, &g_tv_sub_total);
+    g_tv_depth = 1; g_tv_sub_sel = 0; g_tv_sub_scroll = 0;
+    return true;
+}
+
+// TV sub-screen (Series -> Seasons -> Episodes) — card grid.
+static void xmb_input_tv_sub(void) {
+    GridGeom gg;
+    xmb_grid_geom(g_active_tab, &gg);
+    const int C   = gg.cols;
+    const int VIS = gg.vis;
+    if (BTN_PRESSED(circle)) {
+        g_tv_depth--;
+        g_tv_sub_sel = 0; g_tv_sub_scroll = 0; g_tv_sub_start = 0; g_tv_sub_total = 0;
+        if (g_tv_depth == 1) {
+            // Episodes -> seasons: the grid's items ARE the episodes until
+            // the seasons are fetched back, which drew every season as an
+            // episode (2026-09-27).  Reload them, the season we came from
+            // selected.
+            g_tv_sub_count = xmb_fetch_seasons(g_tv_series_id, g_tv_sub_items,
+                                               XMB_ITEMS_MAX, 0, &g_tv_sub_total);
+            for (int i = 0; i < g_tv_sub_count; i++)
+                if (strcmp(g_tv_sub_items[i].id, g_tv_season_id) == 0) {
+                    g_tv_sub_sel = i;
+                    g_tv_sub_scroll = (i / C) * C;
+                    if (g_tv_sub_scroll > 0 && g_tv_sub_scroll + VIS > g_tv_sub_count + C - 1)
+                        g_tv_sub_scroll = g_tv_sub_scroll;   // (kept on the row)
+                    break;
+                }
+        }
+        return;
+    }
+    if (BTN_REPEAT(up)) {
+        if (g_tv_sub_sel >= C) {
+            g_tv_sub_sel -= C;
+            if (g_tv_sub_sel < g_tv_sub_scroll)
+                g_tv_sub_scroll = (g_tv_sub_sel / C) * C;
+        } else if (g_tv_sub_start > 0) {
+            // Earlier pages were dropped by the forward slide: fetch back.
+            int n = xmb_slide_tv_sub_backward();
+            if (n > 0) {
+                g_tv_sub_sel += n - C;   // one row up, same column
+                if (g_tv_sub_sel < 0) g_tv_sub_sel = 0;
+                g_tv_sub_scroll = (g_tv_sub_sel / C) * C;
+            }
+        }
+    }
+    if (BTN_REPEAT(down)) {
+        if (g_tv_sub_sel + C < g_tv_sub_count) {
+            g_tv_sub_sel += C;
+            if (g_tv_sub_sel >= g_tv_sub_scroll + VIS)
+                g_tv_sub_scroll += C;
+        } else if (g_tv_sub_sel / C < (g_tv_sub_count - 1) / C) {
+            g_tv_sub_sel = g_tv_sub_count - 1;
+            if (g_tv_sub_sel >= g_tv_sub_scroll + VIS)
+                g_tv_sub_scroll += C;
+        } else if (g_tv_sub_start + g_tv_sub_count < g_tv_sub_total) {
+            int first = xmb_slide_tv_sub_forward();
+            if (first >= 0) {
+                g_tv_sub_sel    = first;
+                g_tv_sub_scroll = (first / C) * C;
+            }
+        }
+    }
+    if (BTN_REPEAT(right)) {
+        if ((g_tv_sub_sel % C) < C - 1 && g_tv_sub_sel + 1 < g_tv_sub_count)
+            g_tv_sub_sel++;
+    }
+    if (BTN_REPEAT(left)) {
+        if ((g_tv_sub_sel % C) > 0) g_tv_sub_sel--;
+    }
+    // Triangle on a SEASON (depth 1): the whole-season download sheet, when
+    // downloads are available.  (At depth 2 it is the episode's details.)
+    if (BTN_PRESSED(triangle) && g_tv_depth == 1 && g_tv_sub_count > 0 &&
+        g_tv_sub_sel < g_tv_sub_count && dl_manager_ready()) {
+        xmb_season_download_sheet(&g_tv_sub_items[g_tv_sub_sel]);
+        init_btns();
+        return;
+    }
+    // Triangle opens the info screen for an EPISODE, the same as it does for a
+    // movie in the library grid — which is where the Version and Quality rows
+    // live, so without this an episode could not be played from a chosen
+    // source at all.  Seasons (depth 1) have nothing playable behind them and
+    // are left alone.
+    if (BTN_PRESSED(triangle) && g_tv_depth == 2 && g_tv_sub_count > 0 &&
+        g_tv_sub_sel < g_tv_sub_count &&
+        timing_get_us() >= g_info_cooldown_until) {
+        peek_open_item(&g_tv_sub_items[g_tv_sub_sel], gg.card_w, gg.card_h);
+        return;
+    }
+    if (BTN_PRESSED(cross) && g_tv_sub_count > 0 && g_tv_sub_sel < g_tv_sub_count) {
+        const XMBItem *it = &g_tv_sub_items[g_tv_sub_sel];
+        if (g_tv_depth == 1) {
+            strncpy(g_tv_season_id,   it->id,   sizeof(g_tv_season_id)-1);
+            strncpy(g_tv_season_name, it->name, sizeof(g_tv_season_name)-1);
+            g_tv_sub_start = 0; g_tv_sub_total = 0;
+            g_tv_sub_count = xmb_fetch_episodes(g_tv_series_id, g_tv_season_id,
+                                                 g_tv_sub_items, XMB_ITEMS_MAX,
+                                                 0, &g_tv_sub_total);
+            g_tv_depth = 2; g_tv_sub_sel = 0; g_tv_sub_scroll = 0;
+        } else {
+            // X opens the episode's details page (2026-09-26, hardware
+            // feedback): that is where Version and Quality are chosen, and
+            // where Play / Resume / Start over live.  It used to play at once.
+            if (timing_get_us() >= g_info_cooldown_until)
+                xmb_show_item_info(&g_tv_sub_items[g_tv_sub_sel]);
+            init_btns();
+        }
+    }
+}
+
+// Collections sub-screen (Collection -> Movies) — card grid.
+static void xmb_input_col_sub(void) {
+    GridGeom gg;
+    xmb_grid_geom(g_active_tab, &gg);
+    const int C   = gg.cols;
+    const int VIS = gg.vis;
+    if (BTN_PRESSED(circle)) {
+        g_col_depth = 0;
+        g_col_sub_sel = 0; g_col_sub_scroll = 0; g_col_sub_start = 0; g_col_sub_total = 0;
+        return;
+    }
+    if (BTN_REPEAT(up)) {
+        if (g_col_sub_sel >= C) {
+            g_col_sub_sel -= C;
+            if (g_col_sub_sel < g_col_sub_scroll)
+                g_col_sub_scroll = (g_col_sub_sel / C) * C;
+        } else if (g_col_sub_start > 0) {
+            // Earlier pages were dropped by the forward slide: fetch back.
+            int n = xmb_slide_col_sub_backward();
+            if (n > 0) {
+                g_col_sub_sel += n - C;   // one row up, same column
+                if (g_col_sub_sel < 0) g_col_sub_sel = 0;
+                g_col_sub_scroll = (g_col_sub_sel / C) * C;
+            }
+        }
+    }
+    if (BTN_REPEAT(down)) {
+        if (g_col_sub_sel + C < g_col_sub_count) {
+            g_col_sub_sel += C;
+            if (g_col_sub_sel >= g_col_sub_scroll + VIS)
+                g_col_sub_scroll += C;
+        } else if (g_col_sub_sel / C < (g_col_sub_count - 1) / C) {
+            g_col_sub_sel = g_col_sub_count - 1;
+            if (g_col_sub_sel >= g_col_sub_scroll + VIS)
+                g_col_sub_scroll += C;
+        } else if (g_col_sub_start + g_col_sub_count < g_col_sub_total) {
+            int first = xmb_slide_col_sub_forward();
+            if (first >= 0) {
+                g_col_sub_sel    = first;
+                g_col_sub_scroll = (first / C) * C;
+            }
+        }
+    }
+    if (BTN_REPEAT(right)) {
+        if ((g_col_sub_sel % C) < C - 1 && g_col_sub_sel + 1 < g_col_sub_count)
+            g_col_sub_sel++;
+    }
+    if (BTN_REPEAT(left)) {
+        if ((g_col_sub_sel % C) > 0) g_col_sub_sel--;
+    }
+    // Same as the TV episode grid: Triangle reaches the info screen, and with
+    // it the Version and Quality rows.
+    if (BTN_PRESSED(triangle) && g_col_sub_count > 0 &&
+        g_col_sub_sel < g_col_sub_count &&
+        timing_get_us() >= g_info_cooldown_until) {
+        peek_open_item(&g_col_sub_items[g_col_sub_sel], gg.card_w, gg.card_h);
+        return;
+    }
+    if (BTN_PRESSED(cross) && g_col_sub_count > 0 && g_col_sub_sel < g_col_sub_count) {
+        xmb_play_list_with_next(g_col_sub_items, g_col_sub_count,
+                                g_col_sub_sel, TR("NEXT MOVIE"),
+                                TR("Press SELECT for next movie"));
+        g_col_depth = 0;
+        g_col_sub_sel = 0;
+        g_col_sub_scroll = 0;
+    }
+}
+
+// -------------------------------------------------------
+// Music tab — sub-tab header + Artist/Genre→Albums sub-screen
+// -------------------------------------------------------
+
+// Switch the music content sub-tab: clear the letter filter and force a
+// refetch (the frame loop reloads whenever g_items_loaded drops).
+static void music_set_subtab(int st) {
+    if (st < 0)               st = 0;
+    if (st >= MUSIC_ST_COUNT) st = MUSIC_ST_COUNT - 1;
+    if (st == g_music_subtab) return;
+    g_music_subtab = st;
+    // Reset the ACTIVE tab's paging state, not a fixed music slot — with
+    // several music libraries each one is its own tab and keeps its own.
+    const int mt = g_active_tab;
+    g_tab_name_filter[mt][0] = '\0';
+    g_items_loaded[mt] = false;
+    g_item_count[mt]   = 0;
+    g_tab_start[mt]    = 0;
+    g_tab_total[mt]    = 0;
+    g_sel        = 0;
+    g_scroll_top = 0;
+}
+
+// Header row focused: LEFT/RIGHT switch sub-tab, DOWN/X drop into the grid.
+static void xmb_input_music_header(void) {
+    if (BTN_PRESSED(l1)) { xmb_switch_tab(xmb_next_enabled(g_active_tab, -1)); return; }
+    if (BTN_PRESSED(r1)) { xmb_switch_tab(xmb_next_enabled(g_active_tab, +1)); return; }
+    if (BTN_REPEAT(left))  music_set_subtab(g_music_subtab - 1);
+    if (BTN_REPEAT(right)) music_set_subtab(g_music_subtab + 1);
+    if (BTN_PRESSED(down) || BTN_PRESSED(cross) || BTN_PRESSED(circle))
+        g_music_header = false;
+}
+
+// Albums-of-one-artist/genre sub-screen (single fetched page, no sliding —
+// a 50-album discography is already an outlier).
+static void xmb_input_music_sub(void) {
+    GridGeom gg;
+    xmb_grid_geom(g_active_tab, &gg);
+    const int C   = gg.cols;
+    const int VIS = gg.vis;
+    if (BTN_PRESSED(circle)) {
+        g_music_depth = 0;
+        g_music_sub_sel = 0; g_music_sub_scroll = 0; g_music_sub_total = 0;
+        return;
+    }
+    if (BTN_REPEAT(up) && g_music_sub_sel >= C) {
+        g_music_sub_sel -= C;
+        if (g_music_sub_sel < g_music_sub_scroll)
+            g_music_sub_scroll = (g_music_sub_sel / C) * C;
+    }
+    if (BTN_REPEAT(down)) {
+        if (g_music_sub_sel + C < g_music_sub_count) {
+            g_music_sub_sel += C;
+            if (g_music_sub_sel >= g_music_sub_scroll + VIS)
+                g_music_sub_scroll += C;
+        } else if (g_music_sub_sel / C < (g_music_sub_count - 1) / C) {
+            g_music_sub_sel = g_music_sub_count - 1;
+            if (g_music_sub_sel >= g_music_sub_scroll + VIS)
+                g_music_sub_scroll += C;
+        }
+    }
+    if (BTN_REPEAT(right)) {
+        if ((g_music_sub_sel % C) < C - 1 &&
+            g_music_sub_sel + 1 < g_music_sub_count)
+            g_music_sub_sel++;
+    }
+    if (BTN_REPEAT(left)) {
+        if ((g_music_sub_sel % C) > 0) g_music_sub_sel--;
+    }
+    if (BTN_PRESSED(cross) && g_music_sub_count > 0 &&
+        g_music_sub_sel < g_music_sub_count) {
+        // Sub-items are albums when drilling an artist/genre, but TRACKS when
+        // drilling a playlist — open whichever this actually is.
+        if (strcmp(g_music_sub_items[g_music_sub_sel].type, "Audio") == 0)
+            music_screen_open_songs(g_music_sub_items, g_music_sub_count,
+                                    g_music_sub_sel);
+        else
+            music_screen_open_album(&g_music_sub_items[g_music_sub_sel],
+                                    g_music_parent_name);
+        init_btns();
+    }
+}
+
+// Jump bar — alphabetical letter filter.
+static void xmb_input_jumpbar(int tab) {
+    if (BTN_REPEAT(up))
+        g_jumpbar_sel = (g_jumpbar_sel - 1 + JBAR_ENTRIES) % JBAR_ENTRIES;
+    if (BTN_REPEAT(down))
+        g_jumpbar_sel = (g_jumpbar_sel + 1) % JBAR_ENTRIES;
+    if (BTN_PRESSED(right) || BTN_PRESSED(circle))
+        g_jumpbar_active = false;
+    if (BTN_PRESSED(cross)) {
+        if (g_jumpbar_sel == 0) {
+            g_tab_name_filter[tab][0] = '#';
+            g_tab_name_filter[tab][1] = '\0';
+        } else {
+            g_tab_name_filter[tab][0] = (char)('A' + g_jumpbar_sel - 1);
+            g_tab_name_filter[tab][1] = '\0';
+        }
+        g_items_loaded[tab] = false;
+        g_item_count[tab]   = 0;
+        g_tab_start[tab]    = 0;
+        g_tab_total[tab]    = 0;
+        g_sel               = 0;
+        g_scroll_top        = 0;
+        g_jumpbar_active    = false;
+    }
+}
+
+// -------------------------------------------------------
+// Browse input dispatcher
+// -------------------------------------------------------
+
+bool xmb_handle_input_browse(void) {
+    static bool s_movie_just_exited = false;
+    int tab = g_active_tab;
+
+    if (tab == XMB_TAB_SETTINGS) return xmb_input_settings();
+    if (xmb_kind(tab) == TABKIND_LIVETV) return xmb_input_livetv();
+    if (xmb_kind(tab) == TABKIND_LOCAL) return xmb_input_media();
+
+    // A quick-peek owns the input while it is up (spine gate only).
+    if (peek_input()) return false;
+
+    if (BTN_PRESSED(l1)) { xmb_switch_tab(xmb_next_enabled(g_active_tab, -1)); return false; }
+    if (BTN_PRESSED(r1)) { xmb_switch_tab(xmb_next_enabled(g_active_tab, +1)); return false; }
+
+    // Route on DEPTH alone.  Now that a Series/BoxSet/Playlist can be opened
+    // from any library — including a user-made "Anime" folder — the matching
+    // sub-screen handler has to run regardless of the tab's kind, or the
+    // drill-down would render with no input handler behind it.  Only one
+    // depth is ever non-zero: xmb_switch_tab() clears all three.
+    if (g_tv_depth > 0)    { xmb_input_tv_sub();    return false; }
+    if (g_col_depth > 0)   { xmb_input_col_sub();   return false; }
+    if (g_music_depth > 0) { xmb_input_music_sub(); return false; }
+    // The Albums/Artists/Playlists/... header belongs to a real music library
+    // only; a Playlists library has no sub-tabs to move between.
+    if (xmb_kind(tab) == TABKIND_MUSIC && g_music_header)        { xmb_input_music_header(); return false; }
+
+    // Alphabetical jump bar on every library tab, custom folders included.
+    bool jbar_mode = g_jumpbar_active &&
+        xmb_kind(tab) >= TABKIND_MOVIES && xmb_kind(tab) <= TABKIND_GENERIC;
+    if (jbar_mode) { xmb_input_jumpbar(tab); return false; }
+
+    // Normal browse — 3-column card grid.
+    if (BTN_PRESSED(circle)) return false;
+
+    int count = g_item_count[tab];
+    GridGeom gg;
+    xmb_grid_geom(tab, &gg);
+    const int C   = gg.cols;
+    const int VIS = gg.vis;
+
+    if (BTN_REPEAT(up)) {
+        if (g_sel >= C) {
+            g_sel -= C;
+            if (g_sel < g_scroll_top) g_scroll_top = (g_sel / C) * C;
+        } else if (g_tab_start[tab] > 0) {
+            // Top of the loaded window with earlier pages dropped by the
+            // forward slide: fetch the previous page back in.
+            int n = xmb_slide_tab_backward(tab);
+            if (n > 0) {
+                g_sel += n - C;   // one row up, same column
+                if (g_sel < 0) g_sel = 0;
+                g_scroll_top = (g_sel / C) * C;
+            }
+        } else if (xmb_kind(tab) == TABKIND_MUSIC) {
+            // Top row: move d-pad focus up onto the sub-tab header.
+            g_music_header = true;
+            return false;
+        }
+    }
+    if (BTN_REPEAT(down)) {
+        if (g_sel + C < count) {
+            g_sel += C;
+            if (g_sel >= g_scroll_top + VIS) g_scroll_top += C;
+        } else if (g_sel / C < (count - 1) / C) {
+            g_sel = count - 1;          // partial last row
+            if (g_sel >= g_scroll_top + VIS) g_scroll_top += C;
+        } else if (g_tab_start[tab] + count < g_tab_total[tab]) {
+            // Infinite scroll: slide the window forward one page.
+            int first = xmb_slide_tab_forward(tab);
+            if (first >= 0) {
+                g_sel        = first;
+                g_scroll_top = (first / C) * C;
+            }
+        }
+    }
+    if (BTN_REPEAT(right)) {
+        if ((g_sel % C) < C - 1 && g_sel + 1 < count) g_sel++;
+    }
+    if (BTN_REPEAT(left) && (g_sel % C) > 0) {
+        g_sel--;
+    } else if (BTN_PRESSED(left) && (g_sel % C) == 0 &&
+               (xmb_kind(tab) == TABKIND_MOVIES || xmb_kind(tab) == TABKIND_TV ||
+                xmb_kind(tab) == TABKIND_MUSIC  || xmb_kind(tab) == TABKIND_BOXSETS)) {
+        // Left at the first column opens the letter jump bar.
+        const char *filt = g_tab_name_filter[tab];
+        if (filt[0] == '#') {
+            g_jumpbar_sel = 0;
+        } else if (filt[0] >= 'A' && filt[0] <= 'Z') {
+            g_jumpbar_sel = 1 + (filt[0] - 'A');
+        } else if (count > 0) {
+            int idx = (g_sel < count) ? g_sel : 0;
+            char c = (char)toupper((unsigned char)g_items[tab][idx].name[0]);
+            g_jumpbar_sel = (c >= 'A' && c <= 'Z') ? 1 + (c - 'A') : 0;
+        } else {
+            g_jumpbar_sel = 1;
+        }
+        g_jumpbar_active = true;
+        return false;
+    }
+
+    if (s_movie_just_exited) { s_movie_just_exited = false; return false; }
+
+    if (BTN_PRESSED(cross) && count > 0 && g_sel < count) {
+        const XMBItem *it = &g_items[tab][g_sel];
+        const char *ty = it->type;
+        // Dispatch on the ITEM's type, not the tab's KIND.  A library the
+        // user made themselves — "Anime", or any folder Jellyfin types as
+        // mixed/untyped — holds exactly the same item types as a purpose-built
+        // one, so it has to browse the same way: a Series opens the
+        // Seasons -> Episodes browser no matter which tab it was found in.
+        // Keying this off the tab meant only a "tvshows" library could drill
+        // in, and everywhere else X fell through to the video player.
+        if (strcmp(ty, "Series") == 0) {
+            xmb_open_series(it);
+        } else if (strcmp(ty, "BoxSet") == 0) {
+            strncpy(g_col_id,   it->id,   sizeof(g_col_id)-1);
+            strncpy(g_col_name, it->name, sizeof(g_col_name)-1);
+            g_col_sub_start = 0; g_col_sub_total = 0;
+            g_col_sub_count = xmb_fetch_collection_items(g_col_id, g_col_sub_items, XMB_ITEMS_MAX,
+                                                          0, &g_col_sub_total);
+            g_col_depth = 1; g_col_sub_sel = 0; g_col_sub_scroll = 0;
+        } else if (strcmp(ty, "MusicAlbum")  == 0 ||
+                   strcmp(ty, "Audio")       == 0 ||
+                   strcmp(ty, "Playlist")    == 0 ||
+                   strcmp(ty, "MusicArtist") == 0 ||
+                   strcmp(ty, "MusicGenre")  == 0) {
+            if (strcmp(it->type, "MusicAlbum") == 0) {
+                // Album → Now Playing (blocks until the user backs out).
+                music_screen_open_album(it, "Albums");
+                s_movie_just_exited = true;
+                init_btns();
+                return false;
+            } else if (strcmp(it->type, "Audio") == 0) {
+                // Songs list → play from here, rest of the page queued.
+                music_screen_open_songs(g_items[tab], count, g_sel);
+                s_movie_just_exited = true;
+                init_btns();
+                return false;
+            } else if (strcmp(it->type, "Playlist") == 0) {
+                // Drill into the playlist's TRACKS in the browser, the same
+                // way an artist or genre opens its albums — not straight
+                // into the player.  X on a track there starts playback with
+                // the rest of the playlist queued behind it.
+                strncpy(g_music_parent_id,   it->id,   sizeof(g_music_parent_id)-1);
+                strncpy(g_music_parent_name, it->name, sizeof(g_music_parent_name)-1);
+                g_music_sub_total = 0;
+                g_music_sub_count = xmb_fetch_playlist_items(
+                    it->id, g_music_sub_items, XMB_ITEMS_MAX,
+                    &g_music_sub_total);
+                g_music_depth = 1;
+                g_music_sub_sel = 0; g_music_sub_scroll = 0;
+            } else if (strcmp(it->type, "MusicArtist") == 0 ||
+                       strcmp(it->type, "MusicGenre")  == 0) {
+                // Drill into the artist's / genre's albums.
+                strncpy(g_music_parent_id,   it->id,
+                        sizeof(g_music_parent_id)-1);
+                strncpy(g_music_parent_name, it->name,
+                        sizeof(g_music_parent_name)-1);
+                g_music_sub_total = 0;
+                g_music_sub_count = xmb_fetch_music_children(
+                    strcmp(it->type, "MusicArtist") == 0 ? "AlbumArtistIds"
+                                                         : "GenreIds",
+                    it->id, g_music_sub_items, XMB_ITEMS_MAX,
+                    &g_music_sub_total);
+                g_music_depth = 1;
+                g_music_sub_sel = 0; g_music_sub_scroll = 0;
+            }
+        } else if (tab != XMB_TAB_RESUME) {
+            // Movies, episodes, videos: X opens the details page (2026-09-26,
+            // hardware feedback) -- Version and Quality are chosen there, and
+            // its Play / Resume / Start over rows replace the old prompt.
+            if (timing_get_us() >= g_info_cooldown_until) xmb_show_item_info(it);
+            s_movie_just_exited = true;
+            init_btns();
+            return false;
+        } else {
+            // The Continue Watching row still launches straight at the saved
+            // position.
+            int resume = (int)xmb_resume_for(it->id, it->resume_secs);
+            if (resume >= 0) {
+                if (strcmp(it->type, "Episode") == 0)
+                    xmb_play_episode_with_next(it, (u32)resume);
+                else
+                    xmb_play_item(it, (u32)resume);
+            }
+            s_movie_just_exited = true;
+            init_btns();
+            return false;
+        }
+    }
+
+    // Triangle — detail overlay
+    if (btn_cur.triangle || btn_prev.triangle) {
+        char dbg[200];
+        snprintf(dbg, sizeof(dbg),
+            "outer: triangle state cur=%d prev=%d (BTN_PRESSED would be %d)",
+            btn_cur.triangle, btn_prev.triangle,
+            (btn_cur.triangle && !btn_prev.triangle) ? 1 : 0);
+        plog(dbg);
+    }
+    u64 now_us = timing_get_us();
+    // Under the spine, Triangle on a library grid is the quick-peek: the
+    // poster turns over to show the synopsis and cast (xmb/ui_peek.cpp).  X
+    // from there opens full detail.
+    if (BTN_PRESSED(triangle) && count > 0 && g_sel < count &&
+        xmb_kind(tab) != TABKIND_MUSIC &&
+        now_us >= g_info_cooldown_until) {
+        peek_open_item(&g_items[tab][g_sel], gg.card_w, gg.card_h);
+        return false;
+    }
+    if (BTN_PRESSED(triangle) && count > 0 && g_sel < count
+        && now_us >= g_info_cooldown_until) {
+        const XMBItem *sel = &g_items[tab][g_sel];
+        // A Series has no version to choose, so the overlay would only ever
+        // offer "Play" on something that is not playable.  Browse it instead;
+        // Triangle on an EPISODE still gets the version picker.
+        if (strcmp(sel->type, "Series") == 0) xmb_open_series(sel);
+        else                                  xmb_show_item_info(sel);
+    }
+    return false;
+}

@@ -1,0 +1,1416 @@
+// Triangle detail overlay — shown when the user presses triangle on a list item.
+
+#include <stdio.h>
+#include <string.h>
+
+#include <rsx/rsx.h>
+#include <sysutil/sysutil.h>
+#include <io/pad.h>
+
+#include "ui_internal.h"
+#include "ui_wave.h"
+#include "ui_text_gpu.h"   // the version picker draws its text on the RSX
+#include "jellyfin_api.h"
+#include "vquality.h"
+#include "hd1080.h"
+#include "rsxutil.h"
+#include "timing.h"
+#include "plog.h"
+#include "slog.h"
+#include "detail_media.h"
+#include "thumbnail_cache.h"
+#include "player.h"       // show_player_offline
+#include "dl_manager.h"   // DOWNLOAD FOR OFFLINE (Stage 5)
+#include "dl_service.h"
+#include "dl_ui.h"
+#include "api_userdata.h"
+
+// The title band behind the header — a deep stripe over the backdrop (the
+// official page's grey bar, re-tinted to fit the theme).  Now the `detail_band`
+// theme token: XMB wave keeps the exact 412C73 this was hardcoded to, so the
+// shipping theme is unchanged, and Golden Age finally gets a brass band instead
+// of a violet one on a gold screen.  See theme.h.
+
+// "More Like This" recommendations to request/show.
+#define INFO_SIMILAR_MAX 12
+
+
+// Draw text at (x,y), truncated with ".." to max_w px.  y is a signed screen
+// coordinate (the page scrolls), so a line above the top is simply culled by
+// drawTTF's own clipping.
+// face < 0 keeps the system face (regular or bold).  Pass a UI_FACE_* for the
+// handoff section 3.0 faces: UI_FACE_DISPLAY for the media title,
+// UI_FACE_SPEC for codec and quality values.
+static void info_clip_text(int x, int y, const char *text, float px,
+                           u32 color, int max_w, bool bold, int face = -1) {
+    drawTTF_clipped((u32)x, (u32)y, text, px, color, max_w,
+                    face >= 0 ? face : bold ? UI_FACE_BOLD : UI_FACE_REGULAR);
+}
+
+// A frame that bails out early — switching titles, or coming back from the
+// player — must STILL queue a flip before looping.  waitflip() at the top of
+// the next iteration spins until the PREVIOUS flip lands
+// (`while (gcmGetFlipStatus() != 0) usleep(50);`), so a `continue` that skips
+// flip() leaves the status stuck at "pending" and hangs the UI thread forever
+// at 20k syscalls/sec.  This is the same rsxSync()+flip() the screen does on
+// entry; call it immediately before any early `continue`.
+static void info_skip_frame(void) { rsxSync(); flip(); }
+
+// 1:1 CPU blit of a main-memory bitmap to the current framebuffer, clipped to
+// the display.  Same idea as the grid's card blit (ui_lists.cpp) — call after
+// rsxSync.  The pixels are precomputed, so this is a per-row memcpy into
+// write-combined VRAM (fast on hardware); no per-pixel blend/read.
+static void info_blit(const Bitmap *bm, int dx, int dy) {
+    if (!bm || !bm->pixels) return;
+    int w = (int)bm->width, h = (int)bm->height;
+    for (int row = 0; row < h; row++) {
+        int sy = dy + row;
+        if (sy < 0 || sy >= (int)display_height) continue;
+        int sx0 = dx, cw = w, srcx = 0;
+        if (sx0 < 0) { srcx = -sx0; cw += sx0; sx0 = 0; }
+        if (sx0 + cw > (int)display_width) cw = (int)display_width - sx0;
+        if (cw <= 0) continue;
+        memcpy(color_buffer[curr_fb] + (u32)sy * display_width + sx0,
+               bm->pixels + (u32)row * bm->width + srcx, (size_t)cw * 4);
+    }
+}
+
+// Modal version picker used by the info page.  The full source list lives only
+// here, before playback starts; the player receives one selected MediaSourceId.
+static int info_choose_version(const char *title,
+                               const JFMediaSources *sources, int current) {
+    if (!sources || sources->n_sources <= 0) return -1;
+    int sel = (current >= 0 && current < sources->n_sources) ? current : 0;
+    bool armed = false;
+    rsxSync();
+    flip();
+    init_btns();
+
+    while (running) {
+        waitflip();
+        sysUtilCheckCallback();
+        poll_buttons();
+
+        if (!armed) {
+            if (!btn_cur.cross && !btn_cur.circle) armed = true;
+        } else {
+            if (BTN_PRESSED(circle)) { init_btns(); return -1; }
+            if (BTN_REPEAT(up) && sel > 0) sel--;
+            if (BTN_REPEAT(down) && sel < sources->n_sources - 1) sel++;
+            if (BTN_PRESSED(cross)) { init_btns(); return sel; }
+        }
+
+        const int max_rows = 8;
+        int shown = sources->n_sources < max_rows
+                      ? sources->n_sources : max_rows;
+        int first = sel - shown / 2;
+        if (first < 0) first = 0;
+        if (first > sources->n_sources - shown)
+            first = sources->n_sources - shown;
+
+        int pw = UIS_W(760);
+        int row_h = UIS_H(58);            // two lines: the summary, the full name
+        int ph = UIS_H(104) + shown * row_h;
+        int px = ((int)display_width - pw) / 2;
+        int py = ((int)display_height - ph) / 2;
+        int cx = px + UIS_W(30);
+        const int y0 = py + UIS_H(72);
+
+        // Everything is drawn on the RSX, as on the page under it: the panel,
+        // the selection and the text runs.  CPU rectangles and per-glyph text
+        // after an rsxSync blended against VRAM, and the wave under them ran
+        // at a frame or two a second.
+        clearScreen(XMB_BG);
+        wave_draw();
+        wave_draw_rrect_outline_gpu(px, py, pw, ph, 0, 1, XMB_HAIRLINE, 255,
+                                    XMB_PANEL, XMB_PANEL, 255);
+        {
+            const int ry = y0 + (sel - first) * row_h;
+            wave_draw_rrect_gpu(cx, ry, pw - UIS_W(60), row_h - UIS_H(4), 0,
+                                XMB_PANEL_HI, XMB_PANEL_HI, 255);
+            wave_draw_rrect_gpu(cx - UIS_W(4), ry, UIS_W(3), row_h - UIS_H(4), 0,
+                                XMB_ACCENT, XMB_ACCENT, 255);
+        }
+        rsxSync();
+        ui_text_gpu_begin();
+
+        // Media title -- one of the two things section 3.0 gives to the
+        // display face.
+        info_clip_text(cx, py + UIS_H(22), title, UIS_TF(24), XMB_WHITE,
+                       pw - UIS_W(160), false, UI_FACE_DISPLAY);
+        char count[24];
+        snprintf(count, sizeof(count), "%d / %d", sel + 1,
+                 sources->n_sources);
+        int cw = ttf_text_width(count, UIS_TF(17));
+        drawTTF((u32)(px + pw - UIS_W(30) - cw),
+                (u32)(py + UIS_H(27)), count, UIS_TF(17), XMB_TEXT_DIM);
+
+        for (int row = 0; row < shown; row++) {
+            int idx = first + row;
+            int ry = y0 + row * row_h;
+            // The summary ("1080p · REMUX · DTS-HD MA 7.1 · 38.8 GB"), and
+            // the full, cleaned name small beneath it.
+            info_clip_text(cx + UIS_W(16), ry + UIS_H(7),
+                           sources->source[idx].summary[0] ? sources->source[idx].summary
+                                                           : sources->source[idx].label,
+                           UIS_TF(18), idx == sel ? XMB_TEXT : XMB_TEXT_DIM,
+                           pw - UIS_W(100), idx == sel);
+            info_clip_text(cx + UIS_W(16), ry + UIS_H(33),
+                           sources->source[idx].label, UIS_TF(12.5f),
+                           idx == sel ? XMB_TEXT_DIM : XMB_TEXT_FAINT,
+                           pw - UIS_W(100), false);
+        }
+
+        { static const Hint h[] = {{'X', TRN("Select")}, {'C', TRN("Back")}};
+          draw_hints_bar(h, 2); }
+        ui_text_gpu_flush();
+        flip();
+    }
+    init_btns();
+    return -1;
+}
+
+// ===========================================================================
+// Item detail, redesigned -- design-import-v3 "06 · Item detail", L3 of the
+// spine's depth model.
+//
+// Every position is the canvas's, measured by script at 1280x720 (see
+// design-import-v3/MEASURED-detail-hud.md) and scaled like everything else.
+//
+// WHAT IS DRAWN WHERE, and why it matters here:
+//   GPU phase  backdrop + scrims, the spine's glow, the divider, every panel,
+//              chip and button (rounded fans), the uploaded poster.  All of
+//              it blended on the RSX, none of it read back.
+//   CPU phase  cast portraits (write-only circle blits), hairlines.
+//   text       everything else, through the text-run cache -- the old page
+//              drew every glyph on the CPU against the framebuffer.
+//
+// DEVIATIONS FROM THE CANVAS, all because the data is not there:
+//   * the second chip shows the VIDEO line ("1080p H264 SDR"), not the HDMI
+//     audio path -- the client does not know the output path until playback;
+//   * no Trailer: nothing plays trailers yet, so the hint says what X does;
+//   * "More Like This", the tagline and the facts list are not on this page.
+//     The canvas has none of them and the old page keeps them.
+// ===========================================================================
+
+#include "ui_card_gpu.h"
+#include "ui_art.h"
+#include "ui_buffering.h"
+#include "ui_spine.h"
+#include "ui_depth.h"      // the L2 -> L3 arrival
+#include "ui_text_gpu.h"
+#include "line_break.h"
+#include "detail_meta.h"
+#include "http.h"
+#include <unistd.h>          // usleep: the version search worker
+#include <sys/thread.h>
+#include "api_facts.h"
+#include "vremember.h"       // jellyfin_warm_playback()
+
+static int IX(int x) { return XMB_OX + UIS_W(x); }
+static int IY(int y) {
+    // Classic has a compact header instead of the XMB category band.
+    return XMB_OY + UIS_H(y - (ui_layout() == UI_LAYOUT_CLASSIC ? 70 : 0));
+}
+
+// Colour mixed toward another; used for the canvas's opacity steps on text
+// (a run's colour is cached, so these are fixed values, not animations).
+static u32 info_mix(u32 a, u32 b, float t) {
+    u32 out = 0;
+    for (int sh = 0; sh <= 16; sh += 8) {
+        int ca = (int)((a >> sh) & 0xFF), cb = (int)((b >> sh) & 0xFF);
+        out |= (u32)(ca + (int)((float)(cb - ca) * t)) << sh;
+    }
+    return out;
+}
+
+// The audio line without its leading language ("English EAC3 5.1" -> "EAC3
+// 5.1"), for the codec chip.  Unchanged when there is only one word.
+static void info_audio_chip(const char *audio, char *out, size_t cap) {
+    const char *sp = strchr(audio, ' ');
+    snprintf(out, cap, "%s", (sp && sp[1]) ? sp + 1 : audio);
+}
+
+// The bytes of `p` that make up its next line (render/line_break.h): broken at a space or after a CJK
+// character, never inside a UTF-8 sequence.  Width is summed per character; ignoring kerning is fine
+// for wrapping.
+static int fit_width(const char *ch, void *ctx) { return ttf_text_width(ch, *(const float *)ctx); }
+static int info_fit(const char *p, float px, int max_w, int cap) {
+    return lb_fit(p, max_w, cap, fit_width, &px);
+}
+
+// Word-wrap `text` at max_w, drawing up to max_lines at `pitch`.  Returns the
+// number of lines drawn.
+static int info_wrap(int x, int y, const char *text, float px, u32 colour,
+                     int max_w, int pitch, int max_lines) {
+    const char *p = text;
+    int lines = 0;
+    while (*p && lines < max_lines) {
+        char buf[200];
+        int take = info_fit(p, px, max_w, (int)sizeof(buf) - 4);
+        const bool more = p[take] != 0;
+        if (take <= 0) take = 1;
+        if (lines == max_lines - 1 && more && take < (int)strlen(p))
+            snprintf(buf, sizeof buf, "%.*s...", take, p);   // last line: cut
+        else
+            snprintf(buf, sizeof buf, "%.*s", take, p);
+        drawTTF((u32)x, (u32)(y + lines * pitch), buf, px, colour);
+        p += take;
+        while (*p == ' ') p++;
+        lines++;
+    }
+    return lines;
+}
+
+// One pill chip (canvas: height 29, radius full, border 0.8, 8 px padding).
+// GPU part: the shape.  Returns its width so the caller can place the next.
+static int info_chip_width(const char *label, float px, int face) {
+    return ttf_text_width_face(label, px, face) + UIS_W(20);
+}
+
+enum { F3_RESUME, F3_PLAY, F3_START, F3_WATCHED, F3_FAVOURITE,
+       F3_VERSION, F3_QUALITY, F3_DOWNLOAD };
+
+// The details page's blocking loads, run behind loading_run().  Everything here
+// is thread-safe: the item fetches use responseBuffer while the render thread
+// only draws the loader, and detail_media carries its own decoder and buffers.
+struct InfoLoad {
+    const XMBItem  *it;
+    XMBItemDetail  *detail;
+    JFMediaSources *versions;
+    int             pw, ph;
+    Bitmap          poster, back;
+    bool            back_ok;
+};
+static void info_load_work(void *arg) {
+    InfoLoad *ld = (InfoLoad *)arg;
+    jellyfin_fetch_item_detail(ld->it->id, ld->detail);
+    // A search stub answers as the library item it has just become; only that
+    // id has versions and art (see XMBItemDetail.id).
+    const char *id = ld->detail->id[0] ? ld->detail->id : ld->it->id;
+    if (strcmp(ld->it->type, "Movie") == 0 || strcmp(ld->it->type, "Episode") == 0 ||
+        strcmp(ld->it->type, "Video") == 0)
+        jellyfin_fetch_media_sources(id, ld->versions);
+    for (int v = 0; v < ld->versions->n_sources; v++)            // emoji -> gone
+        ttf_clean_text(ld->versions->source[v].label, (int)sizeof ld->versions->source[v].label);
+    // Episodes: the show's poster (the title card Home shows) and the
+    // episode's own still -- its Primary image, 16:9 -- as the backdrop.  The
+    // show's backdrop stands in when an episode has no still.
+    const bool ep = strcmp(ld->it->type, "Episode") == 0 && ld->detail->series_id[0];
+    const char *poster_id = ep ? ld->detail->series_id : id;
+    if (!detail_media_load(poster_id, "Primary", ld->pw, ld->ph, 0.5f, &ld->poster) && ep)
+        detail_media_load(id, "Primary", ld->pw, ld->ph, 0.5f, &ld->poster);
+    ld->back_ok = ep && detail_media_load(id, "Primary", 960, 540, 0.3f, &ld->back);
+    // A Gelato title found by Search is the title item, whose "Backdrop" is
+    // its poster again; its first version (what Home lists) carries the real
+    // one.  Ask the version first when the two ids differ.
+    if (!ld->back_ok && !ep && ld->versions->n_sources > 0 &&
+        ld->versions->source[0].id[0] && strcmp(ld->versions->source[0].id, id) != 0)
+        ld->back_ok = detail_media_load(ld->versions->source[0].id, "Backdrop", 960, 540, 0.3f, &ld->back);
+    if (!ld->back_ok)
+        ld->back_ok = detail_media_load(ep ? ld->detail->series_id : id,
+                                        "Backdrop", 960, 540, 0.3f, &ld->back);
+}
+
+// Versions still being found (2026-10-14).  A Gelato title opened from Search
+// for the first time has no media sources yet -- the server resolves them on
+// the first look, in a few seconds -- so the page opened with Quality and no
+// Version, and backing out and in again "fixed" it.  Now a worker asks again
+// every 2 s for up to 30 s while the page shows "Finding versions...", and the
+// selector fills in by itself.  Its own buffer (never responseBuffer, which the
+// page's own requests use); a generation number retires a worker whose page
+// has gone, and its result is ignored.
+#define VS_TRIES    15
+// Gelato answering with only its placeholder has already looked and found
+// nothing, so a short second look is enough.
+#define VS_TRIES_PLACEHOLDER 3
+#define VS_GAP_MS   2000
+typedef struct { u32 gen; int tries; char id[64]; } VsJob;
+static volatile u32  s_vs_gen   = 0;
+static volatile int  s_vs_done  = 0;        // the current generation's answer is in s_vs_out
+static JFMediaSources s_vs_out;
+
+static void vs_worker(void *arg) {
+    VsJob *job = (VsJob *)arg;
+    char *buf = (char *)malloc(RESPONSE_SIZE);
+    JFMediaSources *tmp = (JFMediaSources *)malloc(sizeof(JFMediaSources));
+    bool found = false;
+    for (int t = 0; t < job->tries && buf && tmp && job->gen == s_vs_gen && !found; t++) {
+        for (int w = 0; w < VS_GAP_MS / 100 && job->gen == s_vs_gen; w++) usleep(100000);
+        if (job->gen != s_vs_gen) break;
+        found = jellyfin_fetch_media_sources_buf(job->id, tmp, buf, RESPONSE_SIZE) && tmp->n_sources > 0;
+    }
+    if (job->gen == s_vs_gen) {
+        if (found)    memcpy(&s_vs_out, tmp, sizeof s_vs_out);
+        else if (tmp) { memset(&s_vs_out, 0, sizeof s_vs_out); s_vs_out.n_placeholder = tmp->n_placeholder; }
+        else          memset(&s_vs_out, 0, sizeof s_vs_out);
+        char b[160];
+        snprintf(b, sizeof b, "versions: found %d after waiting (%s)", found ? s_vs_out.n_sources : 0, job->id);
+        plog(b);
+        __sync_synchronize();
+        s_vs_done = 1;
+    }
+    free(tmp);
+    free(buf);
+    free(job);
+    sysThreadExit(0);
+}
+
+static bool vs_start(const char *item_id, int tries) {
+    VsJob *job = (VsJob *)malloc(sizeof(VsJob));
+    if (!job) return false;
+    s_vs_done = 0;
+    job->gen = ++s_vs_gen;
+    job->tries = tries;
+    snprintf(job->id, sizeof job->id, "%s", item_id);
+    __sync_synchronize();
+    sys_ppu_thread_t tid;
+    static char name[] = "jf_versions";
+    if (sysThreadCreate(&tid, vs_worker, job, 1500, 32 * 1024, 0, name) != 0) {
+        free(job);
+        return false;
+    }
+    return true;
+}
+static void vs_cancel(void) { s_vs_gen++; s_vs_done = 0; }
+
+static void xmb_show_item_info_v3(const XMBItem *root) {
+    rsxSync();
+    flip();
+    init_btns();
+    // Hand back whatever level this was opened from: X on the base layer
+    // opens detail too, and closing it should land there, not inside the tab.
+    const bool classic = ui_layout() == UI_LAYOUT_CLASSIC;
+    const int back_level = spine_target_level();
+
+    // THE ARRIVAL.  Detail is the next depth, not a screen swap: its poster
+    // flies out of the card it was opened from (the stage or the focus ring
+    // noted that rect on the last frame) while the spine rises to L3 and the
+    // backdrop fades in.  The move starts only once the first fetch has
+    // landed -- see `arrived` below -- or the fetch's blocking time would
+    // arrive as one huge frame and the spine would land in a single step.
+    int  org_x = 0, org_y = 0, org_w = 0, org_h = 0;
+    const bool  have_org = depth_last_focus_rect(&org_x, &org_y, &org_w, &org_h);
+    const float d_from   = spine_depth();
+    bool arrived = false;
+    u64 arrival_us = 0;
+
+    XMBItem cur_item = *root;
+    XMBItemDetail detail;
+    static JFMediaSources versions;
+    int  version_sel = 0;
+    bool versions_searching = false;   // vs_worker is looking (see above)
+    bool reload = true, exit_armed = false, watched = false, favourite = false;
+    Bitmap poster_cpu;               // CPU fallback when the upload fails
+    memset(&poster_cpu, 0, sizeof poster_cpu);
+    bool poster_gpu = false, back_gpu = false;
+
+    // The Download button's state, polled while the page is open.
+    DlStatus dl_st; bool dl_have = false;
+    memset(&dl_st, 0, sizeof dl_st);
+    u64  dl_next = 0, dl_toast_until = 0;
+    char dl_toast[160] = "";
+
+    // Row 0: the action buttons; row 1: the selectors.  Built per title.
+    int row0[4], n0 = 0, row1[3], n1 = 0;
+    int frow = 0, fcol = 0;
+    // Row 3 (Classic): the cast, scrolled a photo at a time.
+    int cast_sel = 0, cast_top = 0;
+
+    // Layout, from the canvas.
+    int PX = IX(57), PY = IY(187);
+    const int PW = UIS_W(216), PH = UIS_H(324);
+    int TX = IX(313);
+    int TW = UIS_W(700);
+    // Rows, from the XMB canvas.  Classic moves them every frame (below).
+    int Y_TITLE = PY, Y_META = IY(228), Y_SCORE = IY(252), Y_CHIPS = IY(278),
+        Y_OVER = IY(318), Y_DIR = IY(402), Y_CAST = IY(426), Y_ACT = IY(562),
+        Y_SEL = IY(634), Y_TOAST = IY(609), Y_SEASON = IY(523);
+    int over_w = UIS_W(620), over_lines = 3, cast_max = 5;
+    float title_px = 25.0f;
+    bool show_poster = true;
+    int PWd = PW, PHd = PH;              // the poster as drawn
+
+    while (running) {
+        if (reload) {
+            reload = false;
+            const XMBItem *it = &cur_item;
+            memset(&detail, 0, sizeof detail);
+            if (facts_wanted(it->type)) facts_request(it->id);   // lands while this loads
+            memset(&versions, 0, sizeof versions);
+            detail_media_free(&poster_cpu);
+            // The fetches run behind the LOADING screen (render/ui_buffering).
+            // A flip is always pending here: the entry flip, or the last frame's.
+            InfoLoad ld;
+            memset(&ld, 0, sizeof ld);
+            ld.it = it; ld.detail = &detail; ld.versions = &versions;
+            ld.pw = PW; ld.ph = PH;
+            loading_run(info_load_work, &ld, TR("Loading"), true);
+            // 2026-10-17: from Search, a Gelato title opened for the first time
+            // is a stub that the server makes into a library item with a NEW id
+            // as it answers.  The stub id then 404s for sources, art and
+            // PlaybackInfo, so the page sat on "Finding versions..." until the
+            // title was opened again from its library tab.  The page becomes
+            // that item: versions, Play, resume and favourites all use it.
+            if (detail.id[0] && strcmp(detail.id, cur_item.id) != 0) {
+                snprintf(cur_item.id, sizeof cur_item.id, "%s", detail.id);
+                if (facts_wanted(it->type)) facts_request(it->id);
+            }
+            {
+                int remembered = vquality_for_item(it->id);
+                if (remembered >= 0) vquality_set((vquality_t)remembered);
+            }
+            version_sel = 0;
+            vs_cancel();
+            versions_searching = versions.n_sources == 0 &&
+                (strcmp(it->type, "Movie") == 0 || strcmp(it->type, "Episode") == 0 ||
+                 strcmp(it->type, "Video") == 0) &&
+                vs_start(it->id, versions.n_placeholder > 0 ? VS_TRIES_PLACEHOLDER : VS_TRIES);
+            // Warm the server while the page is read: its first-time stream
+            // lookup (Gelato, 6-8 s) then happens before Play, not after.
+            if (strcmp(it->type, "Movie") == 0 || strcmp(it->type, "Episode") == 0 ||
+                strcmp(it->type, "Video") == 0)
+                jellyfin_warm_playback(it->id);
+            watched = false;
+            favourite = detail.is_favourite;
+            dl_have = false; dl_next = 0; dl_toast[0] = '\0';
+
+            // Poster: into VRAM once.  Kept in main memory only if that fails.
+            Bitmap poster = ld.poster;
+            // The artwork's accent, sampled once from main memory before the
+            // poster goes to VRAM (render/art_colour.h).  The buffering
+            // screen's ring and glow use it when this title is played.
+            {
+                const art_palette pal = ui_art_palette(it->id, &poster);
+                // ... and the wave takes a hint of it while the page is open
+                // (steady, not breathing; cleared when the page closes).
+                wave_set_art_tint(pal.valid ? pal.accent : 0u, 0.70f);
+            }
+            poster_gpu = ui_gpu_tex_upload(GPU_TEX_POSTER, &poster);
+            if (poster_gpu) ui_gpu_tex_set_tag(GPU_TEX_POSTER, it->id);
+            if (poster_gpu) detail_media_free(&poster);
+            else            poster_cpu = poster;
+
+            // Backdrop: 960x540 is plenty under a 0.88-0.96 scrim, and the RSX
+            // scales it to the screen with linear filtering.  Freed as soon as
+            // it is in VRAM -- the 2 MB never sits in main memory.
+            Bitmap back = ld.back;
+            back_gpu = false;
+            if (ld.back_ok)
+                back_gpu = ui_gpu_tex_upload(GPU_TEX_BACKDROP, &back);
+            if (back_gpu) ui_gpu_tex_set_tag(GPU_TEX_BACKDROP, it->id);
+            detail_media_free(&back);
+            if (!back_gpu) ui_gpu_tex_clear(GPU_TEX_BACKDROP);
+
+            thumb_cache_retarget();     // cast headshots come from the card cache
+
+            const bool has_resume = xmb_resume_for(it->id, it->resume_secs) >= 10;
+            n0 = 0;
+            if (has_resume) { row0[n0++] = F3_RESUME; row0[n0++] = F3_START; }
+            else            { row0[n0++] = F3_PLAY; }
+            row0[n0++] = F3_WATCHED;
+            row0[n0++] = F3_FAVOURITE;
+            n1 = 0;
+            if (versions.n_sources > 1 || versions_searching || versions.n_placeholder > 0)
+                row1[n1++] = F3_VERSION;
+            row1[n1++] = F3_QUALITY;
+            // Download sits after Quality for the three playable types; row 0
+            // stays the "watch now" row.
+            if (strcmp(it->type, "Movie") == 0 || strcmp(it->type, "Episode") == 0 ||
+                strcmp(it->type, "Video") == 0)
+                row1[n1++] = F3_DOWNLOAD;
+            frow = 0; fcol = 0;
+            cast_sel = 0; cast_top = 0;
+            exit_armed = false;
+            init_btns();
+            slog_state("INFO3_OPEN item_id=%s name=%.40s", it->id, it->name);
+            if (!arrived) {
+                arrived = true;
+                arrival_us = timing_get_us();
+                if (!classic) {
+                    spine_clock_reset();          // step from here, not from the fetch
+                    spine_set_level(SPINE_L3);
+                }
+            }
+        }
+        if (versions_searching && s_vs_done) {
+            __sync_synchronize();
+            memcpy(&versions, &s_vs_out, sizeof versions);
+            for (int v = 0; v < versions.n_sources; v++)            // emoji -> gone
+                ttf_clean_text(versions.source[v].label, (int)sizeof versions.source[v].label);
+            versions_searching = false;
+            version_sel = 0;
+            // The Version slot stays when there is a choice, goes when not; a
+            // focus on that row stays on the same control.
+            if (versions.n_sources <= 1 && versions.n_placeholder == 0 &&
+                n1 > 0 && row1[0] == F3_VERSION) {
+                for (int i = 1; i < n1; i++) row1[i - 1] = row1[i];
+                n1--;
+                if (frow == 1) fcol = fcol > 0 ? fcol - 1 : 0;
+            }
+        }
+        const XMBItem *it = &cur_item;
+        // The cast; crew is left out except the director, who gets a row.
+        const char *director = NULL;
+        int cast_all[JF_MAX_PEOPLE], cast_total = 0;
+        for (int i = 0; i < detail.n_people && i < JF_MAX_PEOPLE; i++) {
+            if (strcmp(detail.people[i].role, "Director") == 0) {
+                if (!director) director = detail.people[i].name;
+                continue;
+            }
+            cast_all[cast_total++] = i;
+        }
+        const bool cast_row = cast_total > 0;
+        const bool dl_capable = strcmp(it->type, "Movie") == 0 ||
+                                strcmp(it->type, "Episode") == 0 ||
+                                strcmp(it->type, "Video") == 0;
+        const bool can_download = dl_capable && versions.n_sources > 0;
+        if (dl_capable && timing_get_us() >= dl_next) {
+            dl_next = timing_get_us() + 250000;
+            dl_have = dl_find(it->id, &dl_st);
+        }
+        DlUiContext dl_cx;
+        dl_cx.playback_block = dl_playback_blocking();
+        dl_cx.auth_held      = dl_auth_held();
+        dl_cx.ready          = dl_manager_ready();
+
+        waitflip();
+        sysUtilCheckCallback();
+        poll_buttons();
+        spine_frame_begin();
+
+        const int focus = frow == 0 ? row0[fcol] : (frow == 1 ? row1[fcol] : -1);
+        if (!exit_armed) {
+            if (!btn_cur.circle && !btn_cur.triangle && !btn_cur.cross) exit_armed = true;
+        } else {
+            if (BTN_PRESSED(circle)) break;
+            const int n = frow == 0 ? n0 : n1;
+            const bool can_season = strcmp(it->type, "Episode") == 0 &&
+                                    detail.series_id[0] && detail.season_id[0];
+            // BTN_REPEAT is stateful (the first call per press consumes it),
+            // so read each direction ONCE.  Reading Left twice -- here for
+            // Back to Season, then for the move -- lost every Left press
+            // once the focus left the first button (2026-09-27).
+            const bool nav_l = BTN_REPEAT(left);
+            const bool nav_r = BTN_REPEAT(right);
+            if (frow == 3) {
+                if (nav_l && cast_sel > 0)              cast_sel--;
+                if (nav_r && cast_sel < cast_total - 1) cast_sel++;
+            } else if (frow == 2) {
+                if (nav_r) { frow = 0; fcol = 0; }
+            } else if (nav_l && fcol == 0 && frow == 0 && can_season) {
+                frow = 2;
+            } else {
+            if (nav_l && fcol > 0)     fcol--;
+            if (nav_r && fcol < n - 1) fcol++;
+            }
+            if (frow == 2 && BTN_PRESSED(cross)) {
+                // Leave for the episode's season: TV tab -> the series ->
+                // that season's episodes, this episode selected.
+                XMBItem ser;
+                memset(&ser, 0, sizeof ser);
+                snprintf(ser.id, sizeof ser.id, "%s", detail.series_id);
+                snprintf(ser.name, sizeof ser.name, "%s", detail.series_name[0] ? detail.series_name : "");
+                snprintf(ser.type, sizeof ser.type, "Series");
+                if (xmb_open_series(&ser)) {
+                    for (int i = 0; i < g_tv_sub_count; i++) {
+                        if (strcmp(g_tv_sub_items[i].id, detail.season_id) != 0) continue;
+                        snprintf(g_tv_season_id, sizeof g_tv_season_id, "%s", g_tv_sub_items[i].id);
+                        snprintf(g_tv_season_name, sizeof g_tv_season_name, "%s", g_tv_sub_items[i].name);
+                        g_tv_sub_start = 0; g_tv_sub_total = 0;
+                        g_tv_sub_count = xmb_fetch_episodes(g_tv_series_id, g_tv_season_id,
+                                                            g_tv_sub_items, XMB_ITEMS_MAX,
+                                                            0, &g_tv_sub_total);
+                        g_tv_depth = 2; g_tv_sub_sel = 0; g_tv_sub_scroll = 0;
+                        for (int e = 0; e < g_tv_sub_count; e++)
+                            if (strcmp(g_tv_sub_items[e].id, it->id) == 0) { g_tv_sub_sel = e; break; }
+                        break;
+                    }
+                }
+                init_btns();
+                break;
+            }
+            bool nav_d = BTN_PRESSED(down), nav_u = BTN_PRESSED(up);
+            // The XMB layout has the cast above the buttons: Up from the
+            // first row goes into it and Down comes back.
+            if (!classic && nav_u && frow == 0 && cast_row) { frow = 3; nav_u = false; }
+            else if (!classic && nav_d && frow == 3) {
+                frow = 0; nav_d = false;
+                if (fcol >= n0) fcol = n0 - 1;
+            }
+            if (nav_d && frow == 0 && n1 > 0)              { frow = 1; if (fcol >= n1) fcol = n1 - 1; }
+            else if (nav_d && (frow == 1 || (frow == 0 && n1 == 0)) && cast_row && classic) frow = 3;
+            if (nav_u && frow == 1)                        { frow = 0; if (fcol >= n0) fcol = n0 - 1; }
+            else if (nav_u && frow == 3) {
+                frow = n1 > 0 ? 1 : 0;
+                const int nr = frow == 1 ? n1 : n0;
+                if (fcol >= nr) fcol = nr - 1;
+            }
+            if (frow < 2 && BTN_PRESSED(cross)) {
+                if ((focus == F3_RESUME || focus == F3_PLAY || focus == F3_START) &&
+                    versions.n_sources == 0 && versions.n_placeholder > 0) {
+                    // Gelato listed only its placeholder: there is nothing to
+                    // stream, and asking would only be the server's HTTP 500.
+                    snprintf(dl_toast, sizeof dl_toast, "%s",
+                             versions_searching ? TR("Still finding versions...")
+                                                : TR("No streams found for this title."));
+                    dl_toast_until = timing_get_us() + 3000000ULL;
+                } else if (focus == F3_RESUME || focus == F3_PLAY || focus == F3_START) {
+                    const u32 at = focus == F3_RESUME ? xmb_resume_for(it->id, it->resume_secs) : 0;
+                    const char *source_id = versions.n_sources > 0
+                        ? versions.source[version_sel].id : NULL;
+                    if (strcmp(it->type, "Episode") == 0)
+                        xmb_play_episode_with_next(it, at, source_id);
+                    else
+                        xmb_play_item(it, at, source_id);
+                    exit_armed = false;
+                    init_btns();
+                    info_skip_frame();
+                    continue;
+                } else if (focus == F3_WATCHED) {
+                    if (!watched) {
+                        watched = jf_set_played(it->id, true);
+                        if (watched) g_play_gen++;     // Continue Watching / Next Up are stale
+                    }
+                } else if (focus == F3_FAVOURITE) {
+                    // Optimistic: flip now, put it back with a word if the
+                    // server refuses.
+                    const bool want = !favourite;
+                    favourite = want;
+                    if (jf_set_favourite(it->id, want)) {
+                        g_play_gen++;                  // Home's Favourites row is stale
+                    } else {
+                        favourite = !want;
+                        snprintf(dl_toast, sizeof dl_toast, "%s", TR("Couldn't update favourites"));
+                        dl_toast_until = timing_get_us() + 3000000ULL;
+                    }
+                } else if (focus == F3_VERSION) {
+                    int chosen = info_choose_version(it->name, &versions, version_sel);
+                    if (chosen >= 0) version_sel = chosen;
+                    exit_armed = false;
+                    init_btns();
+                    info_skip_frame();
+                    continue;
+                } else if (focus == F3_QUALITY) {
+                    vquality_next(+1);
+                    vquality_remember_item(it->id, vquality_get());
+                } else if (focus == F3_DOWNLOAD) {
+                    // What X means here is dl_ui_item_action's (host-tested):
+                    // the version on screen, through the player's own stream
+                    // decision (dl_request).
+                    const DlUiAction a = dl_ui_item_action(dl_have ? &dl_st : NULL,
+                                                           can_download, &dl_cx);
+                    int r = DL_OK;
+                    if (a == DL_UI_START || a == DL_UI_RETRY) {
+                        JFItem jf;
+                        memset(&jf, 0, sizeof jf);
+                        snprintf(jf.id,   sizeof jf.id,   "%s", it->id);
+                        snprintf(jf.name, sizeof jf.name, "%s", it->name);
+                        snprintf(jf.type, sizeof jf.type, "%s", it->type);
+                        r = dl_download_item(&jf, &detail, &versions.source[version_sel]);
+                        if (r == DL_OK) {
+                            snprintf(dl_toast, sizeof dl_toast, "%s",
+                                     TR("Added to Downloads (Settings \xE2\x80\xBA Downloads)"));
+                        } else {
+                            const DlSpaceReport rep = dl_last_space_report();
+                            dl_ui_result_message(r, &rep, dl_toast, sizeof dl_toast);
+                        }
+                    } else if (a == DL_UI_PAUSE) {
+                        r = dl_pause(it->id);
+                        snprintf(dl_toast, sizeof dl_toast, "%s", dl_ui_result_text(r));
+                    } else if (a == DL_UI_RESUME) {
+                        r = dl_resume(it->id);
+                        snprintf(dl_toast, sizeof dl_toast, "%s", dl_ui_result_text(r));
+                    } else if (a == DL_UI_PLAY_OFFLINE) {
+                        const int resume = xmb_resume_choice(it);
+                        if (resume >= 0 && !show_player_offline(it->id, (u32)resume))
+                            snprintf(dl_toast, sizeof dl_toast, "%s",
+                                     TR("The offline copy is missing or damaged"));
+                        exit_armed = false;
+                        init_btns();
+                        dl_toast_until = timing_get_us() + 3000000ULL;
+                        dl_next = 0;
+                        info_skip_frame();
+                        continue;
+                    }
+                    dl_toast_until = timing_get_us() + 3000000ULL;
+                    dl_next = 0;
+                }
+            }
+        }
+
+        thumb_cache_tick();
+        clearScreen(XMB_BG);
+        wave_draw();
+
+        // ---- GPU phase ---------------------------------------------------
+        const int W = (int)display_width, H = (int)display_height;
+        if (classic) {
+            // Classic is laid out like Jellyfin's web page: the backdrop
+            // shows on the right, the poster sits top left, and the title,
+            // details and buttons stack beside it with Play right under the
+            // details; the synopsis follows, and the cast runs along the
+            // bottom at full width.
+            show_poster = true;
+            // (IY already lifts Classic by its shorter header.)
+            PWd = UIS_W(288); PHd = UIS_H(432);
+            PX = IX(57); PY = IY(146);
+            TX = PX + PWd + UIS_W(40);
+            TW = W - TX - XMB_OX - UIS_W(57);
+            Y_SEASON = IY(104); Y_TITLE = IY(146); Y_META = IY(198); Y_SCORE = IY(224);
+            Y_CHIPS = IY(250);  Y_ACT = IY(300);   Y_SEL = IY(358);  Y_TOAST = IY(400);
+            Y_OVER = IY(414);   Y_DIR = IY(484);   Y_CAST = IY(560);
+            over_w = TW;
+            over_lines = 3; title_px = 34.0f;
+            cast_max = (W - XMB_OX - TX) / UIS_W(130);
+            if (cast_max > 7) cast_max = 7;
+        }
+        // How far the arrival has got: 0 where it was opened, 1 at L3.
+        const float arr = classic
+            ? spine_ease(spine_clampf((float)(timing_get_us() - arrival_us) / 240000.0f, 0.0f, 1.0f))
+            : d_from < 1.999f
+            ? spine_ease(spine_clampf((spine_depth() - d_from) / (2.0f - d_from), 0.0f, 1.0f))
+            : 1.0f;
+        int PXa = PX, PYa = PY, PWa = PWd, PHa = PHd;
+        if (have_org && arr < 1.0f) {
+            PXa = org_x + (int)((float)(PX - org_x) * arr + 0.5f);
+            PYa = org_y + (int)((float)(PY - org_y) * arr + 0.5f);
+            PWa = org_w + (int)((float)(PWd - org_w) * arr + 0.5f);
+            PHa = org_h + (int)((float)(PHd - org_h) * arr + 0.5f);
+        }
+        if (back_gpu) ui_gpu_tex_draw_a(GPU_TEX_BACKDROP, 0, 0, W, H, depth_a8(arr));
+        {
+            // 90deg rgba(3,4,8) .96 -> .88 @46% -> .34, and a 200 px bottom
+            // scrim to .95.  Without a backdrop they still sit over the wave,
+            // which keeps the text contrast the same either way.
+            static const float hp[3] = { 0.0f, 0.46f, 1.0f };
+            static const u8    ha[3] = { 245, 224, 87 };
+            // Classic lets the artwork through on the right; the left stays
+            // dark enough for the text.
+            static const u8    ha_c[3] = { 238, 190, 30 };
+            wave_draw_ramp_gpu(0, 0, W, H, 0x00030408, false, 3, hp,
+                               classic && back_gpu ? ha_c : ha);
+            static const float vp[2] = { 0.0f, 1.0f };
+            static const u8    va[2] = { 0, 242 };
+            const int scrim_y = classic ? IY(520) : IY(519);
+            wave_draw_ramp_gpu(0, scrim_y, W, H - scrim_y, 0x00030408, true, 2, vp, va);
+        }
+        if (classic) xmb_classic_header_gpu(g_active_tab);
+        else {
+            spine_draw_gpu();
+            const spine_level L = spine_eval(spine_depth());
+            const u8 da = (u8)(72.0f * L.divider_a);
+            if (da) wave_draw_divider_gpu(IY((int)L.divider_y), 0x8A, 0x93, 0xC8, da);
+        }
+        if (poster_gpu && show_poster) ui_gpu_tex_draw(GPU_TEX_POSTER, PXa, PYa, PWa, PHa);
+
+        // Chips (y=262, h=29, pill).
+        // The facts worker's words when they have arrived ("DTS-HD MA 5.1",
+        // "1080P H.264"), the detail fetch's DisplayTitle until then.  The
+        // audio chip keeps its blue outline for lossless audio only: blue is
+        // "state the file has", and lossless is the state worth stating.
+        char achip[96] = "", vchip[64] = "", pchip[48] = "";
+        ItemFacts fx;
+        const bool hfx = facts_get(it->id, &fx, NULL);
+        bool a_ll = true;
+        if (hfx && fx.audio[0]) { snprintf(achip, sizeof achip, "%s", fx.audio); a_ll = fx.lossless; }
+        // 2026-09-27: the chosen VERSION's own default audio track, so the
+        // chip changes as the version does.  "English - DTS-HD MA - 7.1 -
+        // Default" -> "DTS-HD MA 7.1"; blue edge for the lossless ones.
+        if (version_sel >= 0 && version_sel < versions.n_sources) {
+            const JFTracks *tk = &versions.source[version_sel].tracks;
+            if (tk->n_audio > 0) {
+                int d = tk->default_audio;
+                if (d < 0 || d >= tk->n_audio) d = 0;
+                const char *src = tk->audio[d].label;
+                char tmp[96]; snprintf(tmp, sizeof tmp, "%s", src);
+                char outc[96] = ""; int seg = 0, nseg = 1;
+                for (const char *q = tmp; (q = strstr(q, " - ")) != NULL; q += 3) nseg++;
+                char *tokp = tmp;
+                while (tokp) {
+                    char *nx = strstr(tokp, " - ");
+                    if (nx) *nx = 0;
+                    const bool skip = (seg == 0 && nseg > 1) || !strcmp(tokp, "Default") ||
+                                      !strcmp(tokp, "Forced") || !strcmp(tokp, "External");
+                    if (!skip && tokp[0]) {
+                        const size_t L = strlen(outc);
+                        snprintf(outc + L, sizeof outc - L, "%s%s", L ? " " : "", tokp);
+                    }
+                    seg++;
+                    tokp = nx ? nx + 3 : NULL;
+                }
+                if (outc[0]) {
+                    snprintf(achip, sizeof achip, "%s", outc);
+                    a_ll = strstr(outc, "TrueHD") || strstr(outc, "DTS-HD MA") || strstr(outc, "MLP") ||
+                           strstr(outc, "DTS:X") || strstr(outc, "FLAC") || strstr(outc, "PCM");
+                }
+            }
+        }
+        else if (detail.audio_info[0]) info_audio_chip(detail.audio_info, achip, sizeof achip);
+        if (hfx && fx.video[0]) snprintf(vchip, sizeof vchip, "%s", fx.video);
+        else if (detail.video_info[0]) snprintf(vchip, sizeof vchip, "%s", detail.video_info);
+        {
+            u32 qw = 0, qh = 0; unsigned qbr = 0;
+            vquality_params(vquality_get(), hd1080_enabled(), display_width,
+                            display_height, &qw, &qh, NULL, NULL, &qbr);
+            if (qbr == 0) snprintf(pchip, sizeof pchip, "direct play");
+            else          snprintf(pchip, sizeof pchip, "transcode %u Mbps", qbr / 1000000u);
+        }
+        const int CY = Y_CHIPS, CH = UIS_H(29), CG = UIS_W(8);
+        const float apx = UIS_TF(10.0f), cpx = UIS_TF(11.0f);
+        int cx = TX;
+        // 2026-09-27: the audio chip in the regular face and the video chip in
+        // the spec face (swapped), and no "direct play / transcode" chip.
+        (void)pchip;
+        const int aw = achip[0] ? info_chip_width(achip, cpx, UI_FACE_REGULAR) : 0;
+        const float vpx = UIS_TF(12.5f);                 // the video chip's text: bigger (user, 09-27)
+        const int vw = vchip[0] ? info_chip_width(vchip, vpx, UI_FACE_SPEC) : 0;
+        if (aw) { wave_draw_rrect_outline_gpu(cx, CY, aw, CH, CH / 2, 1,
+                                              a_ll ? XMB_ACCENT_ALT : XMB_HAIRLINE, 255,
+                                              XMB_PANEL, XMB_PANEL, 255); cx += aw + CG; }
+        if (vw) { wave_draw_rrect_outline_gpu(cx, CY, vw, CH, CH / 2, 1, XMB_HAIRLINE, 255,
+                                              XMB_PANEL, XMB_PANEL, 255); cx += vw + CG; }
+
+        // Action row (y=410, h=44, r=4, gaps 12).  Resume/Play is the one
+        // primary: the accent->accent_alt ramp with its glow; the others are
+        // panels.  The focused control gets the focus ring, whichever it is.
+        // 2026-09-27: the row moved down into the wave's band (was y=410, above
+        // the cast), and every button is see-through so the wave moves behind
+        // it.  The director line and the cast moved up into its old place.
+        const int AY = Y_ACT, AH = UIS_H(44), AR = UIS_H(4), AG = UIS_W(12);
+        // Label text for an action button.  Shared by the layout (which sizes
+        // the box from it) and the draw below, so the two cannot disagree: a
+        // fixed box width overflowed on 4:3, where text scales but the box doesn't.
+        auto action_label = [&](int id, char *lab, size_t n) {
+            if (id == F3_RESUME) {
+                const u32 s = xmb_resume_for(it->id, it->resume_secs);
+                snprintf(lab, n, TR("Resume %u:%02u:%02u"), s / 3600u, (s / 60u) % 60u, s % 60u);
+            } else if (id == F3_PLAY)    snprintf(lab, n, TR("Play"));
+            else if (id == F3_START)     snprintf(lab, n, TR("Play from start"));
+            else if (id == F3_FAVOURITE) snprintf(lab, n, favourite ? TR("Favourited") : TR("Favourite"));
+            else                         snprintf(lab, n, watched ? TR("Watched") : TR("Mark as watched"));
+        };
+        int ax[4], aww[4];
+        {
+            int x = TX;
+            for (int i = 0; i < n0; i++) {
+                const int id = row0[i];
+                aww[i] = UIS_W(id == F3_RESUME ? 200 : id == F3_PLAY ? 150
+                             : id == F3_START ? 150 : 168);
+                {
+                    char lab[40]; action_label(id, lab, sizeof lab);
+                    const bool pr = (id == F3_RESUME || id == F3_PLAY);
+                    // glyph gutter (cross: label at 52; star: 26) + label + right pad
+                    const int need = ttf_text_width(lab, UIS_TF(15.0f), pr)
+                                   + (pr ? UIS_W(52 + 20) : id == F3_FAVOURITE ? UIS_W(26 + 40) : UIS_W(40));
+                    if (need > aww[i]) aww[i] = need;
+                }
+                ax[i] = x;
+                x += aww[i] + AG;
+                const bool primary = (id == F3_RESUME || id == F3_PLAY);
+                const bool foc = (frow == 0 && fcol == i);
+                if (primary) {
+                    wave_draw_glow_gpu(ax[i] + aww[i] / 2, AY + AH / 2,
+                                       aww[i] / 2 + UIS_W(24), AH / 2 + UIS_H(24),
+                                       (u8)((XMB_ACCENT >> 16) & 0xFF),
+                                       (u8)((XMB_ACCENT >> 8) & 0xFF),
+                                       (u8)(XMB_ACCENT & 0xFF), 60);
+                    wave_draw_rrect_outline_gpu(ax[i], AY, aww[i], AH, AR, 1,
+                                                XMB_ACCENT_ALT, 230,
+                                                XMB_ACCENT, XMB_ACCENT_ALT, 105);
+                } else {
+                    wave_draw_rrect_outline_gpu(ax[i], AY, aww[i], AH, AR, 1,
+                                                XMB_HAIRLINE, 255,
+                                                XMB_PANEL, XMB_PANEL, 110);
+                }
+                // The card focus ring, gliding between controls the way it
+                // glides between posters (spine_focus_ring_gpu).
+                if (foc) spine_focus_ring_gpu(ax[i], AY, aww[i], AH);
+            }
+        }
+
+        // "Back to Season N" under the poster (episodes).  y 523, poster width.
+        const bool season_btn = strcmp(it->type, "Episode") == 0 &&
+                                detail.series_id[0] && detail.season_id[0];
+        const int BSY = Y_SEASON, BSH = UIS_H(34);
+        char season_lab[48] = "";
+        if (season_btn) {
+            if (detail.season_num == 0)      snprintf(season_lab, sizeof season_lab, TR("\xE2\x80\xB9  Back to Specials"));
+            else if (detail.season_num > 0)  snprintf(season_lab, sizeof season_lab, TR("\xE2\x80\xB9  Back to Season %d"), detail.season_num);
+            else                             snprintf(season_lab, sizeof season_lab, TR("\xE2\x80\xB9  Back to Season"));
+        }
+        const int BSX = classic ? TX : PX;
+        const int BSW = classic ? ttf_text_width(season_lab, UIS_TF(13.0f), true) + UIS_W(32) : PW;
+        if (season_btn) {
+            wave_draw_rrect_outline_gpu(BSX, BSY, BSW, BSH, AR, 1, XMB_HAIRLINE, 255,
+                                        XMB_PANEL, XMB_PANEL, 110);
+            if (frow == 2) spine_focus_ring_gpu(BSX, BSY, BSW, BSH);
+        }
+
+        // Selectors (y=634, h=34, r=4).
+        auto sel_name = [&](int id) -> const char * {
+            return id == F3_VERSION ? TR("Version") : id == F3_DOWNLOAD ? TR("Offline") : TR("Quality");
+        };
+        auto sel_value = [&](int id, char *val, size_t n) {
+            if (id == F3_DOWNLOAD) {
+                // The live state: "Download", "Downloading 42%", "Play offline"...
+                dl_ui_item_label(dl_have ? &dl_st : NULL, can_download, &dl_cx, val, n);
+            } else if (id == F3_VERSION && !versions_searching && versions.n_sources <= 0 &&
+                       versions.n_placeholder > 0) {
+                snprintf(val, n, "%s", TR("No streams found"));
+            } else if (id == F3_VERSION && (versions_searching || versions.n_sources <= 0)) {
+                snprintf(val, n, "%s", TR("Finding versions..."));
+            } else if (id == F3_VERSION) {
+                snprintf(val, n, "%s", versions.source[version_sel].summary[0]
+                                          ? versions.source[version_sel].summary
+                                          : versions.source[version_sel].label);
+            } else {
+                u32 qw = 0, qh = 0; unsigned qbr = 0;
+                const vquality_t vq = vquality_get();
+                vquality_params(vq, hd1080_enabled(), display_width, display_height,
+                                &qw, &qh, NULL, NULL, &qbr);
+                if (qbr == 0) snprintf(val, n, TR("Original \xC2\xB7 direct play"));
+                else          snprintf(val, n, "%s \xC2\xB7 %u Mbps",
+                                       tr(vquality_label(vq)), qbr / 1000000u);
+            }
+        };
+        const int SY = Y_SEL, SH = UIS_H(34);
+        int sx_[3], sw_[3];
+        {
+            int x = TX;
+            for (int i = 0; i < n1; i++) {
+                sw_[i] = UIS_W(row1[i] == F3_VERSION ? 172 : 216);   // Quality and Download
+                {
+                    // Grow to fit "<name>  <value>" -- the name's width, not a fixed
+                    // 66 px offset, decides where the value starts (see sel_vx below).
+                    char val[64];
+                    sel_value(row1[i], val, sizeof val);
+                    const int nw = ttf_text_width(sel_name(row1[i]), UIS_TF(12.0f), false);
+                    const int vw2 = ttf_text_width(val, UIS_TF(12.5f), true);
+                    const int need = UIS_W(15) + nw + UIS_W(12) + vw2
+                                   + (row1[i] == F3_DOWNLOAD ? UIS_W(14) : UIS_W(28));
+                    if (need > sw_[i]) sw_[i] = need;
+                    if (sw_[i] > UIS_W(330)) sw_[i] = UIS_W(330);
+                }
+                sx_[i] = x;
+                x += sw_[i] + UIS_W(12);
+                wave_draw_rrect_outline_gpu(sx_[i], SY, sw_[i], SH, AR, 1,
+                                            XMB_HAIRLINE, 255, XMB_PANEL, XMB_PANEL, 255);
+                if (frow == 1 && fcol == i) spine_focus_ring_gpu(sx_[i], SY, sw_[i], SH);
+            }
+        }
+
+        // Portraits in the XMB's own shape: 2:3 cards (a headshot's native
+        // aspect, so no face is cropped) with a hairline frame, not circles.
+        // Classic: round photos on a wider pitch, names centred under them,
+        // a window of cast_max that follows the focus along row 3.
+        const int KY = Y_CAST;
+        const int KW = classic ? UIS_H(92) : UIS_W(58), KD = classic ? UIS_H(92) : UIS_H(87);
+        const int KP = classic ? UIS_W(130) : UIS_W(104);
+        const int KX = TX;
+        // The XMB layout fills the width beside the poster, leaving room for
+        // the "more" arrow, then scrolls the rest as Classic does.
+        if (!classic) {
+            cast_max = (W - XMB_OX - KX - UIS_W(60)) / KP;
+            if (cast_max > 8) cast_max = 8;
+            if (cast_max < 1) cast_max = 1;
+        }
+        if (cast_sel >= cast_total) cast_sel = cast_total > 0 ? cast_total - 1 : 0;
+        if (cast_sel < cast_top) cast_top = cast_sel;
+        if (cast_sel >= cast_top + cast_max) cast_top = cast_sel - cast_max + 1;
+        if (cast_top > cast_total - cast_max) cast_top = cast_total > cast_max ? cast_total - cast_max : 0;
+        int cast_idx[JF_MAX_PEOPLE], n_cast = 0;
+        for (int k = cast_top; k < cast_total && n_cast < cast_max; k++) cast_idx[n_cast++] = cast_all[k];
+        if (frow == 3 && cast_row) {
+            const int fk = cast_sel - cast_top;
+            spine_focus_ring_gpu(KX + fk * KP + (classic ? (KP - KW) / 2 : 0), KY, KW, KD);
+        }
+
+        rsxSync();
+        ui_text_gpu_begin();
+
+        // ---- CPU phase ---------------------------------------------------
+        if (classic) xmb_classic_header_cpu(g_active_tab);
+        else         xmb_cpu_draw_user();
+        if (!poster_gpu && show_poster) {
+            if (poster_cpu.pixels) info_blit(&poster_cpu, PX, PY);
+            else xmb_cpu_blit_thumb_scaled(it->id, PX, PY, PW, PH);
+        }
+        // 1 px hairline ring just outside the poster (the canvas's box-shadow),
+        // following it while it arrives.
+        if (show_poster && PXa >= 1 && PYa >= 1) {
+            drawRect((u32)(PXa - 1), (u32)(PYa - 1), (u32)(PWa + 2), 1, XMB_HAIRLINE);
+            drawRect((u32)(PXa - 1), (u32)(PYa + PHa), (u32)(PWa + 2), 1, XMB_HAIRLINE);
+            drawRect((u32)(PXa - 1), (u32)(PYa - 1), 1, (u32)(PHa + 2), XMB_HAIRLINE);
+            drawRect((u32)(PXa + PWa), (u32)(PYa - 1), 1, (u32)(PHa + 2), XMB_HAIRLINE);
+        }
+
+        // The Download button's progress: a thin bar along its bottom edge.
+        for (int i = 0; i < n1; i++) {
+            if (row1[i] != F3_DOWNLOAD || !dl_have || dl_st.rec.state == DL_COMPLETED) continue;
+            const int pm = dl_progress_permille(&dl_st.rec);
+            if (pm < 0) continue;
+            const int by = SY + SH - UIS_H(4), bw = sw_[i] - UIS_W(8);
+            drawRect((u32)(sx_[i] + UIS_W(4)), (u32)by, (u32)bw, UIS_H(2), XMB_HAIRLINE);
+            drawRect((u32)(sx_[i] + UIS_W(4)), (u32)by, (u32)(bw * pm / 1000), UIS_H(2), XMB_ACCENT);
+        }
+
+        // Cast: 58x87 (2:3) portraits on a 104 px pitch from x=313, y=493.  The
+        // canvas has no crew here except the director, who gets the line
+        // above, so crew entries are skipped.
+        // A person with no photo (or one that failed to load) gets the
+        // default silhouette instead of an empty placeholder.
+        for (int k = 0; classic && k < n_cast; k++) {
+            const JFPerson *pp = &detail.people[cast_idx[k]];
+            const int px = KX + k * KP + (KP - KW) / 2;
+            if (pp->has_image && !thumb_failed(pp->id))
+                xmb_cpu_blit_thumb_circle(pp->id, px, KY, KW, XMB_HAIRLINE);
+            else
+                xmb_cpu_draw_avatar(px, KY, KW, KW, true, XMB_HAIRLINE);
+        }
+        for (int k = 0; !classic && k < n_cast; k++) {
+            const JFPerson *pp = &detail.people[cast_idx[k]];
+            const int kx = TX + k * KP;
+            if (!pp->has_image || thumb_failed(pp->id))
+                xmb_cpu_draw_avatar(kx, KY, KW, KD, false, XMB_HAIRLINE);
+            else if (!xmb_cpu_blit_thumb(pp->id, kx, KY, KW, KD))
+                drawRect((u32)kx, (u32)KY, (u32)KW, (u32)KD, XMB_THUMB_DIM);
+            drawRect((u32)(kx - 1), (u32)(KY - 1), (u32)(KW + 2), 1, XMB_HAIRLINE);
+            drawRect((u32)(kx - 1), (u32)(KY + KD), (u32)(KW + 2), 1, XMB_HAIRLINE);
+            drawRect((u32)(kx - 1), (u32)(KY - 1), 1, (u32)(KD + 2), XMB_HAIRLINE);
+            drawRect((u32)(kx + KW), (u32)(KY - 1), 1, (u32)(KD + 2), XMB_HAIRLINE);
+        }
+
+        // ---- text --------------------------------------------------------
+        if (classic) xmb_classic_header_text(g_active_tab);
+        else { xmb_draw_topbar_user(); spine_draw(); }
+
+        // Title: 25px/700 display face, -0.01em.
+        {
+            const float tpx = UIS_TF(title_px), trk = tpx * -0.01f;
+            char tbuf[132];
+            snprintf(tbuf, sizeof tbuf, "%s", it->name);
+            int len = (int)strlen(tbuf);
+            while (len > 1 && ttf_text_width_tracked(tbuf, tpx, UI_FACE_DISPLAY, trk) > TW)
+                tbuf[--len] = 0;
+            drawTTF_tracked((u32)TX, (u32)Y_TITLE, tbuf, tpx, XMB_TEXT, UI_FACE_DISPLAY, trk);
+        }
+
+        // Metadata gets two bounded rows: identity/certification, then scores
+        // and local finish time. A long genre list cannot push ratings off-screen.
+        {
+            unsigned selected_runtime = 0;
+            if (version_sel >= 0 && version_sel < versions.n_sources)
+                selected_runtime = versions.source[version_sel].runtime_secs;
+            const unsigned runtime = detail_runtime_seconds(detail.identity.runtime_secs,
+                hfx ? fx.runtime_secs : 0, selected_runtime);
+            char duration[32];
+            if (runtime >= 3600)
+                snprintf(duration, sizeof duration, "%uh %um", runtime / 3600, runtime / 60 % 60);
+            else if (runtime)
+                snprintf(duration, sizeof duration, "%um", (runtime + 59) / 60);
+            else snprintf(duration, sizeof duration, "%s", it->duration_str);
+            const float mpx = UIS_TF(13.5f);
+            const u32 sep_c = info_mix(XMB_TEXT_DIM, XMB_BG, 0.5f);
+            const char *parts[4] = { it->year_str, duration, detail.official_rating,
+                                     classic ? "" : detail.genres };
+            int mx = TX;
+            for (int i = 0; i < 4 && mx < TX + TW; i++) {
+                if (!parts[i][0]) continue;
+                if (mx != TX) {
+                    drawTTF((u32)(mx + UIS_W(6)), (u32)Y_META, "\xC2\xB7", mpx, sep_c);
+                    mx += UIS_W(18);
+                }
+                if (mx >= TX + TW) break;
+                info_clip_text(mx, Y_META, parts[i], mpx, XMB_TEXT_DIM, TX + TW - mx, false);
+                mx += ttf_text_width(parts[i], mpx);
+            }
+            const unsigned remaining = detail_remaining_seconds(runtime,
+                xmb_resume_for(it->id, it->resume_secs), focus == F3_START);
+            char end_time[16] = "", ends[64] = "";
+            if (remaining) {
+                xmb_clock_after(remaining, end_time, sizeof end_time);
+                snprintf(ends, sizeof ends, TR("Ends at %s"), end_time);
+            }
+            // Reserve the finish estimate at the right; ratings use the rest.
+            const int end_w = ends[0] ? ttf_text_width(ends, mpx) : 0;
+            const int ratings_right = TX + TW - (end_w ? end_w + UIS_W(20) : 0);
+            mx = TX;
+            if (detail.community_rating[0] && mx + UIS_W(24) < ratings_right) {
+                drawIcon((u32)mx, (u32)Y_SCORE, ICON_STAR, mpx, XMB_ACCENT_ALT);
+                mx += UIS_W(22);
+                char score[24];
+                snprintf(score, sizeof score, "%s/10", detail.community_rating);
+                info_clip_text(mx, Y_SCORE, score, mpx, XMB_ACCENT_ALT, ratings_right - mx, false);
+                mx += ttf_text_width(score, mpx) + UIS_W(24);
+            }
+            if (detail.critic_rating[0] && mx < ratings_right) {
+                char score[80];
+                snprintf(score, sizeof score, TR("Critics %s"), detail.critic_rating);
+                info_clip_text(mx, Y_SCORE, score, mpx, XMB_TEXT, ratings_right - mx, false);
+            }
+            if (ends[0])
+                info_clip_text(TX + TW - end_w, Y_SCORE, ends, mpx, XMB_TEXT_DIM, end_w, false);
+        }
+
+        // Chip labels, vertically centred in the 29 px pills.
+        {
+            int x = TX;
+            const int ty_s = CY + (CH - (int)apx) / 2 - UIS_H(1);
+            const int ty_r = CY + (CH - (int)cpx) / 2 - UIS_H(1);
+            if (aw) { drawTTF((u32)(x + UIS_W(10)), (u32)ty_r, achip, cpx,
+                              a_ll ? XMB_ACCENT_ALT : XMB_TEXT_DIM);
+                      x += aw + CG; }
+            if (vw) { const float vpx = UIS_TF(12.5f);
+                      drawTTF_face((u32)(x + UIS_W(10)), (u32)(CY + (CH - (int)vpx) / 2 - UIS_H(1)),
+                                   vchip, vpx, XMB_TEXT_DIM, UI_FACE_SPEC);
+                      x += vw + CG; }
+            (void)x;                    // (the transcode chip is gone)
+        }
+
+        // Overview: three lines below the scores and codec chips.
+        if (detail.overview[0])
+            info_wrap(TX, Y_OVER, detail.overview, UIS_TF(14.0f), XMB_TEXT_DIM,
+                      over_w, UIS_H(22), over_lines);
+
+        // Button labels.
+        for (int i = 0; i < n0; i++) {
+            const int id = row0[i];
+            char lab[40];
+            action_label(id, lab, sizeof lab);
+            const bool primary = (id == F3_RESUME || id == F3_PLAY);
+            const float bpx = UIS_TF(15.0f);
+            const int lw = ttf_text_width(lab, bpx, primary);
+            int lx = ax[i] + (aww[i] - lw) / 2;
+            if (id == F3_FAVOURITE) {
+                // The star (accent when set) and the label after it, centred together.
+                const int gw = UIS_W(26);
+                const int gx = ax[i] + (aww[i] - (gw + lw)) / 2;
+                drawIcon((u32)gx, (u32)(AY + (AH - UIS_H(18)) / 2), ICON_STAR, UIS_TF(18.0f),
+                         favourite ? XMB_ACCENT_ALT : XMB_TEXT_DIM);
+                lx = gx + gw;
+            }
+            if (primary) {
+                // The 22 px cross glyph sits at the left, the label after it.
+                const int gx = ax[i] + UIS_W(20);
+                draw_ps_button_vcentered((u32)gx, AY + AH / 2, 'X', UIS_H(22), 0x00FFFFFF);
+                lx = gx + UIS_W(32);
+            }
+            drawTTF((u32)lx, (u32)(AY + (AH - (int)bpx) / 2 - UIS_H(1)), lab, bpx,
+                    primary ? XMB_WHITE : XMB_TEXT, primary);
+        }
+
+        if (season_btn) {
+            const float spx = UIS_TF(13.0f);
+            const int sw = ttf_text_width(season_lab, spx, frow == 2);
+            drawTTF((u32)(BSX + (BSW - sw) / 2), (u32)(BSY + (BSH - (int)spx) / 2 - UIS_H(1)), season_lab, spx,
+                    frow == 2 ? XMB_WHITE : XMB_TEXT, frow == 2);
+        }
+
+        // Classic: labelled rows, as on Jellyfin's web page.
+        if (classic) {
+            const float lpx = UIS_TF(13.0f);
+            const int vx = TX + UIS_W(96);
+            int ry = Y_DIR;
+            if (detail.genres[0]) {
+                drawTTF((u32)TX, (u32)ry, TR("Genres"), lpx, XMB_TEXT_FAINT);
+                info_clip_text(vx, ry, detail.genres, lpx, XMB_TEXT, TX + TW - vx, true);
+                ry += UIS_H(24);
+            }
+            if (director) {
+                drawTTF((u32)TX, (u32)ry, TR("Director"), lpx, XMB_TEXT_FAINT);
+                info_clip_text(vx, ry, director, lpx, XMB_TEXT, TX + TW - vx, true);
+            }
+        }
+        // Director line.
+        else if (director) {
+            char line[140];
+            snprintf(line, sizeof line, TR("Director \xC2\xB7 %s"), director);
+            drawTTF((u32)TX, (u32)Y_DIR, line, UIS_TF(13.0f), XMB_TEXT_FAINT);   // was 467
+        }
+
+        // Cast names: actor above character, Satoshi one weight.
+        for (int k = 0; k < n_cast; k++) {
+            const JFPerson *pp = &detail.people[cast_idx[k]];
+            int x = KX + k * KP;
+            const int cw = KP - UIS_W(8);
+            // Classic centres each name under its photo (when it fits).
+            const int nw = ttf_text_width(pp->name, UIS_TF(12.0f));
+            const int rw = pp->role[0] ? ttf_text_width(pp->role, UIS_TF(11.5f)) : 0;
+            const int nx = classic && nw < cw ? x + (KP - nw) / 2 : x;
+            const int rx = classic && rw < cw ? x + (KP - rw) / 2 : x;
+            const bool cfoc = frow == 3 && cast_top + k == cast_sel;
+            info_clip_text(nx, KY + KD + UIS_H(6), pp->name, UIS_TF(12.0f),
+                           cfoc ? XMB_WHITE : XMB_TEXT, cw, false, UI_FACE_TAB_REG);
+            if (pp->role[0])
+                info_clip_text(rx, KY + KD + UIS_H(22), pp->role, UIS_TF(11.5f),
+                               XMB_TEXT_DIM, cw, false, UI_FACE_TAB_REG);
+        }
+
+        // More cast either side of the window.
+        if (cast_row && cast_total > cast_max) {
+            const float apx = UIS_TF(20.0f);
+            const int ay = KY + KD / 2 - (int)apx / 2;
+            if (cast_top > 0)
+                drawTTF((u32)(KX - UIS_W(22)), (u32)ay, "\xE2\x80\xB9", apx, XMB_TEXT_DIM);
+            const int ax = classic ? KX + cast_max * KP + UIS_W(4)
+                                   : KX + (cast_max - 1) * KP + KW + UIS_W(14);
+            if (cast_top + cast_max < cast_total)
+                drawTTF((u32)ax, (u32)ay, "\xE2\x80\xBA", apx, XMB_TEXT_DIM);
+        }
+
+        // Selector labels.
+        for (int i = 0; i < n1; i++) {
+            const int y = SY + (SH - (int)UIS_TF(12.0f)) / 2 - UIS_H(1);
+            const char *name = sel_name(row1[i]);
+            drawTTF((u32)(sx_[i] + UIS_W(15)), (u32)y, name, UIS_TF(12.0f), XMB_TEXT_DIM);
+            char val[64];
+            sel_value(row1[i], val, sizeof val);
+            const int vx = sx_[i] + UIS_W(15) + ttf_text_width(name, UIS_TF(12.0f), false) + UIS_W(12);
+            if (row1[i] == F3_DOWNLOAD) {
+                info_clip_text(vx, y, val, UIS_TF(12.5f), XMB_TEXT,
+                               sx_[i] + sw_[i] - vx - UIS_W(14), true);
+                continue;                       // not a drop-down: no arrow
+            }
+            info_clip_text(vx, y, val, UIS_TF(12.5f), XMB_TEXT,
+                           sx_[i] + sw_[i] - vx - UIS_W(24), true);
+            drawTTF((u32)(sx_[i] + sw_[i] - UIS_W(18)), (u32)(y + UIS_H(1)),
+                    "\xE2\x96\xBE", UIS_TF(10.0f), XMB_TEXT_FAINT);
+        }
+
+        // The Download button's toast, a few seconds, above the selector row.
+        if (dl_toast[0] && timing_get_us() < dl_toast_until)
+            drawTTF((u32)TX, (u32)Y_TOAST, dl_toast, UIS_TF(13.0f), 0x00E8B64CUL);
+
+        // Hints: what X does on the focused control, and Back.
+        if (frow == 3) {
+            static const Hint hc[] = {{'E', TRN("Browse cast")}, {'C', TRN("Back")}};
+            draw_hints_bar(hc, 2);
+        } else {
+            Hint h[2];
+            h[0].glyph = 'X';
+            h[0].label = focus == F3_RESUME ? TR("Resume") : focus == F3_PLAY ? TR("Play")
+                       : focus == F3_START ? TR("Play from start")
+                       : focus == F3_WATCHED ? TR("Mark watched")
+                       : focus == F3_FAVOURITE ? (favourite ? TR("Remove favourite") : TR("Favourite"))
+                       : focus == F3_VERSION ? TR("Choose version")
+                       : focus == F3_DOWNLOAD
+                           ? dl_ui_action_label(dl_ui_item_action(dl_have ? &dl_st : NULL,
+                                                                  can_download, &dl_cx))
+                       : TR("Change quality");
+            h[1].glyph = 'C'; h[1].label = TR("Back");
+            draw_hints_bar(h, 2);
+        }
+
+        ui_text_gpu_flush();
+        flip();
+    }
+
+    vs_cancel();                          // a search still running is no longer wanted
+    detail_media_free(&poster_cpu);
+    ui_gpu_tex_clear(GPU_TEX_POSTER);
+    ui_gpu_tex_clear(GPU_TEX_BACKDROP);
+    wave_set_art_tint(0u, 0.0f);          // back to the plain palette
+    if (!classic) spine_set_level(back_level);
+    slog_state("INFO3_CLOSE");
+    g_info_cooldown_until = timing_get_us() + 500000;
+    init_btns();
+}
+
+void xmb_show_item_info(const XMBItem *root) { xmb_show_item_info_v3(root); }
+
+// Resume-or-restart prompt for a partly-watched item.  Blocks with its own
+// draw/input loop over the wave background, exactly like xmb_show_item_info.
+// Returns where playback should start:
+//   >= 0  play at this many seconds (0 = from the beginning)
+//   <  0  the user cancelled — don't play.
+// Items with no meaningful resume point (< 10 s watched) skip the prompt and
+// return 0 (start from the beginning) so a fresh item plays immediately.
+int xmb_resume_choice(const XMBItem *it) {
+    if (!it || xmb_resume_for(it->id, it->resume_secs) < 10) return 0;
+
+    // Format the saved position as H:MM:SS / M:SS.
+    char tstr[16];
+    u32 s = xmb_resume_for(it->id, it->resume_secs);
+    if (s >= 3600) snprintf(tstr, sizeof(tstr), "%u:%02u:%02u",
+                            s / 3600, (s % 3600) / 60, s % 60);
+    else           snprintf(tstr, sizeof(tstr), "%u:%02u", s / 60, s % 60);
+    char opt_resume[48];
+    snprintf(opt_resume, sizeof(opt_resume), TR("Resume from %s"), tstr);
+    char sub[48];
+    snprintf(sub, sizeof(sub), TR("Stopped at %s"), tstr);
+    const char *opts[2] = { opt_resume, TR("Start from beginning") };
+
+    rsxSync();
+    flip();
+    init_btns();
+
+    int  sel   = 0;       // 0 = resume (default), 1 = start over
+    bool armed = false;   // wait for the launching cross/circle to release
+    while (running) {
+        waitflip();
+        sysUtilCheckCallback();
+        poll_buttons();
+
+        if (!armed) {
+            if (!btn_cur.cross && !btn_cur.circle) armed = true;
+        } else {
+            if (BTN_PRESSED(circle)) { init_btns(); return -1; }
+            if (BTN_PRESSED(up))     sel = 0;
+            if (BTN_PRESSED(down))   sel = 1;
+            if (BTN_PRESSED(cross)) {
+                int r = (sel == 0) ? (int)xmb_resume_for(it->id, it->resume_secs) : 0;
+                init_btns();
+                return r;
+            }
+        }
+
+        clearScreen(XMB_BG);
+        wave_draw();
+        rsxSync();
+
+        int pw = UIS_W(560), ph = UIS_H(236);
+        int px = ((int)display_width  - pw) / 2;
+        int py = ((int)display_height - ph) / 2;
+        drawRect((u32)px, (u32)py, (u32)pw, (u32)ph, XMB_PANEL);
+        drawRect((u32)px, (u32)py, (u32)pw, 1, XMB_HAIRLINE);
+        drawRect((u32)px, (u32)(py + ph - 1), (u32)pw, 1, XMB_HAIRLINE);
+        drawRect((u32)px, (u32)py, 1, (u32)ph, XMB_HAIRLINE);
+        drawRect((u32)(px + pw - 1), (u32)py, 1, (u32)ph, XMB_HAIRLINE);
+
+        int cx    = px + UIS_W(32);
+        int max_w = pw - UIS_W(64);
+        int y     = py + UIS_H(30);
+
+        // Item title, truncated to the panel width.
+        {
+            char tbuf[132];
+            snprintf(tbuf, sizeof(tbuf), "%s", it->name);
+            int len = (int)strlen(tbuf);
+            while (len > 1 && ttf_text_width(tbuf, UIS_TF(25), true) > max_w)
+                tbuf[--len] = '\0';
+            drawTTF((u32)cx, (u32)y, tbuf, UIS_TF(25), XMB_WHITE, true);
+        }
+        y += 40;
+        drawTTF((u32)cx, (u32)y, sub, UIS_TF(15), XMB_TEXT_DIM);
+        y += 34;
+
+        // Two option rows; the selected one gets the panel-hi fill + accent bar.
+        int ow = max_w, oh = UIS_H(46);
+        for (int i = 0; i < 2; i++) {
+            int oy = y + i * (oh + UIS_H(10));
+            if (i == sel) {
+                drawRect((u32)cx, (u32)oy, (u32)ow, (u32)oh, XMB_PANEL_HI);
+                drawRect((u32)(cx - UIS_W(4)), (u32)oy, UIS_W(3), (u32)oh, XMB_ACCENT);
+            }
+            drawTTF_vcentered((u32)(cx + UIS_W(16)), oy + oh / 2, opts[i], UIS_TF(19),
+                              i == sel ? XMB_TEXT : XMB_TEXT_DIM);
+        }
+
+        { static const Hint h[] = {{'X', TRN("Select")}, {'C', TRN("Back")}};
+          draw_hints_bar(h, 2); }
+        flip();
+    }
+    init_btns();
+    return -1;
+}

@@ -1,0 +1,851 @@
+// Chrome widgets — top bar (brand + clock), divider, alphabetical
+// jump bar, controller hints bar, empty states, breadcrumbs.
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+
+#include "ui.h"
+#include "ui_visuals.h"
+#include "ui_internal.h"
+#include "ui_wave.h"
+#include "ui_spine.h"    // frame clock for the A-Z rail's glide
+#include "boot_anim.h"
+#include "icons.h"
+#include "clock_fmt.h"
+#include <sysutil/sysutil.h>
+#include <sys/systime.h>
+#include "stb_image.h"
+#include "ps_buttons_png.h"
+#include "jfmark_png.h"
+#include "plog.h"
+#include "jellyfin_api.h"      // g_userid: the header picture
+#include "thumbnail_cache.h"
+
+// -------------------------------------------------------
+// Tab icon codepoints (Tabler Icons)
+// -------------------------------------------------------
+
+// Icon per tab KIND, not per tab index — several tabs can share a kind now
+// that every library gets its own.  A library with an unrecognised
+// CollectionType falls back to the generic collections glyph.
+static int tab_icon(int tab) {
+    switch (xmb_kind(tab)) {
+    case TABKIND_SEARCH:   return ICON_SEARCH;
+    case TABKIND_HOME:     return ICON_HOME;
+    case TABKIND_MOVIES:   return ICON_MOVIE;
+    case TABKIND_TV:       return ICON_TV;
+    case TABKIND_MUSIC:    return ICON_MUSIC;
+    case TABKIND_PLAYLISTS:return ICON_MUSIC;
+    case TABKIND_BOXSETS:  return ICON_COLLECTIONS;
+    case TABKIND_SETTINGS: return ICON_SETTINGS;
+    case TABKIND_LIVETV:   return ICON_ANTENNA;
+    case TABKIND_LOCAL:    return ICON_COLLECTIONS;
+    // Every custom / untyped library shares ONE icon, so they read as a
+    // family rather than masquerading as a Collections library.
+    //
+    // ICON_PHOTO is the only sensible glyph left: the bundled Tabler font is
+    // a 21-glyph SUBSET (ui/fonts/tabler_icons.h) and all 21 are already
+    // spoken for, so nothing is truly free.  This one at least never appears
+    // in the tab bar — its only other use is a list placeholder in
+    // ui_lists.cpp — so it collides with nothing the user sees up here.
+    // A dedicated folder glyph means regenerating the subset (fontTools on
+    // tabler-icons.ttf with the ICON_* codepoints, per that file's header).
+    default:               return ICON_PHOTO;
+    }
+}
+
+int xmb_nav_depth(void)
+{
+    if (g_tv_depth > 0) return g_tv_depth;
+    if (g_col_depth > 0) return g_col_depth;
+    if (g_music_depth > 0) return g_music_depth;
+    return 0;
+}
+
+// -------------------------------------------------------
+// Top bar: brand on the left, clock on the right (XMB style)
+// -------------------------------------------------------
+
+// Top bar: lockup left, clock right, both on the same 24px row at y=20
+// (handoff section 8's Phase 2 block).  Scales with the UI scale so it stays
+// proportional inside the chrome band above the tab strip.
+//
+// This is the design's lockup now: the rasterised mark (gfx/jfmark_png.h) and
+// "JELLYFIN" in Mata Bold running the theme's wordmark ramp.  v1.0's sizes --
+// mark 21px, wordmark 14px, gap 6 -- and no "PS3" tag, because the mark
+// carries the PS3 icon itself.
+//
+// Two deviations from the canvas, both deliberate:
+//
+//   * NO skewX(-7deg) scaleX(0.88).  Shearing would mean rasterising the word
+//     into a scratch buffer and blitting it row-shifted, which is real work
+//     every frame for a 1.7px lean at 14px.  Revisit it if it reads as wrong
+//     on a TV beside the mark, which is where this has to be judged anyway.
+//   * Not the canvas's stack of five shadows: a short extrusion instead --
+//     two layers of the ramp, darkened, stepping down-right under the face,
+//     over one hard drop shadow.  It keeps the wordmark legible over the
+//     wave and gives it a little depth (xmb_draw_topbar).
+void xmb_lockup_geom(XmbLockupGeom *g) {
+    const int oy    = XMB_OY;   // shift the top bar down out of the CRT overscan
+    const int row_y = oy + UIS_H(20);            // the shared 24px row
+    g->cy      = row_y + UIS_H(24) / 2;
+    g->mark_px = UIS_H(21);
+    g->mark_x  = (int)XMB_ITEM_PAD;
+    g->mark_y  = g->cy - g->mark_px / 2;
+    // The wordmark's ink is centred on the same line as the mark rather than
+    // being given a y of its own: 14px type against a 21px mark is exactly the
+    // case where an eyeballed offset stops being right at the next scale.
+    g->word_px = UIS_TF(14.0f);
+    g->track   = g->word_px * 0.02f;             // the design's 0.02em
+    g->word_x  = g->mark_x + g->mark_px + UIS_H(6);
+    g->word_y  = g->cy;
+    g->word_ok = ttf_center_y("JELLYFIN", g->word_px, UI_FACE_LOCKUP, g->cy,
+                              &g->word_y);
+}
+
+// The wordmark's depth: the ramp itself, darkened, as a short extrusion under
+// the face -- so the edge carries the gradient (a solid letter seen slightly
+// from above) rather than reading as a flat shadow.  k scales each channel.
+static void lk_ramp_shade(const u32 *in, u32 *out, float k) {
+    for (int i = 0; i < 4; i++) {
+        const u32 c = in[i];
+        const u32 r = (u32)((float)((c >> 16) & 0xFF) * k);
+        const u32 g = (u32)((float)((c >> 8) & 0xFF) * k);
+        const u32 b = (u32)((float)(c & 0xFF) * k);
+        out[i] = (c & 0xFF000000u) | (r << 16) | (g << 8) | b;
+    }
+}
+
+// The lockup's opacity (2026-09-27): the music screen fades it in focus mode.
+// Mixed toward the background in sixteenths, so the cached text runs are
+// reused; the mark is an image and takes real alpha.
+float g_topbar_logo_a = 1.0f;
+static u32 lk_fade(u32 c, float a) {
+    u32 out = 0;
+    for (int sh = 0; sh <= 16; sh += 8) {
+        const int cb = (int)((XMB_BG >> sh) & 0xFF), cc = (int)((c >> sh) & 0xFF);
+        out |= (u32)(cb + (int)((float)(cc - cb) * a)) << sh;
+    }
+    return out;
+}
+
+// Shared by the corner clock and the details page's finish estimate.
+static void clock_strings(unsigned after_secs, char *t_str, size_t t_cap, char *d_str, size_t d_cap) {
+    static int s_off = 0, s_dfmt = CLK_DATE_MDY, s_tfmt = CLK_TIME_12H;
+    static u64 s_read_at = 0;
+    u64 sec = 0, nsec = 0;
+    sysGetCurrentTime(&sec, &nsec);
+    if (s_read_at == 0 || sec != s_read_at) {
+        s_read_at = sec;
+        s32 tz = 0, summer = 0, df = CLK_DATE_MDY, tf = CLK_TIME_12H;
+        if (sysUtilGetSystemParamInt(SYSUTIL_SYSTEMPARAM_ID_TIMEZONE, &tz) != 0) tz = 0;
+        if (sysUtilGetSystemParamInt(SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME, &summer) != 0) summer = 0;
+        if (sysUtilGetSystemParamInt(SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT, &df) != 0) df = CLK_DATE_MDY;
+        if (sysUtilGetSystemParamInt(SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT, &tf) != 0) tf = CLK_TIME_12H;
+        s_off = (int)tz * 60 + (summer ? 3600 : 0);
+        s_dfmt = df; s_tfmt = tf;
+    }
+    clock_format((long long)sec + after_secs, s_off, s_dfmt, s_tfmt, t_str, t_cap, d_str, d_cap);
+}
+
+void xmb_clock_after(unsigned seconds, char *out, size_t cap) {
+    char date[16];
+    clock_strings(seconds, out, cap, date, sizeof date);
+}
+
+// Room kept at the right of the top row for the user's picture.
+static int s_topbar_right_reserve = 0;
+
+static void user_box(int *x, int *y, int *d) {
+    *d = UIS_H(34);
+    *x = (int)display_width - (int)XMB_ITEM_PAD - *d;
+    *y = XMB_OY + UIS_H(20) + UIS_H(12) - *d / 2;
+}
+
+// A user with no picture (or one that fails) gets the default silhouette.
+void xmb_cpu_draw_user(void) {
+    if (!g_userid[0]) return;
+    char key[80];
+    snprintf(key, sizeof key, "user:%s", g_userid);
+    int x, y, d;
+    user_box(&x, &y, &d);
+    const int ct = g_cpu_clip_top, cb = g_cpu_clip_bot;
+    g_cpu_clip_top = 0; g_cpu_clip_bot = 0;
+    if (thumb_failed(key) || !xmb_cpu_blit_thumb_circle_sq(key, x, y, d, XMB_HAIRLINE))
+        xmb_cpu_draw_avatar(x, y, d, d, true, XMB_HAIRLINE);
+    g_cpu_clip_top = ct; g_cpu_clip_bot = cb;
+}
+
+void xmb_draw_topbar_user(void) {
+    int x, y, d;
+    user_box(&x, &y, &d);
+    s_topbar_right_reserve = g_userid[0] ? d + UIS_W(16) : 0;
+    xmb_draw_topbar();
+    s_topbar_right_reserve = 0;
+}
+
+void xmb_draw_topbar(void) {
+    const int oy    = XMB_OY;
+    const float la  = (float)(int)(g_topbar_logo_a * 16.0f + 0.5f) / 16.0f;
+    const int row_y = oy + UIS_H(20);            // the shared 24px row
+
+    XmbLockupGeom lk;
+    xmb_lockup_geom(&lk);
+
+    // During a cold boot the lockup is ASSEMBLED rather than drawn: the boot
+    // animation hands back a pose saying which parts exist yet and where.
+    // NULL -- every frame after the boot, and every boot with the animation
+    // off -- is the static lockup, drawn by exactly the calls it always was.
+    const BootLockupPose *pose = boot_anim_lockup_pose();
+
+    if (la > 0.03f && (!pose || pose->show_mark)) {
+        if (!pose && la < 0.999f)
+            xmb_draw_mark_a(lk.mark_x, lk.mark_y, lk.mark_px, (u8)(la * 255.0f + 0.5f));
+        else if (pose && pose->mark_posed)
+            xmb_draw_mark(pose->mark_x, pose->mark_y, pose->mark_bell);
+        else
+            xmb_draw_mark(lk.mark_x, lk.mark_y, lk.mark_px);
+    }
+
+    const u32 ramp[4] = { XMB_LK_WORD_A, XMB_LK_WORD_B,
+                          XMB_LK_WORD_C, XMB_LK_WORD_D };
+    // Back to front: the drop shadow, two extruded layers stepping down-right
+    // (deepest first), then the face.  One step is a device pixel at least.
+    u32 deep[4], mid[4];
+    lk_ramp_shade(ramp, deep, 0.28f);
+    lk_ramp_shade(ramp, mid,  0.50f);
+    u32 rampf[4];
+    for (int i = 0; i < 4; i++) {
+        rampf[i] = lk_fade(ramp[i], la); deep[i] = lk_fade(deep[i], la); mid[i] = lk_fade(mid[i], la);
+    }
+    #define ramp rampf
+    const u32 st = UIS_H(1) > 1 ? (u32)UIS_H(1) : 1u;
+    if (lk.word_ok && la > 0.03f && (!pose || pose->show_word)) {
+        const u32 wx = (u32)lk.word_x, wy = (u32)lk.word_y;
+        if (xmb_nav_depth() > 0) {
+            drawTTF_tracked(wx, wy, "JELLYFIN", lk.word_px,
+                            lk_fade(XMB_TEXT_FAINT, la), UI_FACE_LOCKUP, lk.track);
+        } else if (pose && pose->word_posed) {
+            // Same passes as below, each letter at its pose.  NULL stops is
+            // a flat black run: the shadow and the extrusion travel with
+            // their letter.
+            drawTTF_ramp_posed(wx + st, wy + 3 * st, "JELLYFIN", lk.word_px,
+                               NULL, 0, UI_FACE_LOCKUP, lk.track,
+                               pose->word_reveal, pose->word_alpha,
+                               BOOT_WORD_LETTERS, pose->word_slide_px);
+            drawTTF_ramp_posed(wx + st, wy + 2 * st, "JELLYFIN", lk.word_px,
+                               deep, 4, UI_FACE_LOCKUP, lk.track,
+                               pose->word_reveal, pose->word_alpha,
+                               BOOT_WORD_LETTERS, pose->word_slide_px);
+            drawTTF_ramp_posed(wx, wy + st, "JELLYFIN", lk.word_px,
+                               mid, 4, UI_FACE_LOCKUP, lk.track,
+                               pose->word_reveal, pose->word_alpha,
+                               BOOT_WORD_LETTERS, pose->word_slide_px);
+            drawTTF_ramp_posed(wx, wy, "JELLYFIN", lk.word_px,
+                               ramp, 4, UI_FACE_LOCKUP, lk.track,
+                               pose->word_reveal, pose->word_alpha,
+                               BOOT_WORD_LETTERS, pose->word_slide_px);
+        } else {
+            drawTTF_tracked(wx + st, wy + 3 * st, "JELLYFIN", lk.word_px,
+                            lk_fade(0x00000000, la), UI_FACE_LOCKUP, lk.track);
+            drawTTF_ramp(wx + st, wy + 2 * st, "JELLYFIN", lk.word_px,
+                         deep, 4, UI_FACE_LOCKUP, lk.track);
+            drawTTF_ramp(wx, wy + st, "JELLYFIN", lk.word_px,
+                         mid, 4, UI_FACE_LOCKUP, lk.track);
+            drawTTF_ramp(wx, wy, "JELLYFIN", lk.word_px,
+                         ramp, 4, UI_FACE_LOCKUP, lk.track);
+        }
+    }
+
+    #undef ramp
+    // Clock, right-aligned, with the date dimmer beside it.
+    // The console's own zone, summer time, 12/24 h and date order, read once a
+    // second (clock_fmt.h): what the XMB shows, not the C library's UTC guess.
+    char t_str[16], d_str[16];
+    clock_strings(0, t_str, sizeof t_str, d_str, sizeof d_str);
+    // v1.0 moved BOTH of these onto --font-tab (Satoshi).  The clock used to be
+    // one of two things the display face was allowed; it is not any more, which
+    // matters now that the display face is a subset with no colon -- a clock on
+    // it would have rendered "1334" and nobody would have known why.
+    const float time_px = UIS_TF(16.0f);         // Satoshi 700
+    const float date_px = UIS_TF(11.0f);         // Satoshi 500
+    int tw = ttf_text_width_face(t_str, time_px, UI_FACE_TAB);
+    int dw = ttf_text_width_face(d_str, date_px, UI_FACE_TAB_REG);
+    int tx = (int)display_width - (int)XMB_ITEM_PAD - s_topbar_right_reserve - tw;
+    drawTTF_face((u32)tx, (u32)(row_y + UIS_H(2)), t_str, time_px,
+                 XMB_TEXT, UI_FACE_TAB);
+    drawTTF_face((u32)(tx - dw - UIS_H(10)), (u32)(row_y + UIS_H(7)),
+                 d_str, date_px, XMB_TEXT_FAINT, UI_FACE_TAB_REG);
+}
+
+
+// Section eyebrow — the small uppercase label above a row.
+//
+// v1.0 gives these their own token, `--font-eyebrow`: Microgramma at 11px,
+// weight 400, UPPERCASE, 0.18em tracking.  In the canvas they are "Continue
+// watching", "Recently added · Movies", "Search library", "Results", "Up next";
+// this client has a few more of its own ("Cast & Crew", "More Like This") and
+// they get the same treatment, because the design's rule is about what the
+// label IS, not which screen it happens to be on.
+//
+// Microgramma carried the DISPLAY role before v1.0 and was already embedded, so
+// the new role costs nothing.  Uppercasing is ASCII-only (ui_upper_ascii) — the
+// text can be a server row title.
+//
+// Returns the advance, so a caller can put a count or a chevron after it.
+int xmb_draw_eyebrow(int x, int y, const char *text, u32 color)
+{
+    char up[96];
+    snprintf(up, sizeof up, "%s", text);
+    ui_upper_ascii(up);
+    const float px    = UIS_TF(11.0f);
+    const float track = px * 0.18f;
+    drawTTF_tracked((u32)x, (u32)y, up, px, color, UI_FACE_EYEBROW, track);
+    return ttf_text_width_tracked(up, px, UI_FACE_EYEBROW, track);
+}
+
+int xmb_eyebrow_width(const char *text)
+{
+    char up[96];
+    snprintf(up, sizeof up, "%s", text);
+    ui_upper_ascii(up);
+    const float px = UIS_TF(11.0f);
+    return ttf_text_width_tracked(up, px, UI_FACE_EYEBROW, px * 0.18f);
+}
+// One 1px rule of the divider stack: x 40 -> 1240, flat across the middle and
+// fading to nothing over the outer 12% at each end.
+//
+// The canvas spells it as a gradient stop list --
+//   linear-gradient(90deg, transparent, hair 12%, hair 88%, transparent)
+// -- which is a flat line with two ramps, NOT the triangular falloff this used
+// to draw.  The old version was also full-bleed and a hardcoded 8A93C8, which
+// is within a shade of `hairline` composited over the shipping background but
+// would have stayed blue on a gold screen.
+static void divider_rule(int y, u32 color, u32 alpha) {
+    if (y < 0 || (u32)y >= display_height || !alpha) return;
+    const int x0 = (int)XMB_ITEM_PAD;
+    const int x1 = (int)display_width - (int)XMB_ITEM_PAD;
+    const int w  = x1 - x0;
+    if (w <= 0) return;
+    const int fade = w * 12 / 100;               // the outer 12%, each end
+
+    u32 *row = color_buffer[curr_fb] + (u32)y * display_width;
+    const u32 c_r = (color >> 16) & 0xFF, c_g = (color >> 8) & 0xFF, c_b = color & 0xFF;
+    for (int x = x0; x < x1; x++) {
+        int d = x - x0 < x1 - 1 - x ? x - x0 : x1 - 1 - x;
+        u32 a = (fade > 0 && d < fade) ? alpha * (u32)d / (u32)fade : alpha;
+        if (!a) continue;
+        u32 bg = row[x];
+        row[x] = (((a*c_r + (255-a)*((bg>>16)&0xFF))/255) << 16) |
+                 (((a*c_g + (255-a)*((bg>> 8)&0xFF))/255) <<  8) |
+                  ((a*c_b + (255-a)*( bg     &0xFF))/255);
+    }
+}
+
+// The divider under the tab bar: the hairline, and the trim rule 4px below it
+// that the canvas draws with `--jf-trim2`.  That second line is transparent
+// under the shipping theme (trim_alpha 0) and brass under Golden Age, which is
+// the first time the `trim` token has been drawn by anything.
+void xmb_draw_divider(void) {
+    divider_rule(XMB_DIVIDER_Y, XMB_HAIRLINE, 255);
+    if (g_theme.trim_alpha)
+        divider_rule(XMB_DIVIDER_Y + UIS_H(4), XMB_TRIM, g_theme.trim_alpha);
+}
+
+// The A-Z rail, left of a library grid, as an XMB list.
+//
+// WHY NOT THE DESIGN'S STATIC RAIL.  README 3.3 draws all 27 entries at once.
+// Under the spine that is physically capped: 27 rows have to fit between the
+// grid's top and the hints bar, which at 1080p is ~22 px a row, so the letters
+// can never be much above 19 px however the constants are tuned -- and the TV
+// report after that tuning was still "tiny".  So the rail becomes what the
+// rest of the UI now is: a window of JB_WIN letters centred on the current one,
+// on a pitch roomy enough for 25 px type, fading toward its ends and gliding
+// (the spine's approach) as the current letter changes.  At the ends the
+// window stops rather than showing empty rows.  This IS a departure from the
+// canvas and is recorded in docs/history/xmb-spine-plan.md.
+//
+// The current letter is the jump cursor while the rail is focused, otherwise
+// the focused item's section.  Size is constant (cached runs stay cached);
+// only colour steps, in sixteenths, so a settled rail uploads nothing.
+#define JB_WIN       15      // letters visible
+#define JB_PITCH     24      // authored px per letter
+#define JB_FONT      17.0f   // authored px
+
+static spine_approach s_jb;
+static unsigned       s_jb_frame = 0;
+
+static u32 jb_mix(u32 a, u32 b, float t) {
+    int k = (int)(t * 16.0f + 0.5f);
+    if (k < 0) k = 0;
+    if (k > 16) k = 16;
+    u32 out = 0;
+    for (int sh = 0; sh <= 16; sh += 8) {
+        int ca = (int)((a >> sh) & 0xFF), cb = (int)((b >> sh) & 0xFF);
+        out |= (u32)(ca + (cb - ca) * k / 16) << sh;
+    }
+    return out;
+}
+
+static void xmb_draw_jumpbar_window(int tab, int jbar_x, int bar_top, int avail,
+                                    const char * const *labels) {
+    // The letter the window centres on.
+    int cur = 0;
+    if (g_jumpbar_active) {
+        cur = g_jumpbar_sel;
+    } else if (g_sel >= 0 && g_sel < g_item_count[tab]) {
+        char c = g_items[tab][g_sel].name[0];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        cur = (c >= 'A' && c <= 'Z') ? 1 + (c - 'A') : 0;
+    }
+    const int half = JB_WIN / 2;
+    float centre = (float)cur;
+    if (centre < (float)half) centre = (float)half;
+    if (centre > (float)(JBAR_ENTRIES - 1 - half)) centre = (float)(JBAR_ENTRIES - 1 - half);
+
+    // Glide once per frame; snap on the first frame after the rail was absent.
+    const unsigned id = spine_frame_id();
+    if (id != s_jb_frame) {
+        if (s_jb_frame + 1 < id) spine_approach_init(&s_jb, centre, SPINE_CATEGORY_MS);
+        spine_approach_set(&s_jb, centre);
+        spine_approach_step(&s_jb, spine_frame_dt_us());
+        s_jb_frame = id;
+    }
+    const float c = s_jb.value;
+
+    float pitch = (float)UIS_H(JB_PITCH);
+    if (pitch * JB_WIN > (float)avail) pitch = (float)avail / JB_WIN;
+    float font_px = UIS_TF(JB_FONT);
+    if (font_px > pitch * 0.85f) font_px = pitch * 0.85f;
+    float wide = (float)ttf_text_width("W", font_px, true);
+    if (wide > (float)JBAR_W) font_px *= (float)JBAR_W / wide;
+
+    const u32 bg = XMB_BG;
+    for (int i = 0; i < JBAR_ENTRIES; i++) {
+        const float d = (float)i - c;                 // rows from the centre
+        if (d < -(float)half - 0.5f || d > (float)half + 0.5f) continue;
+        const int ty = bar_top + (int)(((float)half + d) * pitch
+                                       + (pitch - font_px) * 0.5f);
+        if (ty < 0 || (u32)ty >= display_height) continue;
+
+        const bool sel  = g_jumpbar_active && i == g_jumpbar_sel;
+        const bool here = !g_jumpbar_active && i == cur;
+        const u32  base = sel ? XMB_ACCENT_ALT : here ? XMB_TEXT : XMB_TEXT_DIM;
+        float a = d < 0.0f ? -d : d;
+        a = a / ((float)half + 0.5f);                 // 0 centre .. 1 at the edge
+        const u32 colour = jb_mix(base, bg, a * a * 0.85f);
+
+        const int lw = ttf_text_width(labels[i], font_px, sel || here);
+        drawTTF((u32)(jbar_x + (JBAR_W - lw) / 2), (u32)ty, labels[i],
+                font_px, colour, sel || here);
+    }
+}
+
+void xmb_draw_jumpbar(int tab) {
+    GridGeom gg;
+    xmb_grid_geom(tab, &gg);
+    const int bar_top = xmb_classic_library(tab) ? xmb_classic_library_y0(tab) : XMB_GRID_Y0
+                      + (xmb_kind(tab) == TABKIND_MUSIC ? XMB_MUSIC_SUBTAB_H : 0);
+    int jbar_x = gg.x0 - JBAR_GAP * 3 - JBAR_W;
+    if (jbar_x < 0) jbar_x = 0;
+
+    // From the REST top: the rail's pitch is a size, and must not change while
+    // the content glides in (it would re-rasterise every letter per frame).
+    const int avail = (int)display_height - XMB_BOTTOM_PAD
+                    - (bar_top - spine_content_dy());
+
+    static const char * const jbar_labels[JBAR_ENTRIES] = {
+        "#","A","B","C","D","E","F","G","H","I","J","K","L","M",
+        "N","O","P","Q","R","S","T","U","V","W","X","Y","Z"
+    };
+
+    xmb_draw_jumpbar_window(tab, jbar_x, bar_top, avail, jbar_labels);
+}
+
+// Music sub-tab header — "Albums  Artists  Playlists  Genres  Songs" over
+// the grid.  The active sub-tab carries the accent underline; while the
+// d-pad focuses the header its label pops white so it's obvious LEFT/RIGHT
+// will switch it.
+void xmb_draw_music_subtabs(int x, int y, int active, bool focused) {
+    static const char *labels[MUSIC_ST_COUNT] =
+        { TRN("Albums"), TRN("Artists"), TRN("Playlists"), TRN("Genres"), TRN("Songs") };
+    const float px = UIS_TF(16.0f);
+    for (int i = 0; i < MUSIC_ST_COUNT; i++) {
+        bool is_active = (i == active);
+        u32 color = is_active ? (focused ? XMB_WHITE : XMB_TEXT)
+                              : XMB_TEXT_FAINT;
+        drawTTF((u32)x, (u32)y, tr(labels[i]), px, color, is_active);
+        int w = ttf_text_width(tr(labels[i]), px, is_active);
+        if (is_active)
+            drawRect((u32)x, (u32)(y + UIS_H(24)), (u32)w, UIS_H(3),
+                     focused ? XMB_KEY_SEL : XMB_ACCENT);
+        x += w + 34;
+    }
+}
+
+// -------------------------------------------------------
+// PS button sprites (Kenney "PlayStation Series" sheet)
+// -------------------------------------------------------
+// The sheet is a 12x12 grid of 128px tiles embedded as a PNG in
+// ps_buttons_png.h.  On first use it's decoded with stb_image, the tiles
+// we need are trimmed to their alpha bounding box and kept as small ARGB
+// masters, and the 9MB decode buffer is freed.  Drawing scales a master
+// to the requested height with an area-average filter — cheap at hint
+// sizes and clean at any scale, so no per-size caching is needed.
+
+#define PS_SHEET_DIM  1536
+#define PS_TILE       128
+
+// Hint glyph -> sheet tile.  All plain white solid variants — no coloured
+// face buttons, no red d-pad highlights.
+static const struct { char glyph; int row, col; } PS_TILES[] = {
+    { 'X', 10, 5 },   // Cross (white solid)
+    { 'C', 11, 7 },   // Circle (white solid)
+    { 'S', 10, 11 },  // Square (white solid)
+    { 'T',  9, 1 },   // Triangle (white solid)
+    { 'A',  5, 8 },   // START
+    { 'B',  5, 6 },   // SELECT
+    { 'D',  9, 3 },   // D-pad, plain white (Switch)
+    { 'E',  9, 3 },   // D-pad, plain white (Jump)
+    { 'L',  6, 7 },   // L2
+    { 'R',  5, 3 },   // R2
+    { 'l',  6, 3 },   // L1, the same solid style as L2
+    { 'r',  6, 11 },  // R1
+};
+#define PS_NTILES ((int)(sizeof PS_TILES / sizeof PS_TILES[0]))
+
+static u32 *s_ps_px[PS_NTILES];             // trimmed ARGB masters
+static int  s_ps_w[PS_NTILES], s_ps_h[PS_NTILES];
+static int  s_ps_state = 0;                 // 0=not loaded, 1=ok, -1=failed
+
+static int ps_tile_idx(char glyph) {
+    for (int i = 0; i < PS_NTILES; i++)
+        if (PS_TILES[i].glyph == glyph) return i;
+    return -1;
+}
+
+static void ps_sprites_load(void) {
+    if (s_ps_state) return;
+    s_ps_state = -1;
+    int w, h, comp;
+    unsigned char *img = stbi_load_from_memory(
+        ps_buttons_png, (int)ps_buttons_png_len, &w, &h, &comp, 4);
+    if (!img) return;
+    if (w != PS_SHEET_DIM || h != PS_SHEET_DIM) { stbi_image_free(img); return; }
+
+    for (int i = 0; i < PS_NTILES; i++) {
+        int tx = PS_TILES[i].col * PS_TILE, ty = PS_TILES[i].row * PS_TILE;
+        // Alpha bounding box inside the tile.
+        int x0 = PS_TILE, y0 = PS_TILE, x1 = -1, y1 = -1;
+        for (int y = 0; y < PS_TILE; y++) {
+            const unsigned char *p = img + (((ty + y) * w + tx) * 4);
+            for (int x = 0; x < PS_TILE; x++) {
+                if (p[x * 4 + 3]) {
+                    if (x < x0) x0 = x;
+                    if (x > x1) x1 = x;
+                    if (y < y0) y0 = y;
+                    if (y > y1) y1 = y;
+                }
+            }
+        }
+        if (x1 < 0) continue;               // empty tile — leave master NULL
+        int mw = x1 - x0 + 1, mh = y1 - y0 + 1;
+        u32 *m = (u32 *)malloc((size_t)mw * mh * 4);
+        if (!m) continue;
+        for (int y = 0; y < mh; y++) {
+            const unsigned char *p = img + (((ty + y0 + y) * w + tx + x0) * 4);
+            for (int x = 0; x < mw; x++)
+                m[y * mw + x] = ((u32)p[x*4+3] << 24) | ((u32)p[x*4] << 16) |
+                                ((u32)p[x*4+1] << 8) | p[x*4+2];
+        }
+        s_ps_px[i] = m; s_ps_w[i] = mw; s_ps_h[i] = mh;
+    }
+    stbi_image_free(img);
+    s_ps_state = 1;
+}
+
+void ps_sprites_preload(void) {
+    ps_sprites_load();
+    plog(s_ps_state == 1 ? "ps_sprites: sheet ok" : "ps_sprites: sheet FAILED");
+}
+
+int ps_btn_width(char glyph, int h) {
+    ps_sprites_load();
+    int i = ps_tile_idx(glyph);
+    if (s_ps_state != 1 || i < 0 || !s_ps_px[i] || h <= 0) return h;
+    return s_ps_w[i] * h / s_ps_h[i];
+}
+
+// Blit an ARGB master into the current CPU draw target, scaled to dw x dh with
+// an area-average filter.  bright scales RGB (255 = as-authored) so the HUD can
+// dim unfocused controls the way ctrl_color() dims its vector glyphs.
+//
+// Shared by the button sprites and the brand mark: both are small ARGB images
+// that are authored once at a master size and drawn at whatever the current UI
+// scale asks for, and neither wants a per-size cache for it.
+static void blit_argb_scaled(const u32 *m, int mw, int mh,
+                             int dx0, int dy0, int dw, int dh, u32 bright) {
+    if (!m || mw <= 0 || mh <= 0 || dw <= 0 || dh <= 0) return;
+    bool rt  = cpu_rt_on();
+    u32  tw_ = cpu_draw_w();
+    for (int oy = 0; oy < dh; oy++) {
+        int sy = dy0 + oy;
+        if (cpu_row_clipped(sy)) continue;
+        u32 *row = cpu_draw_row((u32)sy);
+        int my0 = oy * mh / dh, my1 = (oy + 1) * mh / dh;
+        if (my1 <= my0) my1 = my0 + 1;
+        for (int ox = 0; ox < dw; ox++) {
+            int sx = dx0 + ox;
+            if (sx < 0 || (u32)sx >= tw_) continue;
+            int mx0 = ox * mw / dw, mx1 = (ox + 1) * mw / dw;
+            if (mx1 <= mx0) mx1 = mx0 + 1;
+            // Area-average the source box (alpha-weighted colour).
+            u32 ar = 0, ag = 0, ab = 0, aa = 0, np = 0;
+            for (int my = my0; my < my1; my++) {
+                const u32 *src = m + my * mw;
+                for (int mx = mx0; mx < mx1; mx++) {
+                    u32 s = src[mx], a = s >> 24;
+                    ar += ((s >> 16) & 0xFF) * a;
+                    ag += ((s >>  8) & 0xFF) * a;
+                    ab += ( s        & 0xFF) * a;
+                    aa += a; np++;
+                }
+            }
+            if (!aa) continue;
+            u32 a = aa / np;
+            u32 r = (ar / aa) * bright / 255;
+            u32 g = (ag / aa) * bright / 255;
+            u32 b = (ab / aa) * bright / 255;
+            u32 c = (r << 16) | (g << 8) | b;
+            if (rt) { row[sx] = argb_over(row[sx], c, a); continue; }
+            if (a == 255) { row[sx] = c; continue; }
+            u32 bg = row[sx];
+            u32 ro = (a * r + (255 - a) * ((bg >> 16) & 0xFF)) / 255;
+            u32 go = (a * g + (255 - a) * ((bg >>  8) & 0xFF)) / 255;
+            u32 bo = (a * b + (255 - a) * ( bg        & 0xFF)) / 255;
+            row[sx] = (ro << 16) | (go << 8) | bo;
+        }
+    }
+}
+
+void draw_ps_button_vcentered(u32 x, int cy, char glyph, int h, u32 bright) {
+    ps_sprites_load();
+    int i = ps_tile_idx(glyph);
+    if (s_ps_state != 1 || i < 0 || !s_ps_px[i] || h <= 0) return;
+    int mw = s_ps_w[i], mh = s_ps_h[i];
+    int dw = mw * h / mh;
+    blit_argb_scaled(s_ps_px[i], mw, mh, (int)x, cy - h / 2, dw, h, bright);
+}
+
+// -------------------------------------------------------
+// Brand mark — the lockup's jellyfish, from gfx/jfmark_png.h
+// -------------------------------------------------------
+// The design's mark is an SVG with a bevel, an edge stroke and a clipped
+// image, so it arrives here already rasterised (see that header for why, and
+// for the geometry constants used below).  Two variants exist because the
+// gradient is baked in; the loaded theme picks between them.
+//
+// Each decodes on first use and stays: 80x80x4 is 25 KB, and a theme that is
+// never selected never costs its variant.
+
+#define JFMARK_COOL 0
+#define JFMARK_GOLD 1
+#define JFMARK_TINT 2                 // the cool raster recoloured to the theme
+
+static u32 *s_mark_px[3];
+static int  s_mark_state[3];          // 0 = untried, 1 = ok, -1 = failed
+static u32  s_tint_a, s_tint_b;       // the pair the TINT raster was made for
+
+// Recolour the cool raster's RGBA in place to the pair (a, b).  Each coloured
+// pixel is placed along the raster's own purple -> blue gradient and moved to
+// the same place along a -> b at the same brightness; the PlayStation symbol,
+// the white edge and the shadow (no colour of their own) are left as they are.
+void xmb_mark_tint(unsigned char *rgba, int n, u32 a, u32 b) {
+    const float P[3] = { 170, 92, 195 }, B[3] = { 0, 164, 220 };
+    const float A2[3] = { (float)((a >> 16) & 0xFF), (float)((a >> 8) & 0xFF), (float)(a & 0xFF) };
+    const float B2[3] = { (float)((b >> 16) & 0xFF), (float)((b >> 8) & 0xFF), (float)(b & 0xFF) };
+    const float d[3] = { B[0] - P[0], B[1] - P[1], B[2] - P[2] };
+    const float dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    for (int i = 0; i < n; i++) {
+        unsigned char *px = rgba + (size_t)i * 4;
+        const int mx = px[0] > px[1] ? (px[0] > px[2] ? px[0] : px[2]) : (px[1] > px[2] ? px[1] : px[2]);
+        const int mn = px[0] < px[1] ? (px[0] < px[2] ? px[0] : px[2]) : (px[1] < px[2] ? px[1] : px[2]);
+        if (mx - mn < 36) continue;                       // grey, white, black: not the gradient
+        float t = ((px[0] - P[0]) * d[0] + (px[1] - P[1]) * d[1] + (px[2] - P[2]) * d[2]) / dd;
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        const float lum_src = 0.299f * px[0] + 0.587f * px[1] + 0.114f * px[2];
+        const float base[3] = { P[0] + d[0] * t, P[1] + d[1] * t, P[2] + d[2] * t };
+        const float lum_base = 0.299f * base[0] + 0.587f * base[1] + 0.114f * base[2];
+        float c[3], lum_c;
+        for (int k = 0; k < 3; k++) c[k] = A2[k] + (B2[k] - A2[k]) * t;
+        lum_c = 0.299f * c[0] + 0.587f * c[1] + 0.114f * c[2];
+        // Keep the source's shading relative to its gradient colour.
+        const float k = lum_base > 1.0f ? lum_src / lum_base : 1.0f;
+        const float scale = lum_c > 1.0f ? k : 1.0f;
+        for (int j = 0; j < 3; j++) {
+            float v = c[j] * scale;
+            px[j] = (unsigned char)(v < 0.0f ? 0 : (v > 255.0f ? 255 : (int)(v + 0.5f)));
+        }
+    }
+}
+
+static void mark_load(int v) {
+    if (v == JFMARK_TINT && s_mark_state[v] &&
+        (s_tint_a != XMB_LK_MARK_A || s_tint_b != XMB_LK_MARK_B)) {
+        free(s_mark_px[v]); s_mark_px[v] = NULL; s_mark_state[v] = 0;   // the theme changed
+    }
+    if (s_mark_state[v]) return;
+    s_mark_state[v] = -1;
+    int w, h, comp;
+    unsigned char *img = stbi_load_from_memory(
+        v == JFMARK_GOLD ? jfmark_gold_png : jfmark_cool_png,
+        (int)(v == JFMARK_GOLD ? jfmark_gold_png_len : jfmark_cool_png_len),
+        &w, &h, &comp, 4);
+    if (!img) return;
+    if (w != JFMARK_MASTER || h != JFMARK_MASTER) { stbi_image_free(img); return; }
+    if (v == JFMARK_TINT) {
+        s_tint_a = XMB_LK_MARK_A;
+        s_tint_b = XMB_LK_MARK_B;
+        xmb_mark_tint(img, w * h, s_tint_a, s_tint_b);
+    }
+    u32 *m = (u32 *)malloc((size_t)w * h * 4);
+    if (!m) { stbi_image_free(img); return; }
+    for (int i = 0; i < w * h; i++)
+        m[i] = ((u32)img[i*4+3] << 24) | ((u32)img[i*4] << 16) |
+               ((u32)img[i*4+1] << 8) | img[i*4+2];
+    stbi_image_free(img);
+    s_mark_px[v] = m;
+    s_mark_state[v] = 1;
+}
+
+// Which raster this theme gets: the two drawn ones for the pairs they were
+// drawn in (XMB wave, Golden Age), the cool one recoloured for any other.
+static int mark_variant(void) {
+    const u32 a = XMB_LK_MARK_A & 0xFFFFFF, b = XMB_LK_MARK_B & 0xFFFFFF;
+    if (a == 0xAA5CC3 && b == 0x00A4DC) return JFMARK_COOL;
+    if (a == 0xE8B45C) return JFMARK_GOLD;
+    return JFMARK_TINT;
+}
+
+int xmb_mark_variant(void) { return mark_variant(); }
+
+// Draw the mark with its BELL that many pixels wide, its top-left at (x,y).
+// The raster is wider than the bell -- it carries the design's drop shadow in
+// a padded box -- so both the size and the origin are adjusted here rather
+// than at the call site.
+void xmb_draw_mark_a(int x, int y, int bell_px, u8 alpha) {
+    if (bell_px <= 0 || !alpha) return;
+    int v = mark_variant();
+    mark_load(v);
+    if (s_mark_state[v] != 1) return;
+    int box = bell_px * JFMARK_SPAN_U / JFMARK_BELL_U;
+    int off = bell_px * JFMARK_PAD_U  / JFMARK_BELL_U;
+    blit_argb_scaled(s_mark_px[v], JFMARK_MASTER, JFMARK_MASTER,
+                     x - off, y - off, box, box, alpha);
+}
+
+void xmb_draw_mark(int x, int y, int bell_px) {
+    if (bell_px <= 0) return;
+    int v = mark_variant();
+    mark_load(v);
+    if (s_mark_state[v] != 1) return;
+    int box = bell_px * JFMARK_SPAN_U / JFMARK_BELL_U;
+    int off = bell_px * JFMARK_PAD_U  / JFMARK_BELL_U;
+    blit_argb_scaled(s_mark_px[v], JFMARK_MASTER, JFMARK_MASTER,
+                     x - off, y - off, box, box, 255);
+}
+
+// -------------------------------------------------------
+// Controller-hints bar — sprite buttons + labels, bottom-right
+// -------------------------------------------------------
+
+void draw_hints_bar(const Hint *hints, int n) {
+    if (n <= 0) return;
+    ps_sprites_load();
+    if (s_ps_state != 1) return;
+
+    const int   icon_h  = UIS_H(24);
+    const float text_px = UIS_TF(12.5f);      // section 3.1: 12.5px label
+    const bool  heavy   = (int)display_height < 720;   // a CRT loses thin strokes
+    const int   gap_it  = UIS_H(8);           // icon to its label
+    const int   gap_sep = UIS_H(22);          // section 3.1: items gap 22
+
+    // An EMPTY label pairs a hint with the one after it, so "L1/R1 Tab" is a
+    // single cluster ({'l',""},{'r',"Tab"}) rather than two hints with a full
+    // separator between them.
+    const int gap_pair = UIS_H(4);
+
+    int total_w = 0;
+    for (int i = 0; i < n; i++) {
+        total_w += ps_btn_width(hints[i].glyph, icon_h);
+        if (hints[i].label && hints[i].label[0]) {
+            total_w += gap_it + ttf_text_width(tr(hints[i].label), text_px, heavy);
+            if (i < n - 1) total_w += gap_sep;
+        } else {
+            total_w += gap_pair;
+        }
+    }
+
+    int x = (int)display_width - XMB_ITEM_PAD - total_w;
+    if (x < (int)XMB_ITEM_PAD) x = (int)XMB_ITEM_PAD;
+
+    // Section 3.1 puts the hint baseline at y=698 of the 720-tall canvas.  The
+    // overscan inset stays folded in on top of that, so a calibrated CRT still
+    // lifts the whole bar clear of the bezel.
+    int cy = (int)display_height - XMB_OY - UIS_H(22);
+    if (cy < 0 || (u32)cy >= display_height) return;
+
+    for (int i = 0; i < n; i++) {
+        draw_ps_button_vcentered((u32)x, cy, hints[i].glyph, icon_h, 255);
+        x += ps_btn_width(hints[i].glyph, icon_h);
+        if (hints[i].label && hints[i].label[0]) {
+            x += gap_it;
+            drawTTF((u32)x, (u32)(cy - (int)(text_px * 0.55f)), tr(hints[i].label),
+                    text_px, heavy ? XMB_TEXT : XMB_TEXT_DIM, heavy);
+            x += ttf_text_width(tr(hints[i].label), text_px, heavy);
+            if (i < n - 1) x += gap_sep;
+        } else {
+            x += gap_pair;
+        }
+    }
+}
+
+// -------------------------------------------------------
+// Empty state — tab icon, dimmed, centered above one line of text
+// -------------------------------------------------------
+
+void xmb_draw_empty_state(int tab, const char *msg) {
+    int cx = (int)display_width / 2;
+    int cy = (XMB_CONTENT_Y + (int)display_height - XMB_BOTTOM_PAD) / 2 - UIS_H(30);
+    const float icon_px = UIS_TF(48.0f);
+    drawIcon((u32)(cx - (int)icon_px / 2), (u32)(cy - (int)icon_px),
+             tab_icon(tab), icon_px, XMB_HAIRLINE);
+    int tw = ttf_text_width(msg, UIS_TF(17));
+    drawTTF((u32)(cx - tw / 2), (u32)(cy + UIS_H(8)), msg, UIS_TF(17), XMB_TEXT_FAINT);
+}
+
+// -------------------------------------------------------
+// Breadcrumb — dim parents, chevron separators, bright leaf
+// -------------------------------------------------------
+
+void xmb_draw_breadcrumb(int x, int y, const char *a, const char *b,
+                         const char *leaf) {
+    const float px = UIS_TF(15.0f);
+    const char *parts[3] = { a, b, leaf };
+    for (int i = 0; i < 3; i++) {
+        if (!parts[i]) continue;
+        bool is_leaf = (i == 2) || (i == 1 && !parts[2]) || (i == 0 && !parts[1] && !parts[2]);
+        drawTTF((u32)x, (u32)y, parts[i], px,
+                is_leaf ? XMB_TEXT : XMB_TEXT_FAINT);
+        x += ttf_text_width(parts[i], px);
+        // Chevron between segments.
+        bool more = (i < 2) && parts[i + 1];
+        if (more) {
+            drawIcon((u32)(x + UIS_W(4)), (u32)(y - 1), ICON_CHEVRON_RIGHT, UIS_TF(16.0f),
+                     XMB_TEXT_FAINT);
+            x += UIS_W(24);
+        }
+    }
+}
