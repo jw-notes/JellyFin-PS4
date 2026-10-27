@@ -1,9 +1,10 @@
 #include "input_model.h"
+#include "mono_clock.h"
 #include "platform.h"
 #include "screensaver.h"
 #include <time.h>
 static UiInputFilter filter;
-static uint64_t now_ms(){timespec ts{};clock_gettime(CLOCK_MONOTONIC,&ts);return (uint64_t)ts.tv_sec*1000+ts.tv_nsec/1000000;}
+static uint64_t now_ms(){return mono_ms();}
 void ui_input_sync(){filter.sync(buttons(),now_ms());}
 uint32_t ui_input(){
  uint32_t raw=buttons();uint64_t now=now_ms();

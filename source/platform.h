@@ -22,10 +22,20 @@ void text(int x,int y,const std::string&,uint32_t color,int size=24,int maxwidth
 void wrapped(int x,int y,const std::string&,uint32_t color,int lines=5);
 bool keyboard(const std::string& title,std::string& value,bool password=false,KeyboardType type=KeyboardType::Text);
 int current_user();
+// "free memory 812 MB": logged during playback to catch leaks.
+std::string resource_report();
 bool player_open(const std::string& url);
 bool player_draw();
 bool player_active();
 bool player_has_audio();
+// The stream has opened (FFmpeg has its format); seconds read ahead of the decoder.
+bool player_loaded();
+// mono_ms() of the newest video frame (0 before the first).
+uint64_t player_last_frame_ms();
+double player_cache_seconds();
+// The picture: aspect 0 Fit, 1 Fill, 2 Stretch; width / height in percent of
+// the fitted picture; x / y shift in half-percents of the screen (+ right, up).
+void player_picture(int aspect,int w,int h,int x,int y);
 std::string player_error();
 void player_pause(bool);
 void player_seek(uint64_t ms);

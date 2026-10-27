@@ -14,9 +14,11 @@
 //   * Square opens the three-hour guide; X on a later programme shows its
 //     details. The touchpad searches channels by name.
 #include "livetv_view.h"
+#include "mono_clock.h"
 #include "platform.h"
 #include "ui_view.h"
 #include "art.h"
+#include "language.h"
 #include "input_model.h"
 #include "api_livetv.h"
 #include "livetv.h"
@@ -43,7 +45,7 @@ const CatDef CATS[]={{1,"All Channels"},{101,"NFL"},{151,"NBA"},{201,"NHL"},{251
 const int N_CATS=(int)(sizeof CATS/sizeof *CATS),SPORTS_BELOW=1000;
 const char* const GENRE_LABEL[LG_COUNT]={"News","Sports","Movies","Kids","Music","Crime & Mystery","Comedy","Horror & Sci-Fi","Reality","Food","Home & Lifestyle","Nature & Animals","History & Learning","Game Shows","Westerns","Cars & Motors","Faith","Latino","Shopping"};
 
-uint64_t now_ms(){timespec ts{};clock_gettime(CLOCK_MONOTONIC,&ts);return (uint64_t)ts.tv_sec*1000+ts.tv_nsec/1000000;}
+uint64_t now_ms(){return mono_ms();}
 uint64_t floor_half_hour(uint64_t t){return t-(t%T_30M);}
 
 // ---- state (screen thread) ----
@@ -192,8 +194,8 @@ void tick(){
 }
 void list_changed(){gen++;n=0;pn=0;loaded=failed=false;sel=top=0;pg_rows=0;last_refresh=0;}
 void set_page(int p){if(npages<=1)return;if(p<0)p=npages-1;if(p>=npages)p=0;if(p==page)return;page=p;prefs.last=pages[page].key;prefs_save();list_changed();}
-std::string cat_label(int cat){const CatDef& c=CATS[cat];return c.base>1&&c.base<SPORTS_BELOW?std::string("Sports | ")+c.label:c.label;}
-std::string key_label(int key,int cat){if(LP_IS_GENRE(key)&&LP_GENRE_OF(key)<LG_COUNT)return GENRE_LABEL[LP_GENRE_OF(key)];if(key==LP_FAVS)return "Favourites";if(key==LP_RECENT)return "Recently watched";return cat>=0?cat_label(cat):"Channels";}
+std::string cat_label(int cat){const CatDef& c=CATS[cat];return c.base>1&&c.base<SPORTS_BELOW?std::string(T("Sports"))+" | "+T(c.label):T(c.label);}
+std::string key_label(int key,int cat){if(LP_IS_GENRE(key)&&LP_GENRE_OF(key)<LG_COUNT)return T(GENRE_LABEL[LP_GENRE_OF(key)]);if(key==LP_FAVS)return T("Favourites");if(key==LP_RECENT)return T("Recently watched");return cat>=0?cat_label(cat):T("Channels");}
 void keep_visible(){
  if(!guide){const LiveGrid g=live_grid();int top_row=top/g.cols;const int sel_row=sel/g.cols;if(sel_row<top_row)top_row=sel_row;if(sel_row>=top_row+g.rows)top_row=sel_row-g.rows+1;const int last_row=n>0?(n-1)/g.cols:0;top_row=std::max(0,std::min(top_row,last_row-g.rows+1));top=top_row*g.cols;return;}
  const int vis=guide_rows_visible();if(sel<top)top=sel;if(sel>=top+vis)top=sel-vis+1;top=std::max(0,std::min(top,n-vis));
@@ -232,12 +234,12 @@ void draw_cat_tabs(int x,int y,int right){
 }
 void draw_screen(int header_focus){
  app_header("","Home",header_focus);const LiveGrid g=live_grid();const int x=guide?GUIDE_X0:g.x0;
- face_text(x,86,"Live TV",g_theme.text,24,TextFace::Classic);
- if(search_on)clip(x,122,"Search: "+term+"  ("+std::to_string(n)+" found)",15,g_theme.accent_alt,WIDTH-2*x);
+ face_text(x,86,T("Live TV"),g_theme.text,24,TextFace::Classic);
+ if(search_on)clip(x,122,TF("Search: %s  (%d found)",term.c_str(),n),15,g_theme.accent_alt,WIDTH-2*x);
  else if(paging()&&!guide)draw_cat_tabs(x,122,WIDTH-x);
  if(!guide&&n>0){int last=std::min(top+g.cols*g.rows,n);std::string pos=std::to_string(top+1)+" - "+std::to_string(last)+" / "+std::to_string(n);face_text(WIDTH-g.x0-face_text_width(pos,14,TextFace::Classic),95,pos,g_theme.text_dim,14,TextFace::Classic);}
  const uint64_t now=jf_now_ticks();
- if(n<=0){std::string m=failed?"Couldn't load the channel list":!loaded?"Loading channels...":search_on?"No channels found":cur_key()==LP_FAVS?"No favourites yet. Press Triangle on a channel.":cur_key()==LP_RECENT?"Nothing watched yet":"No channels";face_text((WIDTH-face_text_width(m,18,TextFace::Classic))/2,BAND_TOP+60,m,g_theme.text_dim,18,TextFace::Classic);}
+ if(n<=0){std::string m=T(failed?"Couldn't load the channel list":!loaded?"Loading channels...":search_on?"No channels found":cur_key()==LP_FAVS?"No favourites yet. Press Triangle on a channel.":cur_key()==LP_RECENT?"Nothing watched yet":"No channels");face_text((WIDTH-face_text_width(m,18,TextFace::Classic))/2,BAND_TOP+60,m,g_theme.text_dim,18,TextFace::Classic);}
  else if(!guide){
   for(int rel=0;rel<g.cols*g.rows&&top+rel<n;++rel){
    const int i=top+rel;const JFChannel& c=ch[i];const int cx=card_x(g,rel),cy=card_y(g,rel);const bool on=header_focus<0&&i==sel;
@@ -267,7 +269,7 @@ void draw_screen(int header_focus){
    for(int p=0;p<k;++p){if(ps[p]->end_ticks<=win0||ps[p]->start_ticks>=win0+T_3H)continue;const int x0=x_of_time(ps[p]->start_ticks),x1=x_of_time(ps[p]->end_ticks);if(x1-x0<8)continue;const bool f=foc==ps[p];
     rect(x0+1,y,x1-x0-2,GUIDE_ROW_H,f?g_theme.panel_hi:g_theme.panel);if(f)border(x0+1,y,x1-x0-2,GUIDE_ROW_H,g_theme.focus_ring,2);
     if(x1-x0>=40)clip(x0+10,y+(GUIDE_ROW_H-14)/2-1,ps[p]->name,14,f?g_theme.white:g_theme.text,x1-x0-20);}
-   if(!k)face_text(guide_cells_x()+10,y+(GUIDE_ROW_H-14)/2-1,"No guide information",g_theme.text_faint,14,TextFace::Classic);
+   if(!k)face_text(guide_cells_x()+10,y+(GUIDE_ROW_H-14)/2-1,T("No guide information"),g_theme.text_faint,14,TextFace::Classic);
   }
  }
  if(header_focus>=0)hint_bar({{'D',"Nav"},{'X',"Select"},{'C',"Back"}});
@@ -284,7 +286,7 @@ void show_details(const JFChannel& c,const JFProgram& p){
   const int cx=px+30,mw=pw-60;int y=py+26;clip(cx,y,p.name,24,g_theme.white,mw);y+=40;
   char a[16],b[16];fmt_hm(p.start_ticks,a,sizeof a);fmt_hm(p.end_ticks,b,sizeof b);clip(cx,y,std::string(a)+" - "+b+"  \xC2\xB7  "+c.name,15,g_theme.accent_alt,mw);y+=28;
   if(p.episode_title[0]){clip(cx,y,p.episode_title,15,g_theme.text,mw);y+=28;}
-  if(overview[0])paragraph(cx,y,overview,mw,6,g_theme.text_dim,15,22);else face_text(cx,y,"No description.",g_theme.text_faint,15,TextFace::Classic);
+  if(overview[0])paragraph(cx,y,overview,mw,6,g_theme.text_dim,15,22);else face_text(cx,y,T("No description."),g_theme.text_faint,15,TextFace::Classic);
   hint_bar({{'X',"OK"}});present();auto bt=ui_input();if(bt&(ORBIS_PAD_BUTTON_CROSS|ORBIS_PAD_BUTTON_CIRCLE))return;
  }
 }
@@ -296,7 +298,7 @@ void play_channel(int idx,const std::function<void(const Item&)>& play){
 }   // namespace
 
 int livetv_screen(const std::function<void(const Item&)>& play){
- if(!ensure_worker()){last_error="Live TV is unavailable";return -2;}
+ if(!ensure_worker()){last_error=T("Live TV is unavailable");return -2;}
  utc_offset=jf_utc_offset_secs();guide=false;top=0;if(search_on){search_on=false;term.clear();list_changed();}
  if(!index_ok)index_tried=false;last_refresh=0;view_changed=now_ms();if(sel>=n)sel=0;keep_visible();
  UiInputScope scope;int header=-1;
@@ -309,7 +311,7 @@ int livetv_screen(const std::function<void(const Item&)>& play){
   }
   if(b&ORBIS_PAD_BUTTON_L1)return 0;if(b&ORBIS_PAD_BUTTON_R1)return 1;if(b&ORBIS_PAD_BUTTON_OPTIONS)return 2;
   if(!guide){
-   if(b&ORBIS_PAD_BUTTON_TOUCH_PAD){std::string query=term;if(keyboard("Search channels",query)){while(!query.empty()&&query.back()==' ')query.pop_back();if(!query.empty()){term=query;search_on=true;list_changed();}}ui_input_sync();continue;}
+   if(b&ORBIS_PAD_BUTTON_TOUCH_PAD){std::string query=term;if(keyboard(T("Search channels"),query)){while(!query.empty()&&query.back()==' ')query.pop_back();if(!query.empty()){term=query;search_on=true;list_changed();}}ui_input_sync();continue;}
    if(b&ORBIS_PAD_BUTTON_CIRCLE){if(search_on){search_on=false;term.clear();list_changed();continue;}return -1;}
    if(paging()&&!search_on){if(b&ORBIS_PAD_BUTTON_L2){set_page(page-1);continue;}if(b&ORBIS_PAD_BUTTON_R2){set_page(page+1);continue;}}
    if(n<=0){if(b&ORBIS_PAD_BUTTON_UP)header=0;continue;}

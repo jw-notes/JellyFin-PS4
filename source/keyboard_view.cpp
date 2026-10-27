@@ -2,6 +2,7 @@
 #include "app.h"
 #include "platform.h"
 #include "art.h"
+#include "language.h"
 #include <algorithm>
 void draw_keyboard(const std::string& title,const KeyboardEditor& editor,bool password){
     clear(g_theme.bg);
@@ -17,8 +18,10 @@ void draw_keyboard(const std::string& title,const KeyboardEditor& editor,bool pa
             auto key=rows[r][c];int w=key.units*step-gap;bool selected=r==editor.row&&c==editor.column;
             uint32_t bg=selected?g_theme.accent:key.kind==KeyKind::Caps&&editor.caps?g_theme.accent_deep:g_theme.panel_hi;
             rect(x,y,w,key_height,bg);
-            int label_width=text_width(key.label,24);
-            text(x+std::max(6,(w-label_width)/2),y+10,key.label,selected?g_theme.bg:g_theme.text,24,w-12);
+            // Action keys (Caps, Delete, Space, Done...) are words to translate; characters are not.
+            const std::string label=key.kind==KeyKind::Character||key.kind==KeyKind::Scheme?key.label:std::string(T(key.label.c_str()));
+            int label_width=text_width(label,24);
+            text(x+std::max(6,(w-label_width)/2),y+10,label,selected?g_theme.bg:g_theme.text,24,w-12);
             x+=key.units*step;
         }
     }

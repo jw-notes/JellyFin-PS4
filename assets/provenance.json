@@ -1,6 +1,6 @@
 {
-  "icon_source": "vendor/ps3/ICON0.PNG",
-  "icon_source_sha256": "3c77940f5f62c00b19d94ab3c29ead13d7a59dce54b87dbd97b8eaf87893720b",
-  "icon_processing": "original pixels resized proportionally and centered on a 512x512 black canvas",
+  "icon_source": "vendor/ps3/source/gfx/jfmark_hd_png.h:jfmark_hd_cool_png",
+  "icon_source_sha256": "ba8f78ef2ade5b82b2f2ab2685f92960999e85aac7c6f1cc4f8adb296433a1f5",
+  "icon_processing": "256 px brand mark resized to 400 px (Lanczos), centred on a 512x512 #151A38 to #05060C vertical gradient",
   "brand_mark_source": "vendor/ps3/source/gfx/jfmark_png.h:jfmark_cool_png"
 }

@@ -8,6 +8,8 @@
 #include <orbis/Sysmodule.h>
 #include <orbis/SystemService.h>
 #include <stdio.h>
+#include <time.h>
+#include <string>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -17,6 +19,30 @@ static int video=-1,pad=-1,user=0,frame_index=0;static uint32_t* buffers[2];stat
 static OrbisKernelEqueue flip_queue;
 static bool queue_created=false,buffers_registered=false,memory_allocated=false;
 int current_user(){return user;}
+// Free memory, for the log during playback: a leak shows as a number that
+// falls. (The toolchain declares the call without its pointer, so it is bound
+// here under its own name.)
+extern "C" int32_t flexible_memory_free(size_t* size) __asm__("sceKernelAvailableFlexibleMemorySize");
+std::string resource_report(){
+ size_t free_bytes=0;return flexible_memory_free(&free_bytes)>=0?"free memory "+std::to_string(free_bytes>>20)+" MB":"free memory unknown";
+}
+// clock_gettime comes from the console's own libkernel, which numbers its
+// clocks the FreeBSD way, while the toolchain's <time.h> (and so FFmpeg and
+// the C library) use Linux's numbers: CLOCK_MONOTONIC (1) reached the kernel
+// as CLOCK_VIRTUAL, this process's CPU time, about a quarter of real time
+// here. Every caller is linked through this (--wrap=clock_gettime), which
+// translates the Linux ids before the call. See also mono_clock.h.
+extern "C" int __real_clock_gettime(int id,struct timespec* ts);
+extern "C" int __wrap_clock_gettime(int id,struct timespec* ts){
+ switch(id){
+ case 1:case 4:id=4;break;   // MONOTONIC, MONOTONIC_RAW -> CLOCK_MONOTONIC
+ case 2:id=15;break;         // PROCESS_CPUTIME_ID
+ case 3:id=14;break;         // THREAD_CPUTIME_ID
+ case 7:id=5;break;          // BOOTTIME -> CLOCK_UPTIME
+ default:break;              // REALTIME is 0 in both
+ }
+ return __real_clock_gettime(id,ts);
+}
 bool platform_init(){
  sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_SYSTEM_SERVICE);
  sceUserServiceInitialize(nullptr);if(sceUserServiceGetInitialUser(&user)<0)return false;
@@ -66,5 +92,14 @@ void platform_shutdown(){
  _Exit(status);
 }
 uint32_t buttons(){OrbisPadData p{};return scePadReadState(pad,&p)>=0&&p.connected?p.buttons:0;}
-uint32_t* framebuffer(){return buffers[frame_index];}
-void present(){int rc=sceVideoOutSubmitFlip(video,frame_index,1,0);if(rc>=0){while(sceVideoOutIsFlipPending(video)>0){OrbisKernelEvent ev;int n;sceKernelWaitEqueue(flip_queue,&ev,1,&n,nullptr);}}frame_index^=1;}
+// Everything is drawn into this ordinary (cached) memory and copied to the
+// display buffer once per frame. The display buffers are write-combined
+// graphics memory: fast to write, but every read -- and every blend, glow,
+// fade and shadow reads the pixel under it -- went uncached, which kept a
+// simple boot frame at 13-16 ms of the 16.7 available.
+static uint32_t* canvas=nullptr;
+uint32_t* framebuffer(){
+ if(!canvas){void* memory=nullptr;if(posix_memalign(&memory,64,(size_t)WIDTH*HEIGHT*4)==0){canvas=(uint32_t*)memory;memset(canvas,0,(size_t)WIDTH*HEIGHT*4);}else return buffers[frame_index];}
+ return canvas;
+}
+void present(){if(canvas)memcpy(buffers[frame_index],canvas,(size_t)WIDTH*HEIGHT*4);int rc=sceVideoOutSubmitFlip(video,frame_index,1,0);if(rc>=0){while(sceVideoOutIsFlipPending(video)>0){OrbisKernelEvent ev;int n;sceKernelWaitEqueue(flip_queue,&ev,1,&n,nullptr);}}frame_index^=1;}

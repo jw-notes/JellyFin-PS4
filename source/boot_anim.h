@@ -37,3 +37,6 @@ void boot_overlay();
 void boot_skip();
 // Null when the header draws normally.
 const BootHeaderPose* boot_header_pose();
+// The Jellyfin mark at any size and position, sampled bilinearly from its
+// mip levels: smooth while it moves or breathes. `box` is the square it fills.
+void draw_jf_mark(float cx,float cy,float box,float opacity);

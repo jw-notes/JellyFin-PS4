@@ -1,4 +1,5 @@
 #include "facts.h"
+#include "thread_priority.h"
 #include <map>
 #include <string.h>
 #include <set>
@@ -12,7 +13,7 @@ static std::deque<FactsJob> jobs;
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed=PTHREAD_COND_INITIALIZER;
 static pthread_t worker;static bool running=false,stopping=false;
-static void* fetch_facts(void*){
+static void* fetch_facts(void*){background_priority();
  for(;;){pthread_mutex_lock(&lock);while(jobs.empty()&&!stopping)pthread_cond_wait(&changed,&lock);if(stopping){pthread_mutex_unlock(&lock);return nullptr;}auto job=jobs.front();jobs.pop_front();pthread_mutex_unlock(&lock);
   std::vector<uint8_t> body(RESPONSE_SIZE);Item detail;std::string status;
   int count=http_fetch_binary(job.url.c_str(),job.token.c_str(),body.data(),(int)body.size());

@@ -1,8 +1,9 @@
 #include "keyboard_view.h"
+#include "mono_clock.h"
 #include "platform.h"
 #include <time.h>
 #include <unistd.h>
-static uint64_t keyboard_millis(){timespec ts{};clock_gettime(CLOCK_MONOTONIC,&ts);return (uint64_t)ts.tv_sec*1000+ts.tv_nsec/1000000;}
+static uint64_t keyboard_millis(){return mono_ms();}
 bool keyboard(const std::string& title,std::string& value,bool password,KeyboardType type){
     KeyboardEditor editor(value,type);
     uint32_t previous=buttons();uint64_t repeat_at=0;

@@ -1,6 +1,7 @@
 #pragma once
 #include "app.h"
 #include "art.h"
+#include "platform.h"
 #include <string>
 #include <vector>
 #include "../vendor/ps3/source/ui/render/classic_grid.h"
@@ -29,6 +30,11 @@ void home_image(const HomeRow& row,const Item& item,std::string& key,std::string
 void home_request_art(const HomeView& home);
 void home_step(HomeView& home,bool snap);
 void draw_home(const HomeView& home,int header_focus);
+// Just Home's header band (the boot handoff redraws it over a still of Home).
+void draw_home_header(int header_focus);
+// Fetch and size the on-screen cards' artwork, waiting up to timeout_ms.
+// Any thread: it only fills the artwork cache.
+void home_prepare_art(const HomeView& home,int timeout_ms);
 struct PeekOrigin { int x=0,y=0,w=0,h=0; };
 PeekOrigin home_focus_rect(const HomeView& home);
 PeekOrigin library_focus_rect(const ClassicGrid& g,int selected,int first,bool home);
@@ -43,15 +49,45 @@ void request_detail_art(const Item& item);
 void draw_detail(const Item& item,const DetailView& view);
 
 // Player on-screen display (PS3 player HUD v3).
-struct PlayerOsd { std::string title,subtitle,audio,subtitles; uint64_t position=0,duration=0,target=0; bool paused=false,live=false,scrubbing=false,started=false,audio_only=false; };
+struct PlayerOsd { std::string title,subtitle,audio,subtitles,album,art,up_next; int track=0,tracks=0,viz=0; bool viz_toast=false; uint64_t position=0,duration=0,target=0; bool paused=false,live=false,scrubbing=false,started=false,audio_only=false; };
 void draw_player_osd(const PlayerOsd& osd);
+// The L1 picture mode's banner: what it is set to, and the buttons.
+void draw_picture_banner(const std::string& state,bool moving);
+// Now Playing for music: the cover, a visualizer, the artist and album, and
+// the progress bar. `bands` are 0..1 levels; `wave` the newest sound (-1..1).
+// The visualizer is osd.viz (Square cycles them); osd.viz_toast names it.
+enum MusicViz { VIZ_BARS, VIZ_AURORA, VIZ_HALO, VIZ_SCOPE, VIZ_OFF, VIZ_COUNT };
+const char* music_viz_name(int viz);
+void draw_music_screen(const PlayerOsd& osd,const float* bands,int count,const float* wave,int wave_n);
 
-void draw_quick_peek(const Item& item,const PeekOrigin& origin,float progress,const std::string& status="");
+// `under`: the page beneath, undimmed (the peek dims it in the same pass).
+void draw_quick_peek(const Item& item,const PeekOrigin& origin,float progress,const std::string& status="",const uint32_t* under=nullptr);
 void draw_search(const std::string& query);
 std::string fit_text(const std::string& text,int width,int size=24);
+std::string fit_face(const std::string& text,int width,int size,TextFace face);
 void paragraph(int x,int y,const std::string& text,int width,int lines,uint32_t color,int size=24,int pitch=29);
 std::string clock_text(uint64_t ms);
+// The console's local time `after_ms` from now, in its own 12/24 h and date order.
+void console_clock(uint64_t after_ms,std::string& time,std::string& date);
+// "Ends at 9:42 PM": when something with `remaining_ms` to go finishes.
+std::string ends_at(uint64_t remaining_ms);
 void draw_star(int x,int y,int size,uint32_t color);
+
+// Settings (PS3 ui_settings.cpp): two levels. First the categories, each a
+// tile with its name and what is inside; X opens one, whose rows show their
+// value at the right and what the highlighted one does underneath.
+enum SettingsIcon { SICON_PLAYBACK, SICON_DISPLAY, SICON_ACCOUNT, SICON_SYSTEM };
+struct SettingsCategoryView { std::string label,summary; SettingsIcon icon=SICON_SYSTEM; };
+// lit: the value is "on" (drawn in the accent); dim: the row does nothing now;
+// action: X opens or does something (a chevron instead of a value).
+struct SettingsRowView { std::string label,value,description; bool lit=false,dim=false,action=false; };
+void draw_settings_categories(const std::vector<SettingsCategoryView>& categories,int selected,const std::string& account,const std::string& footer);
+void draw_settings_rows(const SettingsCategoryView& category,const std::vector<SettingsRowView>& rows,int selected);
+// A yes / no question over the current frame.
+void draw_confirm(const std::string& question,const std::string& detail,const char* yes);
+// Software Update's panel over the current frame: a title, up to two lines of
+// detail, a progress bar when progress >= 0, and the X / O hints (null = none).
+void draw_update_panel(const std::string& title,const std::string& detail,float progress,const char* yes,const char* no);
 
 // Settings > About (PS3 ui_about.cpp): Updates, Credits and Licences.
 int about_sections_count();

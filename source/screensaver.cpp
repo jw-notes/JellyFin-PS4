@@ -1,6 +1,8 @@
 #include "screensaver.h"
+#include "mono_clock.h"
 #include "platform.h"
 #include "art.h"
+#include "language.h"
 #include <algorithm>
 #include <string.h>
 #include <time.h>
@@ -16,7 +18,7 @@ static uint64_t last_input=0;
 static int inhibit=0;
 static bool prefetched=false;
 
-static uint64_t clock_ms(){timespec ts{};clock_gettime(CLOCK_MONOTONIC,&ts);return (uint64_t)ts.tv_sec*1000+ts.tv_nsec/1000000;}
+static uint64_t clock_ms(){return mono_ms();}
 static float smooth(float t){t=std::max(0.0f,std::min(1.0f,t));return t*t*(3-2*t);}
 static uint32_t scale_rgb(uint32_t c,float k){int a=(int)(k*256);return (((c>>16)&255)*a>>8)<<16|(((c>>8)&255)*a>>8)<<8|((c&255)*a>>8);}
 // An episode shows its series' backdrop, as Home's wide cards do on the PS3.
@@ -34,7 +36,7 @@ void screensaver_set_items(const std::vector<SaverItem>& items){
   if(!dup&&(s.item.backdrop||!strcmp(s.item.base.type,"Episode")))slides.push_back(s);}
  prefetched=false;
 }
-std::string screensaver_delay_label(){int s=settings.saver_delay;return s<60?std::to_string(s)+" sec":std::to_string(s/60)+" min";}
+std::string screensaver_delay_label(){int s=settings.saver_delay;return s<60?TF("%d sec",s):TF("%d min",s/60);}
 void screensaver_delay_step(int dir){
  const int n=(int)(sizeof delays/sizeof *delays);int i=0;while(i<n-1&&delays[i]<settings.saver_delay)++i;
  settings.saver_delay=delays[(i+(dir<0?n-1:1))%n];last_input=clock_ms();
