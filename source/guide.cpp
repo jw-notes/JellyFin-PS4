@@ -171,7 +171,8 @@ void* worker(void*){
  }
  if(url.empty()){failure="No guide address. Enter one under Guide Address, or use a playlist that names its guide (url-tvg).";state=GUIDE_FAILED;return nullptr;}
  plog("Guide: downloading");
- const int status=http_download_file(url.c_str(),gz_path.c_str(),[](uint64_t,uint64_t){return true;});
+ int status=http_download_file(url.c_str(),gz_path.c_str(),[](uint64_t,uint64_t){return true;});
+ if(status!=200)status=ffmpeg_download_file(url.c_str(),gz_path.c_str(),[](uint64_t,uint64_t){return true;});
  if(status!=200){failure="The guide did not download (HTTP "+std::to_string(status)+").";plog(("Guide: "+failure).c_str());state=GUIDE_FAILED;return nullptr;}
  std::map<std::string,std::vector<Show>> got;int channels=0,count=0;
  if(!parse(gz_path,got,channels,count)){plog(("Guide: "+failure).c_str());state=GUIDE_FAILED;return nullptr;}

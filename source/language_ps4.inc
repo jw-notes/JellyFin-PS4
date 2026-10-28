@@ -22,6 +22,8 @@
 {"Channel",{"チャンネル","Canal","Sender","Chaîne","Canal"}},
 {"Use the shared sign-in",{"共有サインインを使う","Usar o login compartilhado","Geteilte Anmeldung verwenden","Utiliser la connexion partagée","Usar el inicio de sesión compartido"}},
 {"Sign in with my own account",{"自分のアカウントでサインイン","Entrar com minha própria conta","Mit eigenem Konto anmelden","Me connecter avec mon compte","Iniciar sesión con mi cuenta"}},
+{"On Now",{"放送中","No ar agora","Läuft jetzt","En ce moment","Ahora en emisión"}},
+{"On Now on Home",{"ホームに放送中を表示","No ar agora no Início","Läuft jetzt auf der Startseite","En ce moment sur l'accueil","Ahora en emisión en Inicio"}},
 {"shared",{"共有","compartilhado","geteilt","partagé","compartido"}},
 {"Live TV",{"ライブTV","TV ao vivo","Live-TV","TV en direct","TV en vivo"}},
 {"Update Guide",{"番組表を更新","Atualizar guia","Programm aktualisieren","Mettre à jour le guide","Actualizar guía"}},

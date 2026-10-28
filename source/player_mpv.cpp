@@ -134,7 +134,11 @@ bool player_open(const std::string& url){
   // No kept-alive HTTPS connections between HLS segments: after a Pluto ad
   // break ("keepalive request failed", "mbedtls_ssl_read returned -0x0")
   // the app died as the stream was reloaded, tearing those down.
-  option("demuxer-lavf-o","http_persistent=0");}
+  option("demuxer-lavf-o","http_persistent=0");
+  // Opening a channel probes every one of its variants (Pluto: five video,
+  // seven audio) with up to 5 MB each. Free memory fell with each reconnect
+  // (228, 208 MB) and the app died loading the next: probe 1 MB, 1.5 s.
+  option("demuxer-lavf-probesize","1000000");option("demuxer-lavf-analyzeduration","1.5");}
  else{option("referrer",g_server);option("user-agent","JellyfinPS4/0.8");}option("config","no");option("terminal","no");option("idle","yes");option("vo","libmpv");
  // Verbose until the stream has loaded: when one will not open, the reason is
  // in FFmpeg's detail, not in the one-line "loading failed".
@@ -151,7 +155,7 @@ bool player_open(const std::string& url){
  // Memory: the read-ahead is capped, and the back buffer (kept for seeking
  // backwards, 50 MiB by default) mostly given up -- a 1080p stream ran out
  // of memory with both at their defaults.
- option("demuxer-max-bytes","32MiB");option("demuxer-max-back-bytes","4MiB");
+ option("demuxer-max-bytes",remote?"16MiB":"32MiB");option("demuxer-max-back-bytes",remote?"2MiB":"4MiB");
  // Scaling, when the picture is not already the screen's size: fast-bilinear
  // (a 240p channel upscaled with bicubic took 34 ms a frame). With 1080p (software decoding) the cheapest settings: skip
  // deblocking on frames nothing refers to, and fast-bilinear downscaling.

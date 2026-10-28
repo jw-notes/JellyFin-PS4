@@ -4,6 +4,8 @@
 #include "playback_model.h"
 #include "api_userdata.h"
 #include "json_unescape.h"
+#include "guide.h"
+#include "language.h"
 #include <stdio.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -65,6 +67,7 @@ bool storage_init(int user){
   if(j.find("\"debug\"")!=std::string::npos)settings.debug_log=number(j.c_str(),"debug")!=0;
   settings.viz=(int)(number(j.c_str(),"viz")%5);
   settings.home_order=field(j.c_str(),"home_order");
+  if(j.find("\"home_onnow\"")!=std::string::npos)settings.home_onnow=number(j.c_str(),"home_onnow")!=0;
   if(j.find("\"guide_auto\"")!=std::string::npos)settings.guide_auto=number(j.c_str(),"guide_auto")!=0;
   settings.guide_url=field(j.c_str(),"guide_url");settings.guide_found=field(j.c_str(),"guide_found");
   if(j.find("\"skip_intro\"")!=std::string::npos)settings.skip_intro=(int)number(j.c_str(),"skip_intro")%3;
@@ -73,7 +76,7 @@ bool storage_init(int user){
   if(j.find("\"pic_w\"")!=std::string::npos){settings.pic_aspect=(int)number(j.c_str(),"pic_aspect")%3;settings.pic_w=std::max(50,std::min(110,(int)number(j.c_str(),"pic_w")));settings.pic_h=std::max(50,std::min(110,(int)number(j.c_str(),"pic_h")));
    // Shifts are stored offset by 100: the JSON reader here takes no minus sign.
    settings.pic_x=std::max(-40,std::min(40,(int)number(j.c_str(),"pic_x")-100));settings.pic_y=std::max(-40,std::min(40,(int)number(j.c_str(),"pic_y")-100));}}return true;}
-bool save_settings(){return write_atomic("settings.json","{\"v\":11,\"bitrate\":"+std::to_string(settings.bitrate)+",\"resume\":"+std::to_string(settings.resume)+",\"method\":"+std::to_string(settings.method)+",\"saver\":"+std::to_string(settings.saver)+",\"saver_delay\":"+std::to_string(settings.saver_delay)+",\"language\":"+json_quote(settings.language)+",\"hd1080\":"+std::to_string(settings.hd1080)+",\"debug\":"+std::to_string(settings.debug_log)+",\"pic_aspect\":"+std::to_string(settings.pic_aspect)+",\"pic_w\":"+std::to_string(settings.pic_w)+",\"pic_h\":"+std::to_string(settings.pic_h)+",\"pic_x\":"+std::to_string(settings.pic_x+100)+",\"pic_y\":"+std::to_string(settings.pic_y+100)+",\"viz\":"+std::to_string(settings.viz)+",\"volume\":"+std::to_string(settings.volume)+",\"home_order\":"+json_quote(settings.home_order)+",\"skip_intro\":"+std::to_string(settings.skip_intro)+",\"skip_outro\":"+std::to_string(settings.skip_outro)+",\"guide_auto\":"+std::to_string(settings.guide_auto)+",\"guide_url\":"+json_quote(settings.guide_url)+",\"guide_found\":"+json_quote(settings.guide_found)+"}");}
+bool save_settings(){return write_atomic("settings.json","{\"v\":11,\"bitrate\":"+std::to_string(settings.bitrate)+",\"resume\":"+std::to_string(settings.resume)+",\"method\":"+std::to_string(settings.method)+",\"saver\":"+std::to_string(settings.saver)+",\"saver_delay\":"+std::to_string(settings.saver_delay)+",\"language\":"+json_quote(settings.language)+",\"hd1080\":"+std::to_string(settings.hd1080)+",\"debug\":"+std::to_string(settings.debug_log)+",\"pic_aspect\":"+std::to_string(settings.pic_aspect)+",\"pic_w\":"+std::to_string(settings.pic_w)+",\"pic_h\":"+std::to_string(settings.pic_h)+",\"pic_x\":"+std::to_string(settings.pic_x+100)+",\"pic_y\":"+std::to_string(settings.pic_y+100)+",\"viz\":"+std::to_string(settings.viz)+",\"volume\":"+std::to_string(settings.volume)+",\"home_order\":"+json_quote(settings.home_order)+",\"skip_intro\":"+std::to_string(settings.skip_intro)+",\"skip_outro\":"+std::to_string(settings.skip_outro)+",\"home_onnow\":"+std::to_string(settings.home_onnow)+",\"guide_auto\":"+std::to_string(settings.guide_auto)+",\"guide_url\":"+json_quote(settings.guide_url)+",\"guide_found\":"+json_quote(settings.guide_found)+"}");}
 // Share Sign-in (PS3): one PS4 user lends their sign-in to the console's
 // users with none of their own. It is a copy of their session beside the
 // users' folders, with whose it is; theirs keeps it up to date.
@@ -240,7 +243,39 @@ bool fetch_page(const std::string& parent,int start,const std::string& query,int
  Page next;if(!parse_items(next))return false;page=next;
  pthread_mutex_lock(&page_lock);cache_page(path,page);pthread_mutex_unlock(&page_lock);return true;
 }
+// "2026-10-28T22:00:00.0000000Z" as a Unix time.
+static time_t iso_time(const std::string& s){
+ int Y,M,D,h,m,sec;if(sscanf(s.c_str(),"%d-%d-%dT%d:%d:%d",&Y,&M,&D,&h,&m,&sec)!=6)return 0;
+ Y-=M<=2;const long long era=(Y>=0?Y:Y-399)/400;const int yoe=(int)(Y-era*400),doy=(153*(M+(M>2?-3:9))+2)/5+D-1,doe=yoe*365+yoe/4-yoe/100+doy;
+ return (time_t)((era*146097+doe-719468)*86400+h*3600+m*60+sec);
+}
+// On Now: the server's airing programmes, each as its channel (so X plays it)
+// with the show's name, episode, image and times. A server with no guide of
+// its own: the channels the PS4's downloaded guide has something on for.
+static bool fetch_on_now(Page& page){
+ std::vector<char> body(1024*1024);
+ const std::string path="/LiveTv/Programs/Recommended?userId="+encode(g_userid)+"&isAiring=true&limit=24&enableImageTypes=Primary,Thumb&imageTypeLimit=1&fields=ChannelInfo&enableTotalRecordCount=false";
+ Page next;
+ if(http_request(HTTP_GET,(std::string(g_server)+path).c_str(),"",g_token,body.data(),(int)body.size())==200){
+  const char* j=body.data();const char* e=j+strlen(j);const char* a=find_top_value(j,e,"Items");
+  if(a&&*a=='['){++a;while(a<e){a=skip_ws(a,e);if(a>=e||*a==']')break;if(*a==','){++a;continue;}const char* b=object_end(a,e);if(!b)break;
+   const std::string obj(a,b);a=b;Item i;const std::string channel=field(obj.c_str(),"ChannelId");if(channel.empty())continue;
+   snprintf(i.base.id,sizeof i.base.id,"%s",channel.c_str());snprintf(i.base.name,sizeof i.base.name,"%s",field(obj.c_str(),"ChannelName").c_str());snprintf(i.base.type,sizeof i.base.type,"TvChannel");
+   i.now_on=field(obj.c_str(),"Name");i.now_sub=field(obj.c_str(),"EpisodeTitle");i.now_start=iso_time(field(obj.c_str(),"StartDate"));i.now_stop=iso_time(field(obj.c_str(),"EndDate"));
+   if(obj.find("\"Primary\":")!=std::string::npos)i.now_image=field(obj.c_str(),"Id");
+   next.items.push_back(i);}}
+ }
+ if(next.items.empty()){
+  if(http_request(HTTP_GET,(std::string(g_server)+"/LiveTv/Channels?UserId="+encode(g_userid)+"&Limit=300").c_str(),"",g_token,body.data(),(int)body.size())!=200)return false;
+  Page channels;std::string error;if(!parse_items(body.data(),channels,error))return false;
+  for(auto& c:channels.items){GuideNow g;if(!guide_now_next(c.base.name,g)||g.now.empty())continue;
+   c.now_on=g.now;c.now_start=g.now_start;c.now_stop=g.now_stop;if(!g.next.empty())c.now_sub=std::string(T("Next"))+": "+g.next;
+   next.items.push_back(c);if(next.items.size()>=24)break;}
+ }
+ next.total=(int)next.items.size();page=next;return true;
+}
 bool fetch_home_row(HomeRowKind kind,const Item& library,Page& page){
+ if(kind==HOME_ONNOW)return fetch_on_now(page);
  const std::string fields="&Fields=Overview,Genres&EnableImageTypes=Primary,Backdrop&ImageTypeLimit=1";std::string path;
  if(kind==HOME_CONTINUE)path="/Users/"+encode(g_userid)+"/Items/Resume?Limit=16&Recursive=true&MediaTypes=Video"+fields;
  else if(kind==HOME_NEXTUP)path="/Shows/NextUp?userId="+encode(g_userid)+"&Limit=16"+fields;

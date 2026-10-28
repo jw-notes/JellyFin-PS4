@@ -1,13 +1,16 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>
 #include "jellyfin_api.h"
 #include "json_lite.h"
 #include "theme.h"
 #include <string>
 #include <vector>
 struct Person { std::string id,name,role; bool image=false; };
-struct Item { JFItem base{}; std::string overview,cast,genres,rating,collection,director,community,series,series_id,tagline,album,album_id,artist; std::vector<Person> people; int year=0,season=0,episode=0; uint64_t resume=0, duration=0; bool favourite=false, played=false, backdrop=false; };
+// A Live TV channel's current show (Home's On Now row): its name, episode,
+// image (the programme's id; empty: the channel's logo) and times.
+struct Item { JFItem base{}; std::string overview,cast,genres,rating,collection,director,community,series,series_id,tagline,album,album_id,artist,now_on,now_sub,now_image; time_t now_start=0,now_stop=0; std::vector<Person> people; int year=0,season=0,episode=0; uint64_t resume=0, duration=0; bool favourite=false, played=false, backdrop=false; };
 struct Page { std::vector<Item> items; int total=0; };
 // saver: the Artwork screensaver; saver_delay: idle seconds before it starts.
 // language: "auto" (follow the console) or a code such as "ja" (language.h).
@@ -29,7 +32,9 @@ struct Settings { int bitrate=20000000; bool resume=true; int method=PLAY_AUTO; 
  int skip_intro=2,skip_outro=1;
  // The Live TV guide (guide.h): Auto-Update, the address the viewer typed,
  // and the one found in the playlist (remembered so non-admins have it too).
- bool guide_auto=true; std::string guide_url,guide_found; };
+ bool guide_auto=true; std::string guide_url,guide_found;
+ // home_onnow: Home's On Now row of Live TV channels.
+ bool home_onnow=true; };
 enum { SKIP_OFF, SKIP_BUTTON, SKIP_AUTO };
 // An intro or the credits, as the server marks them, in ms from the start.
 struct MediaSegment { bool outro=false; uint64_t start=0,end=0; };
@@ -62,6 +67,9 @@ std::string http_failure_detail();
 // Stream a GET to a file (see http_ps4.cpp); returns the HTTP status or -1.
 #include <functional>
 int http_download_file(const char* url,const char* path,const std::function<bool(uint64_t,uint64_t)>& progress);
+// The same through FFmpeg's HTTPS (updater.cpp), for hosts the console's own
+// HTTP library cannot reach (GitHub's release files). 200, or -1.
+int ffmpeg_download_file(const char* url,const char* path,const std::function<bool(uint64_t,uint64_t)>& progress);
 int http_context_id();
 int http_ssl_context_id();
 // Page modes beyond 0 (a folder), 1 Continue, 2 Favourites, 3 Live TV and
@@ -74,7 +82,9 @@ bool page_ready(const std::string& parent,int start,const std::string& query,int
 void page_cache_clear();
 void page_cache_stop();
 // Classic Home rows, as on the PS3: Continue Watching, Next Up and Latest <library>.
-enum HomeRowKind { HOME_CONTINUE, HOME_NEXTUP, HOME_LATEST };
+// HOME_ONNOW: Live TV channels with what is on now (the server's guide, else
+// the one downloaded to the PS4), as the web client's "On Now".
+enum HomeRowKind { HOME_CONTINUE, HOME_NEXTUP, HOME_LATEST, HOME_ONNOW };
 // Thread-safe: its own buffer, and last_error is left alone.
 bool fetch_home_row(HomeRowKind kind,const Item& library,Page& page);
 // An album's tracks in disc and track order.

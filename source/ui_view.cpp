@@ -45,7 +45,8 @@ static std::string runtime_text(uint64_t ms){unsigned m=(unsigned)((ms+59999)/60
 // The console's clock (PS3 clock_fmt.h): time() is UTC and the C library
 // knows no zone, so the offset, summer time, 12/24 h and date order come from
 // the system settings, read again every half minute.
-void console_clock(uint64_t after_ms,std::string& time_text,std::string& date_text){
+// Any moment, as the console shows its time and date (its zone and formats).
+static void clock_at(long long when,std::string& time_text,std::string& date_text){
  static int offset=0,date_fmt=CLK_DATE_MDY,time_fmt=CLK_TIME_12H;static time_t read_at=0;const time_t now=time(nullptr);
  if(!read_at||now-read_at>=30||now<read_at){read_at=now;
 #ifdef HOST_TEST
@@ -58,8 +59,10 @@ void console_clock(uint64_t after_ms,std::string& time_text,std::string& date_te
   if(sceSystemServiceParamGetInt(ORBIS_SYSTEM_SERVICE_PARAM_ID_TIME_FORMAT,&v)>=0&&(v==0||v==1))time_fmt=v;
 #endif
  }
- char t[16],d[16];clock_format((long long)now+(long long)(after_ms/1000),offset,date_fmt,time_fmt,t,sizeof t,d,sizeof d);time_text=t;date_text=d;
+ char t[16],d[16];clock_format(when,offset,date_fmt,time_fmt,t,sizeof t,d,sizeof d);time_text=t;date_text=d;
 }
+void console_clock(uint64_t after_ms,std::string& time_text,std::string& date_text){clock_at((long long)time(nullptr)+(long long)(after_ms/1000),time_text,date_text);}
+std::string console_time_at(time_t when){std::string t,d;clock_at((long long)when,t,d);return t;}
 std::string ends_at(uint64_t remaining_ms){std::string t,d;console_clock(remaining_ms,t,d);return TF("Ends at %s",t.c_str());}
 static void avatar(int x,int y,int d);
 // The PS3 loading shimmer (ui_depth.cpp): a soft light band sweeping across a
@@ -175,11 +178,15 @@ void draw_library(const Page& page,const std::string& title,int start,int select
 // ---- classic home --------------------------------------------------------
 constexpr int HOME_X0=64,HOME_TOP=96,HOME_GAP=18,HOME_TITLE_H=34,HOME_LABEL_H=48,HOME_ROW_GAP=12,HOME_CLIP=88,HOME_BOTTOM=650;
 void home_card_size(HomeShape shape,int& w,int& h){if(shape==SHAPE_POSTER){w=140;h=210;}else if(shape==SHAPE_SQUARE){w=168;h=168;}else{w=256;h=144;}}
-int home_row_height(const HomeRow& row){int w,h;home_card_size(row.shape,w,h);return HOME_TITLE_H+h+HOME_LABEL_H+HOME_ROW_GAP;}
+// On Now's cards are channels with a show on: a third line, its times.
+static bool on_now_row(const HomeRow& row){return !row.page.items.empty()&&!strcmp(row.page.items[0].base.type,"TvChannel")&&row.page.items[0].now_start;}
+int home_row_height(const HomeRow& row){int w,h;home_card_size(row.shape,w,h);return HOME_TITLE_H+h+HOME_LABEL_H+(on_now_row(row)?20:0)+HOME_ROW_GAP;}
 static int home_step_px(const HomeRow& row){int w,h;home_card_size(row.shape,w,h);return w+HOME_GAP;}
 static int home_row_y(const HomeView& home,int index){int y=HOME_TOP;for(int k=0;k<index;++k)y+=home_row_height(home.rows[k]);return y-(int)lroundf(home.scroll);}
 void home_image(const HomeRow& row,const Item& item,std::string& key,std::string& path){
  key=item.base.id;path="/Items/"+encode(item.base.id)+"/Images/Primary?MaxWidth=320&Quality=85";
+ // On Now: the show's own picture when it has one, else the channel's logo.
+ if(!item.now_image.empty()){key=item.now_image;path="/Items/"+encode(item.now_image)+"/Images/Primary?MaxWidth=320&Quality=85";return;}
  // Wide rows show a film's backdrop; an episode's own image is already a still.
  if(row.shape==SHAPE_WIDE&&strcmp(item.base.type,"Episode")&&item.backdrop){key+=":wide";path="/Items/"+encode(item.base.id)+"/Images/Backdrop?MaxWidth=480&Quality=80";}
 }
@@ -202,6 +209,8 @@ PeekOrigin home_focus_rect(const HomeView& home){
 static void home_labels(const HomeRow& row,const Item& item,std::string& a,std::string& b){
  a=item.base.name;b.clear();
  if(row.shape==SHAPE_LIBRARY)return;
+ // On Now: the show, then its episode -- or the channel when it has none.
+ if(!item.now_on.empty()){a=item.now_on;b=item.now_sub.empty()?std::string(item.base.name):item.now_sub;return;}
  if(!strcmp(item.base.type,"Episode")){if(!item.series.empty())a=item.series;b=episode_code(item);b+=(b.empty()?"":" - ")+std::string(item.base.name);}
  else if(item.year)b=std::to_string(item.year);
 }
@@ -229,13 +238,19 @@ void draw_home(const HomeView& home,int header_focus){
    const int cx=HOME_X0+(int)c*step-(int)lroundf(row.offset);if(cx>WIDTH||cx+w<0)continue;const auto& item=row.page.items[c];
    rect(cx,cy,w,h,g_theme.thumb_dim);std::string key,path;home_image(row,item,key,path);
    // A wide card falls back to the poster if the backdrop is missing.
-   bool image=key!=item.base.id&&art_state(key)<0?card_art(item.base.id,cx,cy,w,h,true):card_art(key,cx,cy,w,h,true);
+   // A channel's logo is fitted whole, not cropped to fill the card.
+   const bool logo=!strcmp(item.base.type,"TvChannel")&&(item.now_image.empty()||art_state(key)<0);
+   bool image=key!=item.base.id&&art_state(key)<0?card_art(item.base.id,cx,cy,w,h,!logo):card_art(key,cx,cy,w,h,!logo);
    if(!image){if(row.shape==SHAPE_LIBRARY)draw_brand_mark(cx+(w-48)/2,cy+(h-48)/2,48);else face_text(cx+10,cy+h/2-10,fit_face(item.base.name,w-20,16,TextFace::Classic),g_theme.text_dim,16,TextFace::Classic,w-20);if(art_state(item.base.id)==0)load_art(item.base.id);}
    if(item.duration&&item.resume&&row.shape!=SHAPE_LIBRARY){int fill=(int)(w*std::min(1.0,(double)item.resume/item.duration));rect(cx,cy+h-4,w,4,g_theme.track);rect(cx,cy+h-4,fill,4,g_theme.accent_alt);}
+   // On Now: how far into the show, as the web client draws it.
+   if(item.now_stop>item.now_start){const double f=std::max(0.0,std::min(1.0,(double)(time(nullptr)-item.now_start)/(item.now_stop-item.now_start)));
+    const int bw=w-24;round_rect(cx+12,cy+h-14,bw,4,2,g_theme.white,90);if(f>0)round_rect(cx+12,cy+h-14,(int)(bw*f),4,2,g_theme.white,255);}
    const bool on=row_focus&&(int)c==row.col&&home.focus>=0;if(on)outline(cx-3,cy-3,w+6,h+6,g_theme.focus_ring,2);
    std::string a,b;home_labels(row,item,a,b);const int ly=cy+h+8;
    face_text(cx,ly,fit_face(a,w,16,TextFace::Classic),on?g_theme.white:g_theme.text,16,TextFace::Classic,w);
    if(!b.empty())face_text(cx,ly+21,fit_face(b,w,14,TextFace::Classic),g_theme.text_faint,14,TextFace::Classic,w);
+   if(item.now_stop>item.now_start)face_text(cx,ly+41,console_time_at(item.now_start)+" - "+console_time_at(item.now_stop),g_theme.text_faint,14,TextFace::Classic,w);
   }
  }
  // Content scrolls under the header: repaint the band it passes beneath.
@@ -701,6 +716,9 @@ enum AboutKind { A_HEAD, A_VER, A_ITEM, A_NAME, A_TEXT, A_GAP };
 struct AboutLine { AboutKind kind; const char* a; const char* b; };
 // Updates: the PS4 releases, newest first. Add each new release at the top.
 const AboutLine about_updates[]={
+ {A_VER,"1.12",nullptr},
+ {A_ITEM,"On Now on Home: what's on Live TV, with its times and progress.",nullptr},
+ {A_ITEM,"Fixes: Software Update downloads again; Live TV reconnects use less memory.",nullptr},
  {A_VER,"1.11",nullptr},
  {A_ITEM,"TV shows play on to the next episode, across seasons; L1 / R1 skip episodes.",nullptr},
  {A_ITEM,"Skip Intros and Skip Credits, with markers from the server (Intro Skipper).",nullptr},

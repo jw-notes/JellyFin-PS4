@@ -3,6 +3,12 @@
 #include "app.h"
 #include "json_lite.h"
 #include <mbedtls/sha256.h>
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavformat/avio.h>
+#include <libavutil/dict.h>
+#include <libavutil/error.h>
+}
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,15 +93,53 @@ int update_state(){return state;}
 std::string update_version(){pthread_mutex_lock(&lock);auto v=version;pthread_mutex_unlock(&lock);return v;}
 std::string update_error(){pthread_mutex_lock(&lock);auto v=error;pthread_mutex_unlock(&lock);return v;}
 
+// The same GET through FFmpeg's own HTTPS (mbedTLS) instead of the console's.
+// GitHub sends a release's file from release-assets.githubusercontent.com,
+// where the console's HTTP library failed every time ("Send request failed",
+// 0x80431073); FFmpeg follows the redirect and connects. The file is checked
+// against GitHub's SHA-256 afterwards, so its certificate is not relied on.
+int ffmpeg_download_file(const char* url,const char* path,const std::function<bool(uint64_t,uint64_t)>& progress){
+ avformat_network_init();
+ struct Stop{bool stop=false;}stop;
+ AVIOInterruptCB interrupt{[](void* s)->int{return ((Stop*)s)->stop;},&stop};
+ // reconnect: a dropped connection is picked up where it stopped (a Range
+ // request) rather than read as the end of the file.
+ AVDictionary* opts=nullptr;av_dict_set(&opts,"user_agent","JellyfinPS4",0);av_dict_set(&opts,"rw_timeout","20000000",0);
+ av_dict_set(&opts,"reconnect","1",0);av_dict_set(&opts,"reconnect_streamed","1",0);av_dict_set(&opts,"reconnect_on_network_error","1",0);av_dict_set(&opts,"reconnect_delay_max","8",0);
+ AVIOContext* io=nullptr;const int rc=avio_open2(&io,url,AVIO_FLAG_READ,&interrupt,&opts);av_dict_free(&opts);
+ auto why=[](int e){char s[128];av_strerror(e,s,sizeof s);return std::string(s);};
+ if(rc<0){plog(("Download (FFmpeg): "+why(rc)).c_str());return -1;}
+ const int64_t size=avio_size(io);FILE* f=fopen(path,"wb");bool ok=f!=nullptr;uint64_t got=0;int resumes=0;
+ std::vector<unsigned char> buf(256*1024);
+ while(ok){
+  const int n=avio_read(io,buf.data(),(int)buf.size());
+  if(n>0){if(fwrite(buf.data(),1,n,f)!=(size_t)n){ok=false;break;}got+=n;if(!progress(got,size>0?(uint64_t)size:0)){stop.stop=true;ok=false;break;}continue;}
+  // The end -- or a connection that failed or closed early (avio_read says
+  // EOF for both): short of the size, ask for the rest, a few times.
+  if(size>0&&got<(uint64_t)size&&resumes<6&&!stop.stop){
+   plog(("Download (FFmpeg): stopped at "+std::to_string(got)+" of "+std::to_string(size)+" bytes ("+why(io->error?io->error:n)+"); resuming").c_str());
+   ++resumes;io->eof_reached=0;io->error=0;if(avio_seek(io,(int64_t)got,SEEK_SET)>=0)continue;
+  }
+  if(io->error&&io->error!=AVERROR_EOF){plog(("Download (FFmpeg): "+why(io->error)).c_str());ok=false;}
+  break;}
+ if(f)fclose(f);avio_closep(&io);
+ plog(("Download (FFmpeg): "+std::to_string(got)+" bytes"+(size>0?" of "+std::to_string(size):std::string(", size not given"))).c_str());
+ if(!ok||(size>0&&got!=(uint64_t)size)){remove(path);return -1;}
+ return 200;
+}
 static void* download_worker(void*){
  background_priority();
  pthread_mutex_lock(&lock);const std::string url=asset_url,sha=asset_sha256;const uint64_t size=asset_size;pthread_mutex_unlock(&lock);
  mkdir(UPDATE_DIR,0777);
  const std::string part=std::string(UPDATE_FILE)+".part";
- const int status=http_download_file(url.c_str(),part.c_str(),[&](uint64_t got,uint64_t total){got_bytes=got;total_bytes=total?total:size;return !cancel.load();});
+ auto progress=[&](uint64_t got,uint64_t total){got_bytes=got;total_bytes=total?total:size;return !cancel.load();};
+ int status=http_download_file(url.c_str(),part.c_str(),progress);
+ if(status!=200&&!cancel){plog(("Update: "+http_failure_detail()+"; trying FFmpeg's HTTPS").c_str());got_bytes=0;status=ffmpeg_download_file(url.c_str(),part.c_str(),progress);}
  if(status!=200){if(!cancel)fail(http_failure_detail());remove(part.c_str());download=cancel?DL_IDLE:DL_FAILED;return nullptr;}
- struct stat st{};
- if(stat(part.c_str(),&st)||(size&&(uint64_t)st.st_size!=size)){fail("The download is the wrong size.");remove(part.c_str());download=DL_FAILED;return nullptr;}
+ // Its size by seeking to the end: stat()'s st_size read 65984 for a whole
+ // 33 MB download here (the SDK's struct stat does not match the console's).
+ long long on_disk=-1;if(FILE* f=fopen(part.c_str(),"rb")){if(fseeko(f,0,SEEK_END)==0)on_disk=(long long)ftello(f);fclose(f);}
+ if(on_disk<0||(size&&(uint64_t)on_disk!=size)){plog(("Update: the file is "+std::to_string(on_disk)+" bytes, the release says "+std::to_string(size)).c_str());fail("The download is the wrong size.");remove(part.c_str());download=DL_FAILED;return nullptr;}
  // The SHA-256 GitHub published for the file, against the file now on disk.
  if(!sha.empty()){
   mbedtls_sha256_context ctx;mbedtls_sha256_init(&ctx);mbedtls_sha256_starts_ret(&ctx,0);

@@ -77,6 +77,12 @@ int main(){
  // The loading shimmer over cards whose artwork has not arrived.
  HomeView loading;loading.loaded=true;HomeRow latest;latest.title="Latest Movies";latest.shape=SHAPE_POSTER;for(int k=0;k<8;++k)latest.page.items.push_back(item(("pending"+std::to_string(k)).c_str(),"Loading Film","Movie",2020));loading.rows.push_back(latest);
  loading.focus=0;home_step(loading,true);draw_home(loading,-1);capture("build/ui110-shimmer.bmp");
+ // On Now: show pictures, then a channel's logo (no show picture), with times and progress.
+ {HomeView onnow;onnow.loaded=true;HomeRow row;row.title="On Now";row.shape=SHAPE_SQUARE;const time_t now=time(nullptr);
+  const char* shows[][3]={{"The First 48","Fast Friends; The Thin Line","p1"},{"The Walking Dead","The Same Boat","p2"},{"Top Gear UK","Episode 5",""},{"Chicago Fire","Law of the Jungle","p4"},{"Modern Marvels","U.S. Mints: Money Machines","p5"},{"Property Virgins","Josh - Big Money Down","p6"}};
+  int k=0;for(auto& s:shows){Item c=item(("ch"+std::to_string(k)).c_str(),"Channel","TvChannel",0);c.now_on=s[0];c.now_sub=s[1];c.now_image=s[2];c.now_start=now-600*(k+1);c.now_stop=now+1800+300*k;
+   if(*s[2])art_inject(s[2],320,320,fake_image(320,320,k+5));else art_inject(c.base.id,320,120,fake_image(320,120,9));row.page.items.push_back(c);++k;}
+  onnow.rows.push_back(row);onnow.focus=0;home_step(onnow,true);draw_home(onnow,-1);capture("build/ui110-onnow.bmp");}
  // Languages: the PS3 catalog plus the PS4's own strings.
  i18n_set(LANG_JA);draw_detail(film,view);capture("build/ui110-detail-ja.bmp");
  assert(strcmp(T("Settings"),"Settings")&&strcmp(T("Skip 5 min"),"Skip 5 min"));printf("ja: %s / %s / %s\n",T("Settings"),T("Skip 5 min"),TF("Track %d of %d",3,12).c_str());

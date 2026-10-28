@@ -79,6 +79,8 @@ std::string clock_text(uint64_t ms);
 void console_clock(uint64_t after_ms,std::string& time,std::string& date);
 // "Ends at 9:42 PM": when something with `remaining_ms` to go finishes.
 std::string ends_at(uint64_t remaining_ms);
+// A moment's time of day on the console's clock ("10:34 PM" / "22:34").
+std::string console_time_at(time_t when);
 void draw_star(int x,int y,int size,uint32_t color);
 
 // Settings (PS3 ui_settings.cpp): two levels. First the categories, each a

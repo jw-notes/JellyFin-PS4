@@ -66,7 +66,7 @@ static void order_libraries(std::vector<Item>& libraries){
 // Settings changed Home's order: load it again.
 static bool home_dirty=false;
 enum SettingSection { SEC_PLAYBACK, SEC_LIVETV, SEC_DISPLAY, SEC_ACCOUNT, SEC_SYSTEM, SEC__COUNT };
-enum SettingId { SET_QUALITY, SET_HD1080, SET_RESUME, SET_SKIP_INTRO, SET_SKIP_OUTRO, SET_METHOD, SET_GUIDE_UPDATE, SET_GUIDE_AUTO, SET_GUIDE_URL, SET_SHARE, SET_THEME, SET_LANGUAGE, SET_HOME_ORDER, SET_SAVER, SET_SAVER_DELAY, SET_SIGN_OUT, SET_UPDATE, SET_ABOUT, SET_DEBUG, SET_EXIT };
+enum SettingId { SET_QUALITY, SET_HD1080, SET_RESUME, SET_SKIP_INTRO, SET_SKIP_OUTRO, SET_METHOD, SET_GUIDE_UPDATE, SET_GUIDE_AUTO, SET_GUIDE_URL, SET_ONNOW, SET_SHARE, SET_THEME, SET_LANGUAGE, SET_HOME_ORDER, SET_SAVER, SET_SAVER_DELAY, SET_SIGN_OUT, SET_UPDATE, SET_ABOUT, SET_DEBUG, SET_EXIT };
 struct SettingDef { SettingId id; SettingSection section; const char* label; const char* description; bool action; };
 static const SettingDef SETTING_ROWS[]={
  {SET_QUALITY,SEC_PLAYBACK,"Quality","The highest bitrate the server streams at. Lower it if playback\nstops to buffer; raise it for a sharper picture on a fast network.",false},
@@ -75,6 +75,7 @@ static const SettingDef SETTING_ROWS[]={
  {SET_SKIP_INTRO,SEC_PLAYBACK,"Skip Intros","Films and shows: Auto jumps past the intro; Button shows Skip Intro (Triangle).\nNeeds intro markers on the server (Jellyfin 10.10+, e.g. Intro Skipper).",false},
  {SET_SKIP_OUTRO,SEC_PLAYBACK,"Skip Credits","Shows: at the credits, Auto goes on to the next episode; Button shows\nSkip to Next Episode (Triangle). Needs credits markers on the server.",false},
  {SET_METHOD,SEC_PLAYBACK,"Playback method","Auto plays files the PS4 can decode straight from the server, and has the\nserver convert the rest. Always transcode converts everything (slower to start).",false},
+ {SET_ONNOW,SEC_LIVETV,"On Now on Home","A Home row of what's on Live TV now: the show, its episode and times.\nUses the server's guide, else the one downloaded here.",false},
  {SET_GUIDE_UPDATE,SEC_LIVETV,"Update Guide","",true},
  {SET_GUIDE_AUTO,SEC_LIVETV,"Auto-Update Guide","At launch, update the guide in the background when it is over 12 hours old.\nOff: only Update Guide does.",false},
  {SET_GUIDE_URL,SEC_LIVETV,"Guide Address","",true},
@@ -106,6 +107,7 @@ static SettingsRowView setting_view(const SettingDef& r){
  // The guide: its state under Update Guide, its address under Guide Address.
  case SET_GUIDE_UPDATE:v.description=guide_status()+"\n"+T("X downloads the guide now. Anyone signed in can update it.");break;
  case SET_GUIDE_AUTO:v.value=T(settings.guide_auto?"On":"Off");v.lit=settings.guide_auto;break;
+ case SET_ONNOW:v.value=T(settings.home_onnow?"On":"Off");v.lit=settings.home_onnow;break;
  case SET_SHARE:{const int s=share_state();
   v.value=T(s==SHARE_MINE?"On":s==SHARE_USING?"Shared with you":s==SHARE_OTHER?"Another account is shared":"Off");v.lit=s==SHARE_MINE;v.dim=s==SHARE_USING||s==SHARE_OTHER;
   if(s==SHARE_USING)v.description=std::string(T("You are using an account another user of this console shares."))+"\n"+T("Log Out, then sign in, to use your own.");
@@ -136,6 +138,7 @@ static bool setting_step(SettingId id,int dir){
  case SET_HD1080:settings.hd1080=!settings.hd1080;break;
  case SET_RESUME:settings.resume=!settings.resume;break;
  case SET_GUIDE_AUTO:settings.guide_auto=!settings.guide_auto;break;
+ case SET_ONNOW:settings.home_onnow=!settings.home_onnow;home_dirty=true;break;
  // Kept beside the users' folders, not in settings.json.
  case SET_SHARE:return share_set(share_state()!=SHARE_MINE);
  case SET_SKIP_INTRO:if(segments_supported()==0)return false;settings.skip_intro=(settings.skip_intro+dir+3)%3;break;
@@ -482,9 +485,11 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
    // picture): the newest non-silent audio came after the last frame.
    const uint64_t sound=audio_last_sound_ms();
    const bool sound_on=sound>last+2000&&now<sound+1000;
-   if(last&&(now>last+6000||(sound_on&&now>last+2500))&&(!reconnect_at||now>reconnect_at+8000)){
+   // At least 20 s apart, two a minute: each reload costs memory, and three in
+   // 50 s ran it out (the app died loading the fourth).
+   if(last&&(now>last+6000||(sound_on&&now>last+2500))&&(!reconnect_at||now>reconnect_at+20000)){
     if(now>reconnect_window+60000){reconnect_window=now;reconnects=0;}
-    if(reconnects<3){++reconnects;reconnect_at=now;reconnect_us=mono_us();plog(sound_on?"Live TV: picture stopped while the sound went on; reconnecting":"Live TV: picture stalled for 6 s; reconnecting");if(!player_reload(url)){last_error=player_error();play_failed=true;break;}}}}
+    if(reconnects<2){++reconnects;reconnect_at=now;reconnect_us=mono_us();plog(sound_on?"Live TV: picture stopped while the sound went on; reconnecting":"Live TV: picture stalled for 6 s; reconnecting");plog(("Live TV: "+resource_report()).c_str());if(!player_reload(url)){last_error=player_error();play_failed=true;break;}}}}
   if(!started&&time(nullptr)-began>start_limit){last_error=T("Decoder could not start this stream within 45 seconds");break;}
   usleep(1000);
  }
@@ -628,6 +633,7 @@ static bool load_home(HomeView& home,bool quiet=false){
  std::list<RowJob> jobs;
  jobs.emplace_back(HOME_CONTINUE,Item{},T("Continue Watching"),SHAPE_WIDE);row_start(jobs.back());
  jobs.emplace_back(HOME_NEXTUP,Item{},T("Next Up"),SHAPE_WIDE);row_start(jobs.back());
+ if(settings.home_onnow){jobs.emplace_back(HOME_ONNOW,Item{},T("On Now"),SHAPE_SQUARE);row_start(jobs.back());}
  Page views;if(!fetch_page("",0,"",0,views)){for(auto& job:jobs)row_join(job);return false;}
  order_libraries(views.items);
  bool movies=false,shows=false,music=false;
@@ -641,7 +647,7 @@ static bool load_home(HomeView& home,bool quiet=false){
  add(T("My Media"),SHAPE_LIBRARY,views);
  for(auto& job:jobs){row_join(job);if(job.ok)add(job.title,job.shape,job.page);}
  // The screensaver's slides, as on the PS3: Continue Watching, Next Up, then Latest.
- std::vector<SaverItem> saver;for(const auto& r:next.rows)if(r.shape!=SHAPE_LIBRARY)for(size_t c=0;c<r.page.items.size()&&c<4;++c)saver.push_back({r.page.items[c],r.title});screensaver_set_items(saver);
+ std::vector<SaverItem> saver;for(const auto& r:next.rows)if(r.shape!=SHAPE_LIBRARY)for(size_t c=0;c<r.page.items.size()&&c<4;++c)if(strcmp(r.page.items[c].base.type,"TvChannel"))saver.push_back({r.page.items[c],r.title});screensaver_set_items(saver);
  next.loaded=true;next.focus=std::min(next.focus,(int)next.rows.size()-1);if(next.rows.empty())next.focus=-1;
  home=next;home_step(home,true);return true;
 }
@@ -666,6 +672,8 @@ int main(){if(!platform_init()){platform_shutdown();platform_exit(1);}plog("Jell
    if(next==-2)error_screen();else if(next>=0)pending_tab=next;
    reload=true;ui_input_sync();return;
   }
+  // A channel (Home's On Now): straight to the player.
+  if(!strcmp(item.base.type,"TvChannel")){play(item,-1,-1,"");reload=true;ui_input_sync();return;}
   if(!strncmp(item.base.id,"nav:",4)){int mode=!strcmp(item.base.id,"nav:live")?3:!strcmp(item.base.id,"nav:continue")?1:2;stack.push_back({"",item.base.name,"",mode,0,0});reload=true;ui_input_sync();return;}
   if(!strcmp(item.base.type,"CollectionFolder")||!strcmp(item.base.type,"UserView")){stack.push_back(library_location(item));reload=true;ui_input_sync();return;}
   if(is_container(item.base.type)){stack.push_back(child_location(stack.back(),item,from_home));reload=true;ui_input_sync();return;}

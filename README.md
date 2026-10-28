@@ -21,7 +21,7 @@ A native Jellyfin client for PS4 consoles, built with the OpenOrbis toolchain. I
 
 ## Features
 
-- **Home**: My Media, Continue Watching, Next Up and the latest films, shows and music, each row scrolling on its own. My Media lists Live TV, Films and Shows first, or your own order (Settings › Display › Home Order). The clock, the date and your profile picture sit in the header.
+- **Home**: My Media, Continue Watching, Next Up, On Now (what's on Live TV, with the show, its times and progress) and the latest films, shows and music, each row scrolling on its own. My Media lists Live TV, Films and Shows first, or your own order (Settings › Display › Home Order). The clock, the date and your profile picture sit in the header.
 - **Libraries**: poster grids with an A–Z jump bar (press Left at the first column), quick peek with the cast (Triangle) and fast paging; the next page is fetched in the background. Artwork shimmers while it loads and fades in when it arrives.
 - **Details page**: backdrop, poster, rating, quality chips, Resume / Play from start / Favourite / Watched, version, audio and subtitle selection, synopsis, genres, director and the cast as photo cards. Select an actor to see their filmography. "Ends at" shows when a film or episode would finish.
 - **Playback**: 1080p at up to 20 Mbps by default. Files the PS4 can decode play straight from the server (direct play) and start in 1–3 seconds; anything else is converted by the server. A PS3-style buffering screen covers the start. The player bar shows the title, progress, times and when it ends; Left / Right scrub. Up moves to Play / Pause, **Volume** and **Picture** (size, position and Fit / Fill / Stretch), and X uses what's highlighted. TV shows play on to the next episode, across seasons, and L1 / R1 skip episodes. **Skip Intros** and **Skip Credits** (Off, Button or Auto) use the server's intro and credits markers (Jellyfin 10.10+ with a plugin such as Intro Skipper); in shows the credits offer *Skip to Next Episode*.
@@ -57,7 +57,7 @@ A native Jellyfin client for PS4 consoles, built with the OpenOrbis toolchain. I
 
 ## Install
 
-1. Copy `dist/v1.11/IV0000-JFPS40000_00-JELLYFINPS400000.pkg` to your PS4 and install it with your package installer. It installs over an earlier version and keeps your sign-in and settings.
+1. Copy `dist/v1.12/IV0000-JFPS40000_00-JELLYFINPS400000.pkg` to your PS4 and install it with your package installer. It installs over an earlier version and keeps your sign-in and settings.
 2. Open **Jellyfin [PS]**, enter your server's full URL including the port (for example `http://192.168.1.100:8096`), then sign in with Quick Connect or your username and password.
 
 ### Updates
