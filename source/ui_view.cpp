@@ -288,8 +288,20 @@ void draw_quick_peek(const Item& item,const PeekOrigin& origin,float progress,co
  if(item.duration&&!is_container(item.base.type))metadata+="  "+ends_at(item.resume&&settings.resume&&item.resume<item.duration?item.duration-item.resume:item.duration);
  text(tx,y+73,fit_text(metadata,tw),muted,24,tw);
  text(tx,y+108,fit_text(item.rating+(item.rating.empty()?"":"  ")+item.genres,tw),muted,24,tw);
- paragraph(tx,y+151,item.overview.empty()?(status.empty()?T("No synopsis available."):T(status.c_str())):item.overview,tw,9,ink);
- if(!item.cast.empty()){text(x+24,y+285,T("Cast"),muted);paragraph(x+24,y+320,item.cast,160,4,ink);}
+ const bool cast=!item.people.empty();
+ paragraph(tx,y+151,item.overview.empty()?(status.empty()?T("No synopsis available."):T(status.c_str())):item.overview,tw,cast?6:9,ink);
+ // The cast, as on the detail page: round photos, names and roles under
+ // them, across the card's foot. The photos load as the card opens.
+ if(cast){
+  constexpr int KD=64,KP=92;const int KY=y+330,count=std::min((int)item.people.size(),(w-48)/KP);
+  const auto faint=mix(g_theme.panel_hi,g_theme.text_faint,(int)(255*frame.content_a));
+  for(int k=0;k<count;++k){const auto& person=item.people[k];const int kx=x+24+k*KP,px=kx+(KP-KD)/2;
+   if(person.image&&!person.id.empty())load_image("person:"+person.id,"/Items/"+encode(person.id)+"/Images/Primary?MaxWidth=200&Quality=85");
+   if(!(person.image&&draw_art_circle("person:"+person.id,px,KY,KD)))avatar(px,KY,KD);ring(px+KD/2,KY+KD/2,KD/2,g_theme.hairline);
+   const std::string name=fit_face(person.name,KP-6,13,TextFace::Classic),role=fit_face(person.role,KP-6,12,TextFace::Classic);
+   face_text(kx+(KP-face_text_width(name,13,TextFace::Classic))/2,KY+KD+6,name,ink,13,TextFace::Classic);
+   if(!role.empty())face_text(kx+(KP-face_text_width(role,12,TextFace::Classic))/2,KY+KD+24,role,faint,12,TextFace::Classic);}
+ }
  draw_hints(x+24,y+h-42,{{'X',is_container(item.base.type)?"Open":"Details"},{'T',"Close"},{'C',"Close"}},20);
 }
 
@@ -395,36 +407,103 @@ void draw_detail(const Item& item,const DetailView& view){
 void draw_player_osd(const PlayerOsd& osd){
  // Bottom scrim: transparent at y=459 to black 0.90 at 62% of its height.
  const int y0=459,h=HEIGHT-y0;for(int i=0;i<h;i+=2){int a=std::min(230,(int)(230.0f*i/(h*0.62f)));blend_rect(0,y0+i,WIDTH,2,0,a);}
- // Play / pause disc and the title beside it.
- const int d=50,bx=57,by=529;round_rect(bx,by,d,d,d/2,g_theme.accent,190,g_theme.white,70);
- const int cx=bx+d/2,cy=by+d/2;
- if(osd.paused||!osd.started){const int th=d*26/64,tw=th*7/8,tx=cx-tw/2+d/32,ty=cy-th/2;for(int r=0;r<th;++r){float f=(float)r/(th-1);int w=(int)((1.0f-fabsf(2.0f*f-1.0f))*tw+0.5f);if(w>0)rect(tx,ty+r,w,1,g_theme.white);}}
- else{const int bh=d*24/64,bw=d*7/64,gap=d*7/64;rect(cx-gap/2-bw,cy-bh/2,bw,bh,g_theme.white);rect(cx+gap/2,cy-bh/2,bw,bh,g_theme.white);}
- const int tx0=bx+d+20;face_text(tx0,by+(osd.subtitle.empty()?9:0),fit_face(osd.title,820,30,TextFace::Classic),g_theme.white,30,TextFace::Classic);
- if(!osd.subtitle.empty())face_text(tx0,by+36,fit_face(osd.subtitle,820,15,TextFace::Classic),0xC2C2C2,15,TextFace::Classic);
- // Read-only chips at the right: the playing audio and subtitle tracks.
+ // Play / pause disc and the title beside it. Live TV can't be paused: no
+ // disc, the title starts at the margin.
+ const int d=50,bx=57,by=529;
+ if(!osd.live){
+  // Focused (the PS3 HUD's default focus): a halo and the accent_alt border.
+  if(osd.control==OSD_PLAY)round_rect(bx-5,by-5,d+10,d+10,(d+10)/2,g_theme.accent,60);
+  round_rect(bx,by,d,d,d/2,g_theme.accent,190,osd.control==OSD_PLAY?g_theme.accent_alt:g_theme.white,osd.control==OSD_PLAY?255:70);
+  const int cx=bx+d/2,cy=by+d/2;
+  if(osd.paused||!osd.started){const int th=d*26/64,tw=th*7/8,tx=cx-tw/2+d/32,ty=cy-th/2;for(int r=0;r<th;++r){float f=(float)r/(th-1);int w=(int)((1.0f-fabsf(2.0f*f-1.0f))*tw+0.5f);if(w>0)rect(tx,ty+r,w,1,g_theme.white);}}
+  else{const int bh=d*24/64,bw=d*7/64,gap=d*7/64;rect(cx-gap/2-bw,cy-bh/2,bw,bh,g_theme.white);rect(cx+gap/2,cy-bh/2,bw,bh,g_theme.white);}
+ }
+ // The title stops short of the chips at the right.
+ const int tx0=osd.live?bx:bx+d+20;face_text(tx0,by+(osd.subtitle.empty()?9:0),fit_face(osd.title,580,30,TextFace::Classic),g_theme.white,30,TextFace::Classic);
+ if(!osd.subtitle.empty())face_text(tx0,by+36,fit_face(osd.subtitle,580,15,TextFace::Classic),0xC2C2C2,15,TextFace::Classic);
+ // The PS3 HUD's chips, right-aligned to x=1223, left to right: AUDIO,
+ // VOLUME, SUBTITLES, PICTURE. Volume and Picture are focus stops (Left /
+ // Right reach them, X uses them); focus is the accent_alt border with a soft
+ // accent halo. The volume slider opens above its chip while adjusting.
  int x=1223;const int chip_y=by+6;
- const std::string keys[]={T("SUBTITLES"),T("AUDIO")},values[]={osd.subtitles.empty()?T("Off"):osd.subtitles,osd.audio.empty()?T("Default"):osd.audio};
- for(int i=0;i<2&&!osd.audio_only;++i){std::string value=fit_face(values[i],240,15,TextFace::Classic);int w=std::max(face_text_width(keys[i],11,TextFace::Classic),face_text_width(value,15,TextFace::Classic))+28;x-=w;
-  round_rect(x,chip_y,w,42,9,0x0A0C18,184,g_theme.white,52);face_text(x+14,chip_y+5,keys[i],0x8A90B4,11,TextFace::Classic);face_text(x+14,chip_y+19,value,0xE4E6F0,15,TextFace::Classic);x-=10;}
+ {const std::string vol=std::to_string(osd.volume)+"%";
+  const std::string ckeys[4]={T("AUDIO"),T("VOLUME"),T("SUBTITLES"),T("PICTURE")};
+  const std::string cvalues[4]={fit_face(osd.audio.empty()?T("Default"):osd.audio,240,15,TextFace::Classic),vol,fit_face(osd.subtitles.empty()?T("Off"):osd.subtitles,240,15,TextFace::Classic),T(osd.picture.empty()?"Fit":osd.picture.c_str())};
+  const int slot[4]={-1,OSD_VOLUME,-1,OSD_PICTURE};
+  // PICTURE carries an icon left of its value: the screen, and the picture in
+  // it as Fit (bars above and below), Fill (all of it) or Stretch (arrows).
+  constexpr int ICON_W=20,ICON_H=13,ICON_GAP=8;
+  for(int i=3;i>=0&&!osd.audio_only;--i){const int icon=slot[i]==OSD_PICTURE?ICON_W+ICON_GAP:0;
+   int w=std::max(face_text_width(ckeys[i],11,TextFace::Classic),face_text_width(cvalues[i],15,TextFace::Classic)+icon)+28;if(slot[i]==OSD_VOLUME)w=std::max(w,76);x-=w;
+   const bool foc=slot[i]>=0&&osd.control==slot[i];
+   if(foc)round_rect(x-4,chip_y-4,w+8,50,13,g_theme.accent,46);
+   round_rect(x,chip_y,w,42,9,0x0A0C18,184,foc?g_theme.accent_alt:g_theme.white,foc?255:52);
+   face_text(x+14,chip_y+5,ckeys[i],foc?0xC9C3F2:0x8A90B4,11,TextFace::Classic);face_text(x+14+icon,chip_y+19,cvalues[i],foc?g_theme.white:0xE4E6F0,15,TextFace::Classic);
+   if(icon){const int ix=x+14,iy=chip_y+22;const uint32_t c=foc?g_theme.white:0xB8BCD0;
+    rect(ix,iy,ICON_W,1,c);rect(ix,iy+ICON_H-1,ICON_W,1,c);rect(ix,iy,1,ICON_H,c);rect(ix+ICON_W-1,iy,1,ICON_H,c);
+    if(osd.picture=="Fill")rect(ix+2,iy+2,ICON_W-4,ICON_H-4,foc?g_theme.accent_alt:c);
+    else if(osd.picture=="Stretch"){rect(ix+2,iy+2,ICON_W-4,ICON_H-4,foc?g_theme.accent_alt:c);for(int k=0;k<3;++k){rect(ix+3+k,iy+ICON_H/2-k,1,2*k+1,0x0A0C18);rect(ix+ICON_W-4-k,iy+ICON_H/2-k,1,2*k+1,0x0A0C18);}}
+    else rect(ix+2,iy+4,ICON_W-4,ICON_H-8,foc?g_theme.accent_alt:c);}
+   if(slot[i]==OSD_VOLUME&&osd.volume_active){
+    const int sx=x+w/2,bot=chip_y-14,th=90,tw=6,v=std::max(0,std::min(100,osd.volume)),fh=th*v/100;
+    round_rect(sx-22,bot-th-34,44,th+44,9,0x0A0C18,200,g_theme.white,40);
+    rect(sx-tw/2,bot-th,tw,th,0x5A5E70);if(fh>0)rect(sx-tw/2,bot-fh,tw,fh,g_theme.accent);
+    const std::string n=std::to_string(v);face_text(sx-face_text_width(n,13,TextFace::Classic)/2,bot-th-28,n,g_theme.white,13,TextFace::Classic);}
+   x-=10;}}
  // Progress bar and the times under it.
- const int px=57,py=628,pw=1223-57,ph=6;round_rect(px,py,pw,ph,3,g_theme.white,41);
+ // Live TV has nothing to scrub: no track, just the LIVE badge below.
+ const int px=57,py=628,pw=1223-57,ph=6;if(!osd.live)round_rect(px,py,pw,ph,3,g_theme.white,41);
  const uint64_t shown=osd.scrubbing?osd.target:osd.position;int fill=0;
  if(!osd.live&&osd.duration)fill=(int)(pw*std::min(1.0,(double)shown/osd.duration));
  if(fill>0)round_rect(px,py,fill,ph,3,g_theme.accent,255);
+ // Focused: the knob on the playhead in a soft accent halo (Left / Right scrub).
+ if(osd.control==OSD_SCRUB&&!osd.live&&!osd.scrubbing){circle(px+fill,py+ph/2,13,g_theme.accent,70);circle(px+fill,py+ph/2,7,g_theme.white,255);}
  if(osd.scrubbing&&!osd.live){circle(px+fill,py+ph/2,7,g_theme.white,255);std::string at=clock_text(osd.target);int w=face_text_width(at,16,TextFace::Classic)+20,lx=std::max(px,std::min(px+pw-w,px+fill-w/2));round_rect(lx,py-38,w,26,6,0x0A0C18,210,g_theme.accent_alt,200);face_text(lx+10,py-34,at,g_theme.white,16,TextFace::Classic);}
  if(osd.live){int w=face_text_width(T("LIVE"),12,TextFace::Classic)+16;round_rect(px,644,w,18,9,0xD8344A,235);face_text(px+8,646,T("LIVE"),g_theme.white,12,TextFace::Classic);}
  else{face_text(px,644,clock_text(shown),0xE0E0E0,15,TextFace::Classic);if(osd.duration){const uint64_t left=osd.duration>shown?osd.duration-shown:0;std::string rem="-"+clock_text(left),end=ends_at(left);const int rw=face_text_width(rem,15,TextFace::Classic);face_text(px+pw-rw,644,rem,0xE0E0E0,15,TextFace::Classic);face_text(px+pw-rw-20-face_text_width(end,15,TextFace::Classic),644,end,0x9A9EB4,15,TextFace::Classic);}}
  // Hints: what X does, seeking, stop and hide.
- if(osd.live)draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'l',"Picture"},{'C',"Stop"},{'S',"Hide"}});
- else draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'D',"Seek 10s"},{'L',""},{'R',"Skip 5 min"},{'l',"Picture"},{'C',"Stop"},{'S',"Hide"}});
+ // X does what the focused control does; Left / Right move the focus, or
+ // scrub when the bar itself is focused.
+ const char* scrub_hint=osd.control==OSD_SCRUB?"Scrub":"Select";
+ const char* act=osd.control==OSD_VOLUME?"Volume":osd.control==OSD_PICTURE?"Picture":osd.paused?"Play":"Pause";
+ if(osd.volume_active&&!osd.live)draw_hints(57,680,{{'D',"Volume"},{'C',"Done"}});
+ else if(osd.live){
+  if(!osd.up_next.empty()){const std::string next=std::string(T("NEXT CHANNEL"))+"  ";const std::string name=fit_face(osd.up_next,360,15,TextFace::Classic);const int w=face_text_width(next,12,TextFace::Classic),nw=face_text_width(name,15,TextFace::Classic);
+   face_text(1223-nw-w,662,next,g_theme.accent_alt,12,TextFace::Classic);face_text(1223-nw,659,name,0xE0E0E0,15,TextFace::Classic);}
+  // Nothing to pause or seek: Up / Down are the volume, X opens Picture.
+  if(osd.has_prev||osd.has_next)draw_hints(57,680,{{'D',"Volume"},{'X',"Picture"},{'l',""},{'r',"Channel"},{'C',"Stop"},{'S',"Hide"}});
+  else draw_hints(57,680,{{'D',"Volume"},{'X',"Picture"},{'C',"Stop"},{'S',"Hide"}});}
+ // A series: L1 / R1 are the previous and next episodes.
+ else if(osd.has_prev||osd.has_next){
+  if(!osd.up_next.empty()){const std::string next=std::string(T("UP NEXT"))+"  ";const int w=face_text_width(next,12,TextFace::Classic),nw=face_text_width(fit_face(osd.up_next,360,15,TextFace::Classic),15,TextFace::Classic);
+   face_text(1223-nw-w,662,next,g_theme.accent_alt,12,TextFace::Classic);face_text(1223-nw,659,fit_face(osd.up_next,360,15,TextFace::Classic),0xE0E0E0,15,TextFace::Classic);}
+  if(osd.has_prev&&osd.has_next)draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'l',"Previous"},{'r',"Next"},{'C',"Stop"}});
+  else if(osd.has_next)draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'r',"Next episode"},{'C',"Stop"}});
+  else draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'l',"Previous episode"},{'C',"Stop"}});}
+ else draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'C',"Stop"},{'S',"Hide"}});
+}
+void draw_skip_button(const std::string& label,bool button){
+ // Above the bar's chips, so it reads with the bar up or away.
+ const int tw=face_text_width(label,18,TextFace::Classic),gw=button?hints_width({{'T',""}})+6:0,w=tw+gw+40,h=44,x=1223-w,y=462;
+ round_rect(x,y,w,h,h/2,0x0A0C18,215,button?g_theme.accent_alt:g_theme.white,button?255:50);
+ if(button)draw_hints(x+18,y+(h-18)/2,{{'T',""}});
+ face_text(x+20+gw,y+(h-18)/2-2,label,g_theme.white,18,TextFace::Classic);
 }
 void draw_picture_banner(const std::string& state,bool moving){
  constexpr int W=900,H=96,X=(WIDTH-W)/2,Y=40;
  round_rect(X,Y,W,H,12,0x0A0C18,215,g_theme.white,40);
  face_text(X+(W-face_text_width(state,19,TextFace::Classic))/2,Y+18,state,g_theme.white,19,TextFace::Classic);
- const int hw=hints_width({{'D',moving?"Move":"Size"},{'r',moving?"Size":"Move"},{'S',"Fit / Fill / Stretch"},{'T',"Reset"},{'C',"Done"}});
- draw_hints(X+(W-hw)/2,Y+58,{{'D',moving?"Move":"Size"},{'r',moving?"Size":"Move"},{'S',"Fit / Fill / Stretch"},{'T',"Reset"},{'C',"Done"}});
+ const int hw=hints_width({{'D',moving?"Move":"Size"},{'r',moving?"Size":"Move"},{'S',"Fit / Fill / Stretch"},{'T',"Hold: Reset"},{'C',"Done"}});
+ draw_hints(X+(W-hw)/2,Y+58,{{'D',moving?"Move":"Size"},{'r',moving?"Size":"Move"},{'S',"Fit / Fill / Stretch"},{'T',"Hold: Reset"},{'C',"Done"}});
+}
+void draw_volume_banner(int volume){
+ constexpr int W=520,H=80,X=(WIDTH-W)/2,Y=40,BX=X+40,BW=W-80;
+ round_rect(X,Y,W,H,12,0x0A0C18,215,g_theme.white,40);
+ const std::string label=std::string(T("Volume"))+"   "+std::to_string(volume)+"%";
+ face_text(X+(W-face_text_width(label,19,TextFace::Classic))/2,Y+16,label,g_theme.white,19,TextFace::Classic);
+ round_rect(BX,Y+52,BW,6,3,g_theme.white,41);
+ const int fill=BW*std::max(0,std::min(100,volume))/100;if(fill>0)round_rect(BX,Y+52,fill,6,3,g_theme.accent,255);
+ circle(BX+fill,Y+55,7,g_theme.white,255);
 }
 
 // ---- music: Now Playing (PS3 music_screen.cpp) -----------------------------------
@@ -536,8 +615,8 @@ void draw_music_screen(const PlayerOsd& osd,const float* bands,int count,const f
  // Which visualizer Square has just chosen.
  if(osd.viz_toast){const std::string label=std::string(T("Visualizer"))+": "+T(music_viz_name(osd.viz));const int w=face_text_width(label,18,TextFace::Classic)+40;
   round_rect((WIDTH-w)/2,30,w,40,20,0x0A0C18,215,g_theme.accent,120);face_text((WIDTH-face_text_width(label,18,TextFace::Classic))/2,40,label,g_theme.white,18,TextFace::Classic);}
- if(osd.tracks>1)draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'D',"Seek 10s"},{'l',"Previous"},{'r',"Next"},{'S',"Visualizer"},{'C',"Stop"}});
- else draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'D',"Seek 10s"},{'L',""},{'R',"Skip 5 min"},{'S',"Visualizer"},{'C',"Stop"}});
+ if(osd.tracks>1)draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'D',"Seek / Volume"},{'l',"Previous"},{'r',"Next"},{'S',"Visualizer"},{'C',"Stop"}});
+ else draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'D',"Seek / Volume"},{'L',""},{'R',"Skip 5 min"},{'S',"Visualizer"},{'C',"Stop"}});
 }
 
 // ---- settings (PS3 ui_settings.cpp) ------------------------------------------------
@@ -576,12 +655,14 @@ void draw_settings_rows(const SettingsCategoryView& category,const std::vector<S
  const int fit=(DESC_Y-8-TOP)/(ROW+GAP),first=std::max(0,std::min(selected-fit+1,(int)rows.size()-fit));
  for(int k=first;k<(int)rows.size()&&k<first+fit;++k){const auto& r=rows[k];const bool on=k==selected;const int y=TOP+(k-first)*(ROW+GAP);
   if(on){rect(SET_X,y,SET_W,ROW,g_theme.panel_hi);rect(SET_X-5,y,3,ROW,g_theme.accent);}
+  // The row being moved: lifted, in the accent, with arrows above and below its name.
+  if(r.held){outline(SET_X,y,SET_W,ROW,g_theme.accent_alt,2);face_text(SET_X+SET_W/2+40,y+11,"\xE2\x86\x95",g_theme.accent_alt,20,TextFace::Classic);}
   const uint32_t ink=r.dim?g_theme.text_faint:on?g_theme.white:g_theme.text;
   face_text(SET_X+20,y+13,fit_face(r.label,SET_W/2,18,TextFace::Classic),ink,18,TextFace::Classic);
   if(r.action)face_text(SET_X+SET_W-36,y+(ROW-28)/2,"\xE2\x80\xBA",on?g_theme.accent:g_theme.text_faint,28,TextFace::Classic);
   else{const std::string v=fit_face(r.value,SET_W/2-40,17,TextFace::Classic);const uint32_t vc=r.dim?g_theme.text_faint:r.lit?g_theme.accent_alt:g_theme.text_dim;
    // Left / Right change it: arrows either side of the highlighted value.
-   const bool arrows=on&&!r.dim;const int vw=face_text_width(v,17,TextFace::Classic),vx=SET_X+SET_W-(arrows?44:20)-vw;face_text(vx,y+14,v,vc,17,TextFace::Classic);
+   const bool arrows=on&&!r.dim&&!r.reorder;const int vw=face_text_width(v,17,TextFace::Classic),vx=SET_X+SET_W-(arrows?44:20)-vw;face_text(vx,y+14,v,vc,17,TextFace::Classic);
    if(arrows){face_text(vx-22,y+11,"\xE2\x80\xB9",g_theme.text_dim,22,TextFace::Classic);face_text(SET_X+SET_W-30,y+11,"\xE2\x80\xBA",g_theme.text_dim,22,TextFace::Classic);}}}
  // What the highlighted setting does, in two lines.
  rect(SET_X,DESC_Y,SET_W,DESC_H,g_theme.panel);outline(SET_X,DESC_Y,SET_W,DESC_H,g_theme.hairline,1);rect(SET_X,DESC_Y,3,DESC_H,g_theme.accent);
@@ -589,7 +670,10 @@ void draw_settings_rows(const SettingsCategoryView& category,const std::vector<S
   face_text(SET_X+22,DESC_Y+16,fit_face(d.substr(0,nl),SET_W-44,16,TextFace::Classic),g_theme.text_dim,16,TextFace::Classic);
   if(nl!=std::string::npos)face_text(SET_X+22,DESC_Y+42,fit_face(d.substr(nl+1),SET_W-44,16,TextFace::Classic),g_theme.text_dim,16,TextFace::Classic);}
  const bool action=selected>=0&&selected<(int)rows.size()&&rows[selected].action;
- if(action)hint_bar({{'D',"Select"},{'X',"Open"},{'C',"Back"}});else hint_bar({{'D',"Select / change"},{'X',"Change"},{'C',"Back"}});
+ const SettingsRowView* sel=selected>=0&&selected<(int)rows.size()?&rows[selected]:nullptr;
+ if(sel&&sel->reorder&&sel->held)hint_bar({{'D',"Move"},{'X',"Put down"},{'C',"Done"}});
+ else if(sel&&sel->reorder)hint_bar({{'D',"Select"},{'X',"Move"},{'T',"Default order"},{'C',"Done"}});
+ else if(action)hint_bar({{'D',"Select"},{'X',"Open"},{'C',"Back"}});else hint_bar({{'D',"Select / change"},{'X',"Change"},{'C',"Back"}});
 }
 void draw_confirm(const std::string& question,const std::string& detail,const char* yes){
  blend_rect(0,0,WIDTH,HEIGHT,0,150);constexpr int W=560,H=150,X=(WIDTH-W)/2,Y=250;
@@ -617,6 +701,14 @@ enum AboutKind { A_HEAD, A_VER, A_ITEM, A_NAME, A_TEXT, A_GAP };
 struct AboutLine { AboutKind kind; const char* a; const char* b; };
 // Updates: the PS4 releases, newest first. Add each new release at the top.
 const AboutLine about_updates[]={
+ {A_VER,"1.11",nullptr},
+ {A_ITEM,"TV shows play on to the next episode, across seasons; L1 / R1 skip episodes.",nullptr},
+ {A_ITEM,"Skip Intros and Skip Credits, with markers from the server (Intro Skipper).",nullptr},
+ {A_ITEM,"Player bar as on the PS3: Left / Right scrub; Up for Volume and Picture.",nullptr},
+ {A_ITEM,"Live TV: L1 / R1 change channel, a guide on the PS4, reconnects by itself.",nullptr},
+ {A_ITEM,"Quick peek shows the cast; Home Order; Share Sign-in.",nullptr},
+ {A_ITEM,"The controller's light bar takes the theme's colour.",nullptr},
+ {A_ITEM,"Fixes: empty albums, films listed twice, theme cycling, Live TV crashes.",nullptr},
  {A_VER,"1.10",nullptr},
  {A_ITEM,"Starts in about 4 seconds; every screen and animation is smooth.",nullptr},
  {A_ITEM,"Direct play: H264 in MP4, MKV and MOV, and most music, start in 1-3 seconds.",nullptr},

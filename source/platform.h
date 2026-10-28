@@ -32,10 +32,14 @@ bool player_has_audio();
 bool player_loaded();
 // mono_ms() of the newest video frame (0 before the first).
 uint64_t player_last_frame_ms();
+// Load `url` again in the open player (Live TV's reconnect), not a new one.
+bool player_reload(const std::string& url);
 double player_cache_seconds();
 // The picture: aspect 0 Fit, 1 Fill, 2 Stretch; width / height in percent of
 // the fitted picture; x / y shift in half-percents of the screen (+ right, up).
 void player_picture(int aspect,int w,int h,int x,int y);
+// The volume, 0..100.
+void player_volume(int volume);
 std::string player_error();
 void player_pause(bool);
 void player_seek(uint64_t ms);

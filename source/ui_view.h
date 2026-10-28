@@ -49,10 +49,18 @@ void request_detail_art(const Item& item);
 void draw_detail(const Item& item,const DetailView& view);
 
 // Player on-screen display (PS3 player HUD v3).
-struct PlayerOsd { std::string title,subtitle,audio,subtitles,album,art,up_next; int track=0,tracks=0,viz=0; bool viz_toast=false; uint64_t position=0,duration=0,target=0; bool paused=false,live=false,scrubbing=false,started=false,audio_only=false; };
+// control: the bar's focused control, in screen order (PS3 HUD), -1 none;
+// volume_active: its slider is open. picture: Fit / Fill / Stretch; volume 0..100.
+enum OsdControl { OSD_PLAY, OSD_VOLUME, OSD_PICTURE, OSD_CONTROLS, OSD_SCRUB=16 };
+struct PlayerOsd { std::string title,subtitle,audio,subtitles,album,art,up_next,picture; int track=0,tracks=0,viz=0,control=-1,volume=100; bool volume_active=false; bool viz_toast=false; uint64_t position=0,duration=0,target=0; bool paused=false,live=false,scrubbing=false,started=false,audio_only=false,has_prev=false,has_next=false; };
 void draw_player_osd(const PlayerOsd& osd);
 // The L1 picture mode's banner: what it is set to, and the buttons.
 void draw_picture_banner(const std::string& state,bool moving);
+// "Skip Intro" / "Next Episode" over the picture's lower right, with the
+// Triangle glyph when it is a button (else a notice: "Intro skipped").
+void draw_skip_button(const std::string& label,bool button);
+// Music's volume popup: the level as a bar, shown a moment after Up / Down.
+void draw_volume_banner(int volume);
 // Now Playing for music: the cover, a visualizer, the artist and album, and
 // the progress bar. `bands` are 0..1 levels; `wave` the newest sound (-1..1).
 // The visualizer is osd.viz (Square cycles them); osd.viz_toast names it.
@@ -80,7 +88,9 @@ enum SettingsIcon { SICON_PLAYBACK, SICON_DISPLAY, SICON_ACCOUNT, SICON_SYSTEM }
 struct SettingsCategoryView { std::string label,summary; SettingsIcon icon=SICON_SYSTEM; };
 // lit: the value is "on" (drawn in the accent); dim: the row does nothing now;
 // action: X opens or does something (a chevron instead of a value).
-struct SettingsRowView { std::string label,value,description; bool lit=false,dim=false,action=false; };
+// reorder: a row of a list being put in order (Home Order); held: it is the
+// one being moved.
+struct SettingsRowView { std::string label,value,description; bool lit=false,dim=false,action=false,reorder=false,held=false; };
 void draw_settings_categories(const std::vector<SettingsCategoryView>& categories,int selected,const std::string& account,const std::string& footer);
 void draw_settings_rows(const SettingsCategoryView& category,const std::vector<SettingsRowView>& rows,int selected);
 // A yes / no question over the current frame.

@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <pthread.h>
+#include <atomic>
 
 // The PS3's numbers (music_fft.cpp): 2048 points keep 23 Hz bins, so the
 // bass bands do not collapse onto one bin.
@@ -114,8 +115,12 @@ static SDL_AudioCallback mpv_callback=nullptr;
 static void* mpv_userdata=nullptr;
 static SDL_AudioFormat tap_format=0x8010;  // AUDIO_S16LSB
 static int tap_channels=2;
+static std::atomic<uint64_t> last_sound_ms{0};
+uint64_t audio_last_sound_ms(){return last_sound_ms;}
 static void tap_callback(void* userdata,Uint8* stream,int len){
  (void)userdata;if(mpv_callback)mpv_callback(mpv_userdata,stream,len);else memset(stream,0,len);
+ // MPV fills an underrun with zeros: any other byte is sound.
+ for(int i=0;i<len;i+=16)if(stream[i]){last_sound_ms=mono_ms();break;}
  const int bytes=SDL_AUDIO_BITSIZE(tap_format)/8,frame=bytes*tap_channels;if(frame<=0)return;
  float lr[512*2];int frames=len/frame,done=0;
  while(done<frames){

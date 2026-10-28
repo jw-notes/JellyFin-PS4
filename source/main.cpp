@@ -10,6 +10,7 @@
 #include "boot_anim.h"
 #include "screensaver.h"
 #include "livetv_view.h"
+#include "guide.h"
 #include "api_userdata.h"
 #include "buffering.h"
 #include "music_viz.h"
@@ -51,25 +52,45 @@ static void about_screen(){
 // The PS3's two levels: categories, then a category's rows. Each row is
 // English at its use (translated when drawn); its value, X and Left / Right
 // are the switches below.
-enum SettingSection { SEC_PLAYBACK, SEC_DISPLAY, SEC_ACCOUNT, SEC_SYSTEM, SEC__COUNT };
-enum SettingId { SET_QUALITY, SET_HD1080, SET_RESUME, SET_METHOD, SET_THEME, SET_LANGUAGE, SET_SAVER, SET_SAVER_DELAY, SET_SIGN_OUT, SET_UPDATE, SET_ABOUT, SET_DEBUG, SET_EXIT };
+// Home's My Media (and its Latest rows) in order: the viewer's own (Settings ›
+// Home Order), else Live TV, Films, Shows, then the rest -- Music and others --
+// as the server sends them. Libraries the saved order does not name (added
+// since) follow it in that default order.
+static void order_libraries(std::vector<Item>& libraries){
+ auto rank=[](const Item& l){return l.collection=="livetv"?0:l.collection=="movies"?1:l.collection=="tvshows"?2:3;};
+ std::stable_sort(libraries.begin(),libraries.end(),[&](const Item& a,const Item& b){return rank(a)<rank(b);});
+ if(settings.home_order.empty())return;
+ auto place=[](const Item& l){const auto at=(","+settings.home_order+",").find(std::string(",")+l.base.id+",");return at==std::string::npos?std::string::npos:at;};
+ std::stable_sort(libraries.begin(),libraries.end(),[&](const Item& a,const Item& b){return place(a)<place(b);});
+}
+// Settings changed Home's order: load it again.
+static bool home_dirty=false;
+enum SettingSection { SEC_PLAYBACK, SEC_LIVETV, SEC_DISPLAY, SEC_ACCOUNT, SEC_SYSTEM, SEC__COUNT };
+enum SettingId { SET_QUALITY, SET_HD1080, SET_RESUME, SET_SKIP_INTRO, SET_SKIP_OUTRO, SET_METHOD, SET_GUIDE_UPDATE, SET_GUIDE_AUTO, SET_GUIDE_URL, SET_SHARE, SET_THEME, SET_LANGUAGE, SET_HOME_ORDER, SET_SAVER, SET_SAVER_DELAY, SET_SIGN_OUT, SET_UPDATE, SET_ABOUT, SET_DEBUG, SET_EXIT };
 struct SettingDef { SettingId id; SettingSection section; const char* label; const char* description; bool action; };
 static const SettingDef SETTING_ROWS[]={
  {SET_QUALITY,SEC_PLAYBACK,"Quality","The highest bitrate the server streams at. Lower it if playback\nstops to buffer; raise it for a sharper picture on a fast network.",false},
  {SET_HD1080,SEC_PLAYBACK,"1080p Playback (Alpha)","Ask the server for full 1920x1080 video instead of 720p.\nSharper, but needs more bandwidth. Still experimental.",false},
  {SET_RESUME,SEC_PLAYBACK,"Resume playback","Start films and episodes where you left off.\nOff always plays them from the beginning.",false},
+ {SET_SKIP_INTRO,SEC_PLAYBACK,"Skip Intros","Films and shows: Auto jumps past the intro; Button shows Skip Intro (Triangle).\nNeeds intro markers on the server (Jellyfin 10.10+, e.g. Intro Skipper).",false},
+ {SET_SKIP_OUTRO,SEC_PLAYBACK,"Skip Credits","Shows: at the credits, Auto goes on to the next episode; Button shows\nSkip to Next Episode (Triangle). Needs credits markers on the server.",false},
  {SET_METHOD,SEC_PLAYBACK,"Playback method","Auto plays files the PS4 can decode straight from the server, and has the\nserver convert the rest. Always transcode converts everything (slower to start).",false},
+ {SET_GUIDE_UPDATE,SEC_LIVETV,"Update Guide","",true},
+ {SET_GUIDE_AUTO,SEC_LIVETV,"Auto-Update Guide","At launch, update the guide in the background when it is over 12 hours old.\nOff: only Update Guide does.",false},
+ {SET_GUIDE_URL,SEC_LIVETV,"Guide Address","",true},
  {SET_THEME,SEC_DISPLAY,"Theme","The interface colour theme.\nJellywave is the default; extra .ini themes appear here too.",false},
  {SET_LANGUAGE,SEC_DISPLAY,"Language","The language the menus are shown in.\nAuto follows the PS4's own language setting.",false},
+ {SET_HOME_ORDER,SEC_DISPLAY,"Home Order","The order of your libraries on Home. Default: Live TV, Films, Shows,\nthen the rest. X to put them in your own order.",true},
  {SET_SAVER,SEC_DISPLAY,"Screensaver","After a few idle minutes, Artwork fills the screen with backdrops\nfrom Home. Off never starts it.",false},
  {SET_SAVER_DELAY,SEC_DISPLAY,"Screensaver Delay","How long the menus wait, untouched, before the screensaver\nstarts: 30 seconds to 30 minutes.",false},
+ {SET_SHARE,SEC_ACCOUNT,"Share Sign-in","On: this console's users with no sign-in of their own use this account.\nOne account can be shared; users signed in to their own keep it.",false},
  {SET_SIGN_OUT,SEC_ACCOUNT,"Log Out","Sign out of this Jellyfin account.\nYou will need to log in again to browse your library.",true},
  {SET_UPDATE,SEC_SYSTEM,"Software Update","Checked at every launch. X checks again, and downloads a new version\nto /data/pkg when there is one; install it from the Package Installer.",true},
  {SET_ABOUT,SEC_SYSTEM,"About","The version, who made the app, and the licences of\neverything in it.",true},
  {SET_DEBUG,SEC_SYSTEM,"Debug Logging","Write a diagnostic log to /data/JellyFin-PS4-logs (never passwords\nor tokens). Turn it on when reporting a problem.",false},
  {SET_EXIT,SEC_SYSTEM,"Exit application","Close Jellyfin [PS] and return to the PS4 home screen.",true},
 };
-static const struct { const char* label; SettingsIcon icon; } SETTING_SECTIONS[SEC__COUNT]={{"Playback",SICON_PLAYBACK},{"Display",SICON_DISPLAY},{"Account",SICON_ACCOUNT},{"System",SICON_SYSTEM}};
+static const struct { const char* label; SettingsIcon icon; } SETTING_SECTIONS[SEC__COUNT]={{"Playback",SICON_PLAYBACK},{"Live TV",SICON_PLAYBACK},{"Display",SICON_DISPLAY},{"Account",SICON_ACCOUNT},{"System",SICON_SYSTEM}};
 static std::vector<const SettingDef*> section_rows(int section){std::vector<const SettingDef*> rows;for(const auto& r:SETTING_ROWS)if(r.section==section)rows.push_back(&r);return rows;}
 static SettingsCategoryView section_view(int section){
  SettingsCategoryView v;v.label=T(SETTING_SECTIONS[section].label);v.icon=SETTING_SECTIONS[section].icon;
@@ -82,6 +103,21 @@ static SettingsRowView setting_view(const SettingDef& r){
  case SET_QUALITY:v.value=TF("%d Mbps",settings.bitrate/1000000);break;
  case SET_HD1080:v.value=T(settings.hd1080?"On":"Off");v.lit=settings.hd1080;break;
  case SET_RESUME:v.value=T(settings.resume?"On":"Off");v.lit=settings.resume;break;
+ // The guide: its state under Update Guide, its address under Guide Address.
+ case SET_GUIDE_UPDATE:v.description=guide_status()+"\n"+T("X downloads the guide now. Anyone signed in can update it.");break;
+ case SET_GUIDE_AUTO:v.value=T(settings.guide_auto?"On":"Off");v.lit=settings.guide_auto;break;
+ case SET_SHARE:{const int s=share_state();
+  v.value=T(s==SHARE_MINE?"On":s==SHARE_USING?"Shared with you":s==SHARE_OTHER?"Another account is shared":"Off");v.lit=s==SHARE_MINE;v.dim=s==SHARE_USING||s==SHARE_OTHER;
+  if(s==SHARE_USING)v.description=std::string(T("You are using an account another user of this console shares."))+"\n"+T("Log Out, then sign in, to use your own.");
+  if(s==SHARE_OTHER)v.description=std::string(T("Another user of this console already shares their account."))+"\n"+T("They can turn it off in their Settings; one account can be shared.");
+  break;}
+ case SET_GUIDE_URL:{bool playlist=false;const std::string a=guide_address(&playlist);
+  v.description=a.empty()?std::string(T("Not set. Taken from your playlist when it names its guide (url-tvg);"))+"\n"+T("X to enter an XMLTV address (.xml or .xml.gz) yourself."):
+   std::string(T(playlist?"From your playlist:":"Entered:"))+" "+a+"\n"+T("X to change it; clear it to use the playlist's own guide.");break;}
+ case SET_SKIP_INTRO:case SET_SKIP_OUTRO:{
+  // Greyed out, and fixed, when the server has nothing to mark them with.
+  if(segments_supported()==0){v.value=T("Not on server");v.dim=true;v.description=T("Your Jellyfin server has no intro / credits markers. Install the Intro Skipper\nplugin (Jellyfin 10.10+), then scan the library, to use this.");break;}
+  const int s=r.id==SET_SKIP_INTRO?settings.skip_intro:settings.skip_outro;v.value=T(s==SKIP_AUTO?"Auto":s==SKIP_BUTTON?"Button":"Off");v.lit=s==SKIP_AUTO;break;}
  case SET_METHOD:v.value=T(settings.method==PLAY_DIRECT_FILE?"Direct file":settings.method==PLAY_TRANSCODE?"Always transcode":"Auto");break;
  case SET_THEME:v.value=theme_current_name();break;
  case SET_LANGUAGE:v.value=language_label();break;
@@ -99,6 +135,11 @@ static bool setting_step(SettingId id,int dir){
  case SET_QUALITY:{const int rates[]={2000000,4000000,8000000,12000000,20000000};int n=0;for(int i=0;i<5;i++)if(rates[i]==settings.bitrate)n=i;settings.bitrate=rates[(n+dir+5)%5];break;}
  case SET_HD1080:settings.hd1080=!settings.hd1080;break;
  case SET_RESUME:settings.resume=!settings.resume;break;
+ case SET_GUIDE_AUTO:settings.guide_auto=!settings.guide_auto;break;
+ // Kept beside the users' folders, not in settings.json.
+ case SET_SHARE:return share_set(share_state()!=SHARE_MINE);
+ case SET_SKIP_INTRO:if(segments_supported()==0)return false;settings.skip_intro=(settings.skip_intro+dir+3)%3;break;
+ case SET_SKIP_OUTRO:if(segments_supported()==0)return false;settings.skip_outro=(settings.skip_outro+dir+3)%3;break;
  case SET_METHOD:settings.method=(settings.method+dir+3)%3;break;
  case SET_THEME:theme_step(dir);return true;   // the theme keeps its own file
  case SET_LANGUAGE:language_step(dir);break;
@@ -142,13 +183,40 @@ static void update_screen(const std::function<void()>& under){
   }
  }
 }
+// Settings › Home Order: the libraries in their Home order. X picks one up,
+// Up / Down carry it, X puts it down; Triangle (after a question) goes back
+// to the default order. Each change is saved as it is made.
+static void home_order_screen(){
+ UiInputScope input_scope;notice("Loading libraries...");
+ Page views;if(!fetch_page("",0,"",0,views)){error_screen();return;}
+ std::vector<Item> libs=views.items;order_libraries(libs);
+ const int n=(int)libs.size();if(!n)return;
+ SettingsCategoryView category;category.label=T("Home Order");category.icon=SICON_DISPLAY;
+ int row=0,held=-1;wait_release();
+ auto save=[&]{std::string order;for(const auto& l:libs){if(!order.empty())order+=",";order+=l.base.id;}settings.home_order=order;
+  if(!save_settings()){last_error=T("Unable to save settings");error_screen();}home_dirty=true;};
+ auto views_of=[&]{std::vector<SettingsRowView> rows;
+  for(int i=0;i<n;++i){SettingsRowView v;v.label=libs[i].base.name;v.value=std::to_string(i+1);v.reorder=true;v.held=held==i;v.lit=held==i;
+   v.description=held>=0?T("Up / Down move it; X puts it down here."):T("X picks a library up to move it. Triangle puts back the default order:\nLive TV, Films, Shows, then the rest.");rows.push_back(v);}
+  return rows;};
+ for(;;){
+  const auto rows=views_of();draw_settings_rows(category,rows,row);present();const auto b=press();
+  const int dir=(b&ORBIS_PAD_BUTTON_UP)?-1:(b&ORBIS_PAD_BUTTON_DOWN)?1:0;
+  if(dir&&held>=0){const int to=row+dir;if(to>=0&&to<n){std::swap(libs[row],libs[to]);row=held=to;}}
+  else if(dir)row=(row+dir+n)%n;
+  if(b&ORBIS_PAD_BUTTON_CROSS){if(held<0)held=row;else{held=-1;save();}}
+  if((b&ORBIS_PAD_BUTTON_TRIANGLE)&&held<0&&confirm("Use the default order?","Live TV, Films, Shows, then your other libraries.","Default order",[&]{draw_settings_rows(category,rows,row);})){
+   settings.home_order.clear();libs=views.items;order_libraries(libs);if(!save_settings()){last_error=T("Unable to save settings");error_screen();}home_dirty=true;}
+  if(b&ORBIS_PAD_BUTTON_CIRCLE){if(held>=0){held=-1;save();}wait_release();return;}
+ }
+}
 // Returns the tab L1 / R1 asked for (0 Home, 1 Search), else -1.
 static int settings_screen(){
  UiInputScope input_scope;int section=-1,category=0,row=0;wait_release();
  for(;;){
   if(section<0){
    std::vector<SettingsCategoryView> categories;for(int i=0;i<SEC__COUNT;++i)categories.push_back(section_view(i));
-   const std::string account=std::string(T("Account"))+": "+(g_username[0]?g_username:T("(unknown)"))+"  \xC2\xB7  "+(g_server[0]?g_server:T("(no server)"));
+   const std::string account=std::string(T("Account"))+": "+(g_username[0]?g_username:T("(unknown)"))+(g_session_shared?std::string(" (")+T("shared")+")":"")+"  \xC2\xB7  "+(g_server[0]?g_server:T("(no server)"));
    std::string version=JF_BUILD_VERSION;if(version.size()>1&&version[0]=='0')version.erase(0,1);
    draw_settings_categories(categories,category,account,TF("JellyFin [PS] %s \xC2\xB7 built %s",version.c_str(),__DATE__));present();
    const auto b=press();if(b&ORBIS_PAD_BUTTON_L1)return 1;if(b&ORBIS_PAD_BUTTON_R1)return 0;
@@ -169,6 +237,11 @@ static int settings_screen(){
   if(b&ORBIS_PAD_BUTTON_CROSS){
    if(!d.action){setting_step(d.id,1);continue;}
    if(d.id==SET_ABOUT){about_screen();wait_release();}
+   if(d.id==SET_HOME_ORDER){home_order_screen();wait_release();}
+   if(d.id==SET_GUIDE_UPDATE)guide_update_now();
+   if(d.id==SET_GUIDE_URL){std::string url=settings.guide_url;
+    if(keyboard(T("Guide address (XMLTV)"),url,false,KeyboardType::Url)){while(!url.empty()&&url.back()==' ')url.pop_back();settings.guide_url=url;save_settings();guide_update_now();}
+    wait_release();}
    if(d.id==SET_UPDATE){if(update_state()==UPD_AVAILABLE)update_screen([&]{draw_settings_rows(category_view,rows,row);});else update_check_start();}
    if(d.id==SET_SIGN_OUT&&confirm("Log out of this account?","You'll need to sign in again to browse your library.","Log Out",[&]{draw_settings_rows(category_view,rows,row);})){facts_stop();art_stop();page_cache_stop();livetv_stop();logout();return -1;}
    if(d.id==SET_EXIT){running=false;return -1;}
@@ -188,9 +261,10 @@ static int search_screen(std::string& query){
 // How playback ended: stopped (Circle, an error), the end of the stream, or a
 // skip to the next / previous track of an album.
 enum PlayEnd { PLAY_STOPPED, PLAY_ENDED, PLAY_NEXT, PLAY_PREVIOUS };
-// Where a track sits in its album, for the Now Playing screen.
-struct MusicQueue { int track=0,tracks=0; std::string up_next; };
-static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,const std::string& audio_label="",const std::string& subtitle_label="",const MusicQueue* queue=nullptr){
+// Where a track sits in its album (the Now Playing screen), or an episode in
+// its series: what comes next, and whether L1 / R1 can go back or on.
+struct PlayQueue { int track=0,tracks=0; bool has_prev=false,has_next=false; std::string up_next; };
+static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,const std::string& audio_label="",const std::string& subtitle_label="",const PlayQueue* queue=nullptr){
  UiInputScope input_scope;ScreensaverInhibit no_saver;++play_generation;page_cache_clear();std::string url,session,source_id;
  const bool live=!strcmp(item.base.type,"TvChannel"),audio_only=!strcmp(item.base.type,"Audio");
  // The PS3 player HUD: title, play state, progress and times. Left/Right move
@@ -200,13 +274,26 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
  if(!strcmp(item.base.type,"Episode")&&!item.series.empty()){osd.title=item.series;char code[32]="";if(item.episode)snprintf(code,sizeof code,"S%d:E%d - ",item.season,item.episode);osd.subtitle=code+std::string(item.base.name);}
  else if(audio_only){osd.title=item.base.name;osd.subtitle=item.artist;osd.album=item.album;if(item.year)osd.album+=(osd.album.empty()?"":"  \xC2\xB7  ")+std::to_string(item.year);if(queue){osd.track=queue->track;osd.tracks=queue->tracks;osd.up_next=queue->up_next;}}
  else{osd.title=item.base.name;if(item.year)osd.subtitle=std::to_string(item.year);}
+ if(!audio_only&&queue){osd.has_prev=queue->has_prev;osd.has_next=queue->has_next;osd.up_next=queue->up_next;}
+ const bool series=osd.has_prev||osd.has_next;
+ // Live TV: what is on now and next, from the guide (refreshed every few seconds).
+ uint64_t guide_at=0;
+ auto guide_line=[&]{GuideNow g;if(!guide_now_next(item.base.name,g)){osd.subtitle.clear();return;}
+  std::string line;
+  if(!g.now.empty()){const long left=(long)(g.now_stop-time(nullptr))/60;line=g.now+"  \xC2\xB7  "+TF("%ld min left",std::max(1L,left));}
+  if(!g.next.empty())line+=(line.empty()?"":"  \xC2\xB7  ")+std::string(T("Next"))+": "+g.next;
+  osd.subtitle=line;};
  // Music: the track's own cover, else its album's.
  if(audio_only){load_art(item.base.id);if(!item.album_id.empty())load_art(item.album_id);music_viz_reset();}
  // The PS3 buffering screen from Play to the first frame. Preparing (the
  // server's PlaybackInfo) runs on a worker while the ring turns.
  buffering_begin(item,osd.subtitle.empty()||audio_only?osd.title:osd.title+"  \xC2\xB7  "+osd.subtitle);
  if(settings.debug_log)plog(("Playback: starting; "+resource_report()).c_str());
- const uint64_t play_pressed=mono_ms();bool prepared=false;buffering_run([&]{prepared=playback_url(item,audio,subtitle,source,url,session,source_id);});
+ const uint64_t play_pressed=mono_ms();bool prepared=false;std::vector<MediaSegment> segments;std::vector<bool> segment_done;
+ buffering_run([&]{prepared=playback_url(item,audio,subtitle,source,url,session,source_id);
+  if(prepared&&!live&&!audio_only&&(settings.skip_intro||settings.skip_outro)&&segments_supported()!=0)segments=fetch_segments(item.base.id);});
+ segment_done.assign(segments.size(),false);
+ if(!segments.empty())plog(("Playback: "+std::to_string(segments.size())+" intro / credits markers").c_str());
  plog(("Playback: PlaybackInfo took "+std::to_string(mono_ms()-play_pressed)+" ms"+(settings.hd1080?" (1080p)":"")).c_str());
  if(!prepared){buffering_finish(false);end_playback(session);error_screen();return PLAY_STOPPED;}
  buffering_step(T("CONNECTING"),false,T("Cancel"));
@@ -218,8 +305,8 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
  const bool is_static=playback_is_static();
  uint64_t base=settings.resume&&!is_static?item.resume:0;bool direct_resume_pending=is_static&&settings.resume&&item.resume;
  uint64_t osd_until=now_ms()+5000,target=0,scrub_at=0,hold_until=0;bool scrubbing=false;int scrub_presses=0;
- bool picture=false,picture_move=false;uint64_t viz_toast_until=0;
- uint64_t reconnect_at=0,reconnect_window=0;int reconnects=0;
+ bool picture=false,picture_move=false;uint64_t viz_toast_until=0,tri_since=0;bool tri_down=false,tri_used=false,volume_changed=false,volume_active=false;uint64_t volume_until=0,skip_toast_until=0;std::string skip_toast;int control=-1;
+ uint64_t reconnect_at=0,reconnect_us=0,reconnect_window=0;int reconnects=0;
  wait_release();
  for(;;){
   bool got=player_draw();auto decoder_error=player_error();if(!decoder_error.empty()){last_error=decoder_error;play_failed=true;break;}
@@ -244,25 +331,59 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
   osd.position=shown;osd.target=target;osd.paused=paused;osd.started=started;osd.scrubbing=scrubbing;
   if(audio_only){osd.art=art_state(item.base.id)==1||item.album_id.empty()?item.base.id:item.album_id;float bands[MUSIC_VIZ_BANDS];music_viz_bands(bands);
    static float wave[688];music_viz_wave(wave,688);osd.viz=settings.viz;osd.viz_toast=now<viz_toast_until;draw_music_screen(osd,bands,MUSIC_VIZ_BANDS,wave,688);}
-  else if(paused||scrubbing||now<osd_until)draw_player_osd(osd);
+  const bool bar_shown=paused||scrubbing||volume_active||now<osd_until;
+  if(bar_shown&&control<0&&!audio_only)control=live?OSD_VOLUME:OSD_SCRUB;
+  if(!bar_shown)control=-1;
+  if(live&&now>=guide_at){guide_at=now+5000;guide_line();}
+  if(!audio_only){osd.control=control;osd.volume_active=volume_active||(live&&now<volume_until);osd.volume=settings.volume;osd.picture=settings.pic_aspect==PIC_FILL?"Fill":settings.pic_aspect==PIC_STRETCH?"Stretch":"Fit";
+   if(bar_shown)draw_player_osd(osd);}
   // Reconnecting after a stalled picture, until the first new frame.
-  if(reconnect_at&&!player_last_frame_ms()){const std::string r=std::string(T("Reconnecting"))+"...";face_text((WIDTH-face_text_width(r,20,TextFace::Classic))/2,HEIGHT/2-10,r,g_theme.white,20,TextFace::Classic);}
+  if(reconnect_at&&!player_last_frame_ms())buffering_overlay(reconnect_us,T("RECONNECTING"));
   if(picture){
    auto shift=[](int v,const char* pos,const char* neg){if(!v)return std::string(T("Centred"));const int a=v<0?-v:v;char n[24];snprintf(n,sizeof n," %d.%d%%",a/2,(a%2)*5);return std::string(T(v>0?pos:neg))+n;};
    const char* shape=settings.pic_aspect==PIC_FILL?"Fill":settings.pic_aspect==PIC_STRETCH?"Stretch":"Fit";
    draw_picture_banner(picture_move?std::string(T("Picture position"))+"   "+shift(settings.pic_x,"Right","Left")+"   "+shift(settings.pic_y,"Up","Down")+"   "+T(shape)
     :std::string(T("Picture size"))+"   "+T("Width")+" "+std::to_string(settings.pic_w)+"%   "+T("Height")+" "+std::to_string(settings.pic_h)+"%   "+T(shape),picture_move);
   }
+  if(audio_only&&now<volume_until)draw_volume_banner(settings.volume);
+  // Intro / credits markers: the one playing now, not yet acted on.
+  // Credits only count in a show with a next episode (they skip to it); a
+  // film's are left alone.
+  int seg_at=-1;if(started&&!scrubbing)for(size_t i=0;i<segments.size();++i)if(!segment_done[i]&&pos>=segments[i].start&&pos+1500<segments[i].end&&(!segments[i].outro||(series&&osd.has_next))){seg_at=(int)i;break;}
+  const int seg_mode=seg_at<0?SKIP_OFF:segments[seg_at].outro?settings.skip_outro:settings.skip_intro;
+  const bool seg_next=seg_at>=0&&segments[seg_at].outro;
+  if(seg_mode==SKIP_BUTTON&&!picture)draw_skip_button(T(seg_next?"Skip to Next Episode":"Skip Intro"),true);
+  if(now<skip_toast_until&&!picture)draw_skip_button(skip_toast,false);
   present();auto b=press();
-  // L1 (PS3): the picture's size, position and shape -- Fit / Fill / Stretch --
+  // Skip it: by itself (Auto) or with Triangle (Button). Credits go on to the
+  // next episode.
+  if(seg_at>=0&&!picture&&(seg_mode==SKIP_AUTO||(seg_mode==SKIP_BUTTON&&(b&ORBIS_PAD_BUTTON_TRIANGLE)))){
+   const MediaSegment s=segments[seg_at];segment_done[seg_at]=true;b&=~ORBIS_PAD_BUTTON_TRIANGLE;
+   plog(s.outro?"Playback: skipping the credits":"Playback: skipping the intro");
+   if(seg_next){skip=PLAY_NEXT;break;}
+   target=s.end;player_seek(s.end>base?s.end-base:0);hold_until=now+3000;
+   if(seg_mode==SKIP_AUTO){skip_toast=T(s.outro?"Credits skipped":"Intro skipped");skip_toast_until=now+2500;}
+  }
+  // The bar (PS3 HUD): the first press with it away only shows it, Play /
+  // Pause focused -- except Left / Right, which skip 10 s and go on skipping
+  // until another button. With it up, Left / Right move the focus across
+  // Play / Pause, Volume and Picture, and X uses the focused one: Play
+  // pauses, Volume opens its slider (Up / Down, Circle done), Picture opens
+  // its panel, which has the buttons to itself until Circle closes it. Music
+  // has no bar: Up / Down change the volume, shown for a moment.
+  // Picture (PS3 L1): the size, position and shape -- Fit / Fill / Stretch --
   // kept for every video, because they correct for the screen, not the film.
-  // While the mode is open it has the buttons to itself.
-  if(!audio_only&&started&&(picture||(b&ORBIS_PAD_BUTTON_L1))){
-   if(!picture){picture=true;picture_move=false;osd_until=0;}
-   else if(b&(ORBIS_PAD_BUTTON_L1|ORBIS_PAD_BUTTON_CROSS|ORBIS_PAD_BUTTON_CIRCLE)){picture=false;save_settings();}
+  // Holding Triangle 3 s resets it: held, so a bump cannot undo it.
+  if(picture){
+   if(b&ORBIS_PAD_BUTTON_CIRCLE){picture=false;save_settings();}
    else{
     if(b&ORBIS_PAD_BUTTON_SQUARE)settings.pic_aspect=pic_aspect_next(settings.pic_aspect);
-    if(b&ORBIS_PAD_BUTTON_TRIANGLE){settings.pic_aspect=PIC_FIT;settings.pic_w=settings.pic_h=PIC_DEFAULT;settings.pic_x=settings.pic_y=0;}
+    // tri_used: this press already reset (or was down when the panel opened).
+    bool reset=false;const bool tri=buttons()&ORBIS_PAD_BUTTON_TRIANGLE;
+    if(tri&&!tri_down){tri_down=true;tri_used=false;tri_since=now;}
+    else if(tri&&!tri_used&&now-tri_since>=3000){reset=true;tri_used=true;}
+    else if(!tri)tri_down=false;
+    if(reset){settings.pic_aspect=PIC_FIT;settings.pic_w=settings.pic_h=PIC_DEFAULT;settings.pic_x=settings.pic_y=0;}
     if(b&ORBIS_PAD_BUTTON_R1)picture_move=!picture_move;
     const int dx=(b&ORBIS_PAD_BUTTON_RIGHT)?1:(b&ORBIS_PAD_BUTTON_LEFT)?-1:0,dy=(b&ORBIS_PAD_BUTTON_UP)?1:(b&ORBIS_PAD_BUTTON_DOWN)?-1:0;
     if(picture_move){settings.pic_x=pic_shift_clamp(settings.pic_x+dx);settings.pic_y=pic_shift_clamp(settings.pic_y+dy);}
@@ -271,6 +392,48 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
    player_picture(settings.pic_aspect,settings.pic_w,settings.pic_h,settings.pic_x,settings.pic_y);
    b=0;
   }
+  else if(volume_active){
+   osd_until=now+5000;
+   const int step=(b&ORBIS_PAD_BUTTON_UP)?5:(b&ORBIS_PAD_BUTTON_DOWN)?-5:0;
+   if(step){settings.volume=std::max(0,std::min(100,settings.volume+step));player_volume(settings.volume);volume_changed=true;}
+   else if(b&ORBIS_PAD_BUTTON_CIRCLE)volume_active=false;
+   b=0;
+  }
+  else if(audio_only&&started&&(b&(ORBIS_PAD_BUTTON_UP|ORBIS_PAD_BUTTON_DOWN))){
+   settings.volume=std::max(0,std::min(100,settings.volume+((b&ORBIS_PAD_BUTTON_UP)?5:-5)));player_volume(settings.volume);volume_changed=true;volume_until=now+1500;b=0;}
+  else if(!audio_only&&started&&b){
+   const uint32_t nav=b&(ORBIS_PAD_BUTTON_LEFT|ORBIS_PAD_BUTTON_RIGHT);
+   // Live TV cannot be paused, skipped or scrubbed: its bar starts on Volume
+   // and has no Play / Pause stop, and X does nothing elsewhere.
+   const int first=live?OSD_VOLUME:OSD_PLAY;
+   // Live TV: Up / Down are the volume, bar up or not, its slider shown 2 s.
+   if(live&&(b&(ORBIS_PAD_BUTTON_UP|ORBIS_PAD_BUTTON_DOWN))){
+    settings.volume=std::max(0,std::min(100,settings.volume+((b&ORBIS_PAD_BUTTON_UP)?5:-5)));player_volume(settings.volume);volume_changed=true;
+    volume_until=now+2000;control=OSD_VOLUME;b&=~(ORBIS_PAD_BUTTON_UP|ORBIS_PAD_BUTTON_DOWN);
+   }
+   // Films, shows: the scrub bar is a stop of its own, under the controls
+   // row, and where the bar opens. On it Left / Right scrub (below, holding
+   // speeds up) and X pauses; Up goes to the controls, Down from them back.
+   if(!bar_shown){
+    control=live?first:OSD_SCRUB;
+    // Left / Right scrub at once; Live TV has nothing to scrub.
+    if(live)b&=~nav;
+    b&=~(ORBIS_PAD_BUTTON_CROSS|ORBIS_PAD_BUTTON_SQUARE|ORBIS_PAD_BUTTON_UP|ORBIS_PAD_BUTTON_DOWN|ORBIS_PAD_BUTTON_TRIANGLE);
+   }
+   else if(control==OSD_SCRUB){
+    if(b&ORBIS_PAD_BUTTON_UP)control=OSD_PLAY;
+    b&=~(ORBIS_PAD_BUTTON_UP|ORBIS_PAD_BUTTON_DOWN);
+   }
+   else{
+    if(!live&&(b&ORBIS_PAD_BUTTON_DOWN))control=OSD_SCRUB;
+    if(nav){control=control<0?first:std::max(first,std::min(OSD_CONTROLS-1,control+((nav&ORBIS_PAD_BUTTON_RIGHT)?1:-1)));b&=~nav;}
+    if(b&ORBIS_PAD_BUTTON_CROSS){
+     if(control==OSD_VOLUME){volume_active=!live;b&=~ORBIS_PAD_BUTTON_CROSS;}
+     if(control==OSD_PICTURE||live){picture=true;picture_move=false;tri_down=buttons()&ORBIS_PAD_BUTTON_TRIANGLE;tri_used=true;b&=~ORBIS_PAD_BUTTON_CROSS;}
+    }
+   }
+   osd_until=now+5000;
+  }
   if(b&ORBIS_PAD_BUTTON_CIRCLE){cancelled=true;break;}
   // An album: R1 is the next track; L1 restarts this one, or goes back a track
   // in its first few seconds.
@@ -278,7 +441,12 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
    if((b&ORBIS_PAD_BUTTON_R1)&&osd.track<osd.tracks){skip=PLAY_NEXT;break;}
    if(b&ORBIS_PAD_BUTTON_L1){if(pos>base+3000||osd.track<=1){player_seek(0);target=base;hold_until=now+1500;}else{skip=PLAY_PREVIOUS;break;}}
   }
-  if(b&ORBIS_PAD_BUTTON_CROSS){paused=!paused;player_pause(paused);osd_until=now+5000;}
+  // A series: R1 the next episode, L1 the previous one.
+  if(series&&started){
+   if((b&ORBIS_PAD_BUTTON_R1)&&osd.has_next){skip=PLAY_NEXT;break;}
+   if((b&ORBIS_PAD_BUTTON_L1)&&osd.has_prev){skip=PLAY_PREVIOUS;break;}
+  }
+  if((b&ORBIS_PAD_BUTTON_CROSS)&&!live){paused=!paused;player_pause(paused);osd_until=now+5000;}
   // Music: Square chooses the visualizer (kept for next time); video: it hides the bar.
   if((b&ORBIS_PAD_BUTTON_SQUARE)&&audio_only){settings.viz=(settings.viz+1)%VIZ_COUNT;save_settings();viz_toast_until=now+2000;}
   else if(b&ORBIS_PAD_BUTTON_SQUARE)osd_until=now<osd_until?0:now+5000;
@@ -304,16 +472,24 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
   // a provider's stitched ad break -- can leave the picture stopped while the
   // sound goes on (its timestamps went backwards). No new frame for 6 s while
   // playing: reconnect, which starts again at the live edge. Three times a
-  // minute at most, so a dead channel cannot loop.
+  // minute at most, so a dead channel cannot loop. When the sound has gone
+  // on 2 s past the last frame (a stitched ad break: Pluto's bring their own
+  // streams, and the picture's one gets nothing more) it is that, not
+  // buffering: reconnect after 2.5 s. (Switching to the ad's video track
+  // was tried: it never gave a picture.)
   if(live&&started&&!paused&&!audio_only){const uint64_t last=player_last_frame_ms();
-   if(last&&now>last+6000&&(!reconnect_at||now>reconnect_at+8000)){
+   // Sound still reaching the speakers (MPV's own positions stop with the
+   // picture): the newest non-silent audio came after the last frame.
+   const uint64_t sound=audio_last_sound_ms();
+   const bool sound_on=sound>last+2000&&now<sound+1000;
+   if(last&&(now>last+6000||(sound_on&&now>last+2500))&&(!reconnect_at||now>reconnect_at+8000)){
     if(now>reconnect_window+60000){reconnect_window=now;reconnects=0;}
-    if(reconnects<3){++reconnects;reconnect_at=now;plog("Live TV: picture stalled for 6 s; reconnecting");player_close();if(!player_open(url)){last_error=player_error();play_failed=true;break;}}}}
+    if(reconnects<3){++reconnects;reconnect_at=now;reconnect_us=mono_us();plog(sound_on?"Live TV: picture stopped while the sound went on; reconnecting":"Live TV: picture stalled for 6 s; reconnecting");if(!player_reload(url)){last_error=player_error();play_failed=true;break;}}}}
   if(!started&&time(nullptr)-began>start_limit){last_error=T("Decoder could not start this stream within 45 seconds");break;}
   usleep(1000);
  }
  if(buffering_active())buffering_finish(false);
- if(picture)save_settings();
+ if(picture||volume_changed)save_settings();
  uint64_t pos=base+player_time();player_close();finish_playback(item,session,source_id,pos,paused);
  // A channel's own stream would not play: try it once more through the server.
  if(remote&&!started&&!cancelled){plog(("Live TV: direct stream did not start ("+last_error+"); through the server").c_str());playback_force_server_once();return play(item,audio,subtitle,source,audio_label,subtitle_label,queue);}
@@ -329,11 +505,28 @@ static void play_music(const Item& first){
  for(;;){
   Item track=album.items[at];track.resume=!strcmp(track.base.id,first.base.id)?first.resume:0;
   if(track.album.empty())track.album=first.album;if(track.album_id.empty())track.album_id=first.album_id;if(track.artist.empty())track.artist=first.artist;
-  MusicQueue queue;queue.track=at+1;queue.tracks=count;if(at+1<count)queue.up_next=album.items[at+1].base.name;
+  PlayQueue queue;queue.track=at+1;queue.tracks=count;if(at+1<count)queue.up_next=album.items[at+1].base.name;
   const PlayEnd end=play(track,-1,-1,"","","",&queue);
   if(end==PLAY_PREVIOUS)at=std::max(0,at-1);
   else if((end==PLAY_NEXT||end==PLAY_ENDED)&&at+1<count)++at;
   else break;
+ }
+}
+// A series plays on: when an episode ends the next starts by itself (from its
+// beginning), and R1 / L1 skip. The first keeps the detail page's choices.
+static void play_episodes(const Item& first,int audio,int subtitle,const std::string& source,const std::string& audio_label,const std::string& subtitle_label){
+ Item episode=first;bool chosen=true;
+ for(;;){
+  Item prev,next;PlayQueue queue;
+  if(!fetch_adjacent_episodes(episode,prev,next,queue.has_prev,queue.has_next))plog("Playback: no neighbouring episodes found");
+  if(queue.has_next){char code[32]="";if(next.episode)snprintf(code,sizeof code,"S%d:E%d - ",next.season,next.episode);queue.up_next=code+std::string(next.base.name);}
+  const PlayEnd end=chosen?play(episode,audio,subtitle,source,audio_label,subtitle_label,&queue):play(episode,-1,-1,"","","",&queue);
+  chosen=false;
+  if((end==PLAY_NEXT||end==PLAY_ENDED)&&queue.has_next)episode=next;
+  else if(end==PLAY_PREVIOUS&&queue.has_prev)episode=prev;
+  else break;
+  episode.resume=0;
+  if(episode.series.empty())episode.series=first.series;if(episode.series_id.empty())episode.series_id=first.series_id;
  }
 }
 // "English - EAC3 - 5.1 - Default" -> "EAC3 5.1", for the detail page's chip.
@@ -372,7 +565,11 @@ static bool detail_screen(const Item& initial,Person& person){
     if(action==ACT_RESUME||action==ACT_PLAY||action==ACT_START){
      Item target=item;if(action==ACT_START)target.resume=0;
      const std::string audio_name=tracks&&tracks->n_audio?audio_chip(tracks->audio[audio_slot].label):"",sub_name=tracks&&sub_slot>=0?tracks->subs[sub_slot].label:"";
-     if(!strcmp(target.base.type,"Audio"))play_music(target);else play(target,tracks&&tracks->n_audio&&audio_slot!=default_audio()?tracks->audio[audio_slot].index:-1,tracks&&sub_slot>=0?tracks->subs[sub_slot].index:-1,sources.n_sources?sources.source[source].id:"",audio_name.empty()?view.audio:audio_name,sub_name);
+     const int audio_index=tracks&&tracks->n_audio&&audio_slot!=default_audio()?tracks->audio[audio_slot].index:-1,sub_index=tracks&&sub_slot>=0?tracks->subs[sub_slot].index:-1;
+     const std::string source_id=sources.n_sources?sources.source[source].id:"",audio_label=audio_name.empty()?view.audio:audio_name;
+     if(!strcmp(target.base.type,"Audio"))play_music(target);
+     else if(!strcmp(target.base.type,"Episode")&&!target.series_id.empty())play_episodes(target,audio_index,sub_index,source_id,audio_label,sub_name);
+     else play(target,audio_index,sub_index,source_id,audio_label,sub_name);
      // Resume point and watched state change with playback.
      Item fresh;if(fetch_detail(item,fresh)){fresh.people=fresh.people.empty()?item.people:fresh.people;item=fresh;request_detail_art(item);}
      view.col=0;wait_release();continue;
@@ -392,7 +589,7 @@ static bool detail_screen(const Item& initial,Person& person){
 }
 struct Location {std::string parent,title,query;int mode=0,start=0,selected=0,first=0;std::string breadcrumb{};std::string letter{};bool letters=false;};
 static Location child_location(const Location& current,const Item& item,bool home){
- Location next{item.base.id,home?item.base.name:current.title,"",0,0,0};
+ Location next{item.base.id,home?item.base.name:current.title,"",!strcmp(item.base.type,"MusicAlbum")?MODE_ALBUM:0,0,0};
  if(!home){std::string parent=current.breadcrumb;if(!strcmp(item.base.type,"Series"))next.breadcrumb=std::string(item.base.name)+" / Seasons";
  else if(!strcmp(item.base.type,"Season")){const std::string suffix=" / Seasons";if(parent.size()>=suffix.size()&&parent.compare(parent.size()-suffix.size(),suffix.size(),suffix)==0)parent.resize(parent.size()-suffix.size());next.breadcrumb=parent+" / "+item.base.name+" / Episodes";}
  else next.breadcrumb=(parent.empty()?"":parent+" / ")+item.base.name;}
@@ -432,6 +629,7 @@ static bool load_home(HomeView& home,bool quiet=false){
  jobs.emplace_back(HOME_CONTINUE,Item{},T("Continue Watching"),SHAPE_WIDE);row_start(jobs.back());
  jobs.emplace_back(HOME_NEXTUP,Item{},T("Next Up"),SHAPE_WIDE);row_start(jobs.back());
  Page views;if(!fetch_page("",0,"",0,views)){for(auto& job:jobs)row_join(job);return false;}
+ order_libraries(views.items);
  bool movies=false,shows=false,music=false;
  for(const auto& library:views.items){
   bool want=(library.collection=="movies"&&!movies)||(library.collection=="tvshows"&&!shows)||(library.collection=="music"&&!music);if(!want)continue;
@@ -449,7 +647,8 @@ static bool load_home(HomeView& home,bool quiet=false){
 }
 static Location library_location(const Item& library){
  if(library.collection=="livetv")return {"",library.base.name,"",3,0,0};
- Location next{library.base.id,library.base.name,"",0,0,0};next.letters=library.collection!="playlists";return next;
+ const int mode=library.collection=="movies"?MODE_MOVIES:library.collection=="tvshows"?MODE_SHOWS:library.collection=="music"?MODE_MUSIC:0;
+ Location next{library.base.id,library.base.name,"",mode,0,0};next.letters=library.collection!="playlists";return next;
 }
 int main(){if(!platform_init()){platform_shutdown();platform_exit(1);}plog("Jellyfin [PS] PS4 build " JF_BUILD_VERSION " (MPV/FFmpeg)");theme_load_setting();language_apply();boot_begin();boot_pump();if(http_init()<0){boot_leave();last_error=T("PS4 networking initialization failed. See app.log.");error_screen();app_shutdown();http_end();platform_shutdown();platform_exit(2);}bool authenticated=load_session();boot_pump();update_check_start(8000);std::vector<Location> stack;stack.push_back({"","Home","",0,0,0});Page page;bool reload=true;int header_focus=-1,pending_tab=-1;
  HomeView home;int home_generation=-1;JumpBar jump;
@@ -459,7 +658,11 @@ int main(){if(!platform_init()){platform_shutdown();platform_exit(1);}plog("Jell
  auto open_item=[&](const Item& item,bool from_home){
   // Live TV is a page of its own, as on the PS3.
   if(!strcmp(item.base.id,"nav:live")||item.collection=="livetv"){
-   int next=livetv_screen([&](const Item& channel){play(channel,-1,-1,"");});
+   int next=livetv_screen([&](const Item& channel,const Item* prev,const Item* next){
+    // L1 / R1 change to the channel before / after it in the list.
+    PlayQueue queue;queue.has_prev=prev;queue.has_next=next;if(next)queue.up_next=next->base.name;
+    const PlayEnd end=play(channel,-1,-1,"","","",&queue);
+    return end==PLAY_NEXT?1:end==PLAY_PREVIOUS?-1:0;});
    if(next==-2)error_screen();else if(next>=0)pending_tab=next;
    reload=true;ui_input_sync();return;
   }
@@ -469,7 +672,10 @@ int main(){if(!platform_init()){platform_shutdown();platform_exit(1);}plog("Jell
   Person person;if(detail_screen(item,person)){Location next{person.id,person.name,"",4,0,0};next.breadcrumb=T("Filmography");stack.push_back(next);}
   reload=true;ui_input_sync();
  };
- while(running){if(!authenticated||!g_token[0]||g_auth_expired){boot_leave();facts_stop();art_stop();page_cache_stop();authenticated=sign_in();if(!authenticated)break;stack.resize(1);reload=true;home_generation=-1;}if(pending_tab>=0){
+ while(running){if(!authenticated||!g_token[0]||g_auth_expired){boot_leave();facts_stop();art_stop();page_cache_stop();authenticated=sign_in();if(!authenticated)break;stack.resize(1);reload=true;home_generation=-1;}
+  // The Live TV guide: loaded once signed in, updated in the background when due.
+  {static bool guide_started=false;if(!guide_started){guide_started=true;guide_start();}}
+  if(pending_tab>=0){
   int tab=pending_tab;pending_tab=-1;plog((std::string("Navigation: tab=")+(tab==0?"Home":tab==1?"Search":"Settings")).c_str());
   if(tab==0){stack.resize(1);header_focus=-1;reload=true;}
   else if(tab==1){std::string query;int next=search_screen(query);if(next==3){stack.push_back({"",TF("Search: %s",query.c_str()),query,0,0,0});reload=true;header_focus=-1;}else if(next>=0)pending_tab=next;}
@@ -479,7 +685,7 @@ int main(){if(!platform_init()){platform_shutdown();platform_exit(1);}plog("Jell
  const bool at_home=stack.size()==1;
  if(at_home){
   // Rows are kept while browsing; Continue Watching and Next Up change with playback.
-  if(reload&&(home_generation!=play_generation||!home.loaded)){
+  if(reload&&(home_generation!=play_generation||!home.loaded||home_dirty)){home_dirty=false;
    // On a cold start the rows load behind the boot animation.
    // On a cold start the artwork on screen is fetched and sized here too, while
    // the mark breathes, so the handoff draws nothing new.

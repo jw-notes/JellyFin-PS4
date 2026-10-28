@@ -163,6 +163,23 @@ static bool quick_connect_screen() {
 
 bool sign_in() {
     UiInputScope input_scope;
+    // Another user of this console shares their sign-in (Settings > Account):
+    // use it, or go on to sign in with an account of your own.
+    const std::string shared = shared_name();
+    if (!shared.empty()) {
+        int selected = 0;
+        release_buttons();
+        for (;;) {
+            login_header("Sign in");
+            row(195, std::string(T("Use the shared sign-in")) + " (" + shared + ")", selected == 0);
+            row(300, "Sign in with my own account", selected == 1);
+            hint_bar({{'D', "Select"}, {'X', "Continue"}});
+            present(); const auto b = pressed();
+            if (b & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN)) selected = 1 - selected;
+            if (b & ORBIS_PAD_BUTTON_CROSS) { release_buttons(); if (selected == 0 && share_use()) return true; break; }
+            usleep(16000);
+        }
+    }
     std::string server = g_server[0] ? g_server : "http://";
     for (;;) {
         if (!server_screen(server)) return false;

@@ -4,6 +4,7 @@ logs/
 dist/*
 !dist/v1.09/
 !dist/v1.10/
+!dist/v1.11/
 
 # Large third-party toolchains (re-downloadable)
 *.tar.gz

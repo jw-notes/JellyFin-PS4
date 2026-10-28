@@ -41,6 +41,7 @@ int main(){
  std::string t,d;console_clock(0,t,d);printf("clock now: %s %s, in 90 min: %s\n",d.c_str(),t.c_str(),ends_at(90*60000).c_str());
  // Detail page and quick peek: when a resumed film would finish.
  Item film=item("f","Example Film: The Sequel","Movie",2014);film.duration=7020000;film.resume=1800000;film.rating="PG-13";film.community="7.4";film.genres="Action, Adventure";film.overview="A crew of explorers travel through a wormhole in space in an attempt to ensure humanity's survival.";
+ for(auto [n,r]:{std::pair<const char*,const char*>{"Avery Stone","Cooper"},{"Jordan Lee","Brand"},{"Sam Rivers","Murph"},{"Casey Morgan","Professor"},{"Riley Chen","Romilly"},{"Taylor Brooks","Doyle"},{"Morgan Hale","Mann"},{"Quinn Ellis","TARS"}}){Person p;p.name=n;p.role=r;film.people.push_back(p);}
  DetailView view;view.version="1080p H264";view.video="1080p · H264 · SDR";view.audio="English - AAC - Stereo - Default";view.audio_chip="AAC Stereo";view.subtitles="Off";
  draw_detail(film,view);capture("build/ui110-detail-ends.bmp");
  draw_home(home,-1);draw_quick_peek(film,{100,200,140,210},1.0f,"");capture("build/ui110-peek-ends.bmp");

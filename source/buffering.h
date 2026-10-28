@@ -29,3 +29,7 @@ void buffering_run(const std::function<void()>& work);
 // Presents its own frames and returns on a black screen.
 void buffering_finish(bool ready);
 bool buffering_active();
+// Over whatever is on screen (a stopped picture, black): the ring turning
+// round the mark, a breathing glow and `label` under it, faded in from
+// `since_us` (mono_us()). For Live TV's reconnect; the caller presents.
+void buffering_overlay(uint64_t since_us,const char* label);

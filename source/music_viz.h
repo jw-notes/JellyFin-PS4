@@ -9,6 +9,7 @@
 // the newest samples, folds the magnitudes into MUSIC_VIZ_BANDS log-spaced
 // bands (40 Hz - 16 kHz), normalises them to the frame's loudest and eases
 // them: a fast attack, a slow fall.
+#include <stdint.h>
 constexpr int MUSIC_VIZ_BANDS=28;
 
 // Clear the tap and the smoothing (call when music starts).
@@ -21,3 +22,7 @@ void music_viz_bands(float* out);
 // The newest stretch of sound itself (about 21 ms), as n points from -1 to 1,
 // for the Scope visualizer. Zeros when there is no fresh audio.
 void music_viz_wave(float* out,int n);
+// mono_ms() when the speakers last got sound that was not silence (0 before
+// any). Live TV's watchdog: a picture stopped while this keeps moving is a
+// stitched ad break, not a stream that has stalled.
+uint64_t audio_last_sound_ms();

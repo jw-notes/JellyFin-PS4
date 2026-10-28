@@ -1,6 +1,7 @@
 #include "app.h"
 #include "platform.h"
 #include "crash.h"
+#include "mono_clock.h"
 #include <orbis/VideoOut.h>
 #include <orbis/Pad.h>
 #include <orbis/UserService.h>
@@ -68,7 +69,8 @@ bool platform_init(){
 static void shutdown_result(const char* operation,int result){char log[128];snprintf(log,sizeof log,"shutdown: %s result=0x%08x",operation,(unsigned)result);plog(log);}
 void platform_shutdown(){
  plog("shutdown: releasing controller and display");
- if(pad>=0){shutdown_result("controller close",scePadClose(pad));pad=-1;}
+ // The light bar goes back to the system's colour for the next app.
+ if(pad>=0){scePadResetLightBar(pad);shutdown_result("controller close",scePadClose(pad));pad=-1;}
  bool display_released=true;
  if(video>=0){
   // Do not free scanout memory while a flip is queued or buffers are registered.
@@ -91,7 +93,26 @@ void platform_shutdown(){
  shutdown_result("system exit returned",result);
  _Exit(status);
 }
-uint32_t buttons(){OrbisPadData p{};return scePadReadState(pad,&p)>=0&&p.connected?p.buttons:0;}
+// The controller: a disconnect (it turned itself off, its battery ran out) and
+// a reconnect are logged; while it reads as gone the handle is opened again
+// every 2 s, in case the old one no longer answers. The system's "intercepted"
+// bit (the PS button's menu, a notification over the app) is no button.
+uint32_t buttons(){
+ static bool was_connected=true;static uint64_t gone_since=0;
+ OrbisPadData p{};const bool ok=pad>=0&&scePadReadState(pad,&p)>=0&&p.connected;
+ const uint64_t now=mono_ms();
+ if(ok!=was_connected){was_connected=ok;plog(ok?"Controller: connected":"Controller: disconnected");gone_since=ok?0:now;}
+ static uint32_t lit=0xFFFFFFFF;
+ if(!ok){
+  if(gone_since&&now-gone_since>=2000){gone_since=now;
+   if(pad>=0)scePadClose(pad);int initial=0;if(sceUserServiceGetInitialUser(&initial)>=0)user=initial;pad=scePadOpen(user,0,0,nullptr);}
+  lit=0xFFFFFFFF;return 0;}
+ // The light bar in the theme's accent, set again whenever the theme changes
+ // or the controller comes back (a controller without one just ignores it).
+ const uint32_t accent=g_theme.accent&0xFFFFFF;
+ if(accent!=lit){lit=accent;OrbisPadColor c{(uint8_t)(accent>>16),(uint8_t)(accent>>8),(uint8_t)accent,0};scePadSetLightBar(pad,&c);}
+ return p.buttons&~0x80000000u;
+}
 // Everything is drawn into this ordinary (cached) memory and copied to the
 // display buffer once per frame. The display buffers are write-combined
 // graphics memory: fast to write, but every read -- and every blend, glow,

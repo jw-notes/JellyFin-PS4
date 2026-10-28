@@ -104,6 +104,19 @@ void buffering_frame(){
  if(!title.empty())face_text(57,606,fit_face(title,1166,22,TextFace::Classic),mix(VEIL,g_theme.text,ua*0.92f),22,TextFace::Classic);
  if(!hint.empty()&&ua>0.5f&&anim.phase==BUF_LOADING)draw_hints(57,680,{{'C',hint.c_str()}});
 }
+void buffering_overlay(uint64_t since_us,const char* l){
+ const float t=(now_us()-since_us)/1e6f,in=std::min(1.0f,t/0.35f),ease=in*in*(3-2*in);
+ // A veil over the picture, then the buffering screen's ring as a comet: it
+ // turns once a second and its tail breathes between a quarter and a half.
+ blend_rect(0,0,WIDTH,HEIGHT,VEIL,(int)(150*ease));
+ const float breath=0.5f-0.5f*cosf(t*6.2831853f/2.4f);
+ glow(RING_X,RING_Y,150,150,g_theme.accent,(0.18f+0.14f*breath)*ease);
+ ring_arc(RING_R,RING_T*0.66f,0,1,0xFFFFFF,0.12f*ease,0xFFFFFF,0.12f*ease);
+ const float len=0.25f+0.25f*breath,head=t*1.0f;
+ ring_arc(RING_R,RING_T,head-len,len,JF_PURPLE,0,JF_BLUE,ease);
+ draw_jf_mark(RING_X,RING_Y,MARK_BOX*(0.96f+0.04f*breath),ease);
+ if(l&&*l)eyebrow(400,l,mix(VEIL,g_theme.text_dim,ease));
+}
 void buffering_run(const std::function<void()>& work){
  if(!on){work();return;}
  struct Job{const std::function<void()>* work;std::atomic<bool> done{false};}job;job.work=&work;

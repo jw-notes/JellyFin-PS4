@@ -16,6 +16,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <strings.h>
 #include <dirent.h> // POSIX PS4 directory enumeration
 //   // sysLv2FsOpenDir / ReadDir / CloseDir
 
@@ -449,6 +450,22 @@ int theme_scan(ThemeEntry *out, int max) {
         }
         closedir(fd);
     }
+    // Each name once: a file theme with a built-in's name (golden-age.ini,
+    // xmb-wave.ini) made theme_step find the built-in when the file was on,
+    // and jump back. Built-ins come first and are kept, so their slot index
+    // stays their built-in index. Then the files in name order, not the
+    // folder's.
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        bool dup = false;
+        for (int k = 0; k < kept && !dup; k++) dup = strcasecmp(out[k].name, out[i].name) == 0;
+        if (!dup) { if (kept != i) out[kept] = out[i]; kept++; }
+    }
+    n = kept;
+    int first_file = 0;
+    while (first_file < n && !out[first_file].path[0]) first_file++;
+    qsort(out + first_file, n - first_file, sizeof *out,
+          [](const void *a, const void *b) { return strcasecmp(((const ThemeEntry *)a)->name, ((const ThemeEntry *)b)->name); });
     return n;
 }
 

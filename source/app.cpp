@@ -5,6 +5,7 @@
 #include "api_userdata.h"
 #include "json_unescape.h"
 #include <stdio.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -46,7 +47,9 @@ void plog(const char* message){
 void crash_log(const char* m){plog(m);}
 static bool write_atomic(const char* name,const std::string& text){std::string dest=jf_data_path(name),tmp=dest+".tmp";FILE*f=fopen(tmp.c_str(),"wb");if(!f)return false;chmod(tmp.c_str(),0600);bool ok=fwrite(text.data(),1,text.size(),f)==text.size();if(fflush(f)||fsync(fileno(f)))ok=false;if(fclose(f))ok=false;return ok&&rename(tmp.c_str(),dest.c_str())==0;}
 static std::string read_file(const char* n){FILE*f=fopen(jf_data_path(n),"rb");if(!f)return {};char b[8192];size_t z=fread(b,1,sizeof(b)-1,f);fclose(f);b[z]=0;return b;}
+static int storage_user=0;   // the PS4 user whose folder this is (Share Sign-in)
 bool storage_init(int user){
+ storage_user=user;
 #ifdef HOST_TEST
  const char* base=getenv("JF_TEST_DATA");data_dir=base?base:"/tmp/jellyfin-ps4-test";mkdir(data_dir.c_str(),0700);
 #else
@@ -56,15 +59,58 @@ bool storage_init(int user){
  diagnostic_log_path=log_path;
 #endif
  device_id=read_file("device-id");if(device_id.empty()){char id[80];snprintf(id,sizeof id,"ps4-%08x-%llx-%llx",user,(long long)time(nullptr),(long long)clock());device_id=id;if(!write_atomic("device-id",device_id))return false;}
- auto j=read_file("settings.json");if(!j.empty()){auto b=number(j.c_str(),"bitrate");if(b>=1000000&&b<=20000000)settings.bitrate=(int)b;settings.resume=number(j.c_str(),"resume")!=0;if(j.find("\"method\"")!=std::string::npos){auto m=number(j.c_str(),"method");settings.method=m<=PLAY_TRANSCODE?(int)m:PLAY_AUTO;}else settings.method=number(j.c_str(),"direct")?PLAY_DIRECT_FILE:PLAY_AUTO;if(j.find("\"saver\"")!=std::string::npos)settings.saver=number(j.c_str(),"saver")!=0;auto delay=number(j.c_str(),"saver_delay");if(delay>=30&&delay<=3600)settings.saver_delay=(int)delay;auto language=field(j.c_str(),"language");if(!language.empty())settings.language=language;if(j.find("\"hd1080\"")!=std::string::npos)settings.hd1080=number(j.c_str(),"hd1080")!=0;
+ auto j=read_file("settings.json");if(!j.empty()){auto b=number(j.c_str(),"bitrate");if(b>=1000000&&b<=20000000)settings.bitrate=(int)b;if(j.find("\"resume\"")!=std::string::npos)settings.resume=number(j.c_str(),"resume")!=0;
+  // Settings older than 1.11 ("v" < 11) had Resume off by default: it is on now, once.
+  if(number(j.c_str(),"v")<11)settings.resume=true;if(j.find("\"method\"")!=std::string::npos){auto m=number(j.c_str(),"method");settings.method=m<=PLAY_TRANSCODE?(int)m:PLAY_AUTO;}else settings.method=number(j.c_str(),"direct")?PLAY_DIRECT_FILE:PLAY_AUTO;if(j.find("\"saver\"")!=std::string::npos)settings.saver=number(j.c_str(),"saver")!=0;auto delay=number(j.c_str(),"saver_delay");if(delay>=30&&delay<=3600)settings.saver_delay=(int)delay;auto language=field(j.c_str(),"language");if(!language.empty())settings.language=language;if(j.find("\"hd1080\"")!=std::string::npos)settings.hd1080=number(j.c_str(),"hd1080")!=0;
   if(j.find("\"debug\"")!=std::string::npos)settings.debug_log=number(j.c_str(),"debug")!=0;
   settings.viz=(int)(number(j.c_str(),"viz")%5);
+  settings.home_order=field(j.c_str(),"home_order");
+  if(j.find("\"guide_auto\"")!=std::string::npos)settings.guide_auto=number(j.c_str(),"guide_auto")!=0;
+  settings.guide_url=field(j.c_str(),"guide_url");settings.guide_found=field(j.c_str(),"guide_found");
+  if(j.find("\"skip_intro\"")!=std::string::npos)settings.skip_intro=(int)number(j.c_str(),"skip_intro")%3;
+  if(j.find("\"skip_outro\"")!=std::string::npos)settings.skip_outro=(int)number(j.c_str(),"skip_outro")%3;
+  if(j.find("\"volume\"")!=std::string::npos)settings.volume=std::max(0,std::min(100,(int)number(j.c_str(),"volume")));
   if(j.find("\"pic_w\"")!=std::string::npos){settings.pic_aspect=(int)number(j.c_str(),"pic_aspect")%3;settings.pic_w=std::max(50,std::min(110,(int)number(j.c_str(),"pic_w")));settings.pic_h=std::max(50,std::min(110,(int)number(j.c_str(),"pic_h")));
    // Shifts are stored offset by 100: the JSON reader here takes no minus sign.
    settings.pic_x=std::max(-40,std::min(40,(int)number(j.c_str(),"pic_x")-100));settings.pic_y=std::max(-40,std::min(40,(int)number(j.c_str(),"pic_y")-100));}}return true;}
-bool save_settings(){return write_atomic("settings.json","{\"bitrate\":"+std::to_string(settings.bitrate)+",\"resume\":"+std::to_string(settings.resume)+",\"method\":"+std::to_string(settings.method)+",\"saver\":"+std::to_string(settings.saver)+",\"saver_delay\":"+std::to_string(settings.saver_delay)+",\"language\":"+json_quote(settings.language)+",\"hd1080\":"+std::to_string(settings.hd1080)+",\"debug\":"+std::to_string(settings.debug_log)+",\"pic_aspect\":"+std::to_string(settings.pic_aspect)+",\"pic_w\":"+std::to_string(settings.pic_w)+",\"pic_h\":"+std::to_string(settings.pic_h)+",\"pic_x\":"+std::to_string(settings.pic_x+100)+",\"pic_y\":"+std::to_string(settings.pic_y+100)+",\"viz\":"+std::to_string(settings.viz)+"}");}
-bool save_session(){return write_atomic("session.json","{\"server\":"+json_quote(g_server)+",\"username\":"+json_quote(g_username)+",\"token\":"+json_quote(g_token)+",\"userid\":"+json_quote(g_userid)+"}");}
-bool load_session(){auto j=read_file("session.json");snprintf(g_server,sizeof g_server,"%s",field(j.c_str(),"server").c_str());snprintf(g_username,sizeof g_username,"%s",field(j.c_str(),"username").c_str());snprintf(g_token,sizeof g_token,"%s",field(j.c_str(),"token").c_str());snprintf(g_userid,sizeof g_userid,"%s",field(j.c_str(),"userid").c_str());return g_token[0]&&g_server[0]&&g_userid[0];}
+bool save_settings(){return write_atomic("settings.json","{\"v\":11,\"bitrate\":"+std::to_string(settings.bitrate)+",\"resume\":"+std::to_string(settings.resume)+",\"method\":"+std::to_string(settings.method)+",\"saver\":"+std::to_string(settings.saver)+",\"saver_delay\":"+std::to_string(settings.saver_delay)+",\"language\":"+json_quote(settings.language)+",\"hd1080\":"+std::to_string(settings.hd1080)+",\"debug\":"+std::to_string(settings.debug_log)+",\"pic_aspect\":"+std::to_string(settings.pic_aspect)+",\"pic_w\":"+std::to_string(settings.pic_w)+",\"pic_h\":"+std::to_string(settings.pic_h)+",\"pic_x\":"+std::to_string(settings.pic_x+100)+",\"pic_y\":"+std::to_string(settings.pic_y+100)+",\"viz\":"+std::to_string(settings.viz)+",\"volume\":"+std::to_string(settings.volume)+",\"home_order\":"+json_quote(settings.home_order)+",\"skip_intro\":"+std::to_string(settings.skip_intro)+",\"skip_outro\":"+std::to_string(settings.skip_outro)+",\"guide_auto\":"+std::to_string(settings.guide_auto)+",\"guide_url\":"+json_quote(settings.guide_url)+",\"guide_found\":"+json_quote(settings.guide_found)+"}");}
+// Share Sign-in (PS3): one PS4 user lends their sign-in to the console's
+// users with none of their own. It is a copy of their session beside the
+// users' folders, with whose it is; theirs keeps it up to date.
+static const char* SHARED_SESSION="../shared-session.json";
+bool g_session_shared=false;
+static std::string session_text(int owner){return "{\"server\":"+json_quote(g_server)+",\"username\":"+json_quote(g_username)+",\"token\":"+json_quote(g_token)+",\"userid\":"+json_quote(g_userid)+(owner?",\"owner\":"+std::to_string(owner):"")+"}";}
+static bool apply_session(const std::string& j){snprintf(g_server,sizeof g_server,"%s",field(j.c_str(),"server").c_str());snprintf(g_username,sizeof g_username,"%s",field(j.c_str(),"username").c_str());snprintf(g_token,sizeof g_token,"%s",field(j.c_str(),"token").c_str());snprintf(g_userid,sizeof g_userid,"%s",field(j.c_str(),"userid").c_str());return g_token[0]&&g_server[0]&&g_userid[0];}
+static int shared_owner(){auto j=read_file(SHARED_SESSION);return j.empty()?0:(int)number(j.c_str(),"owner");}
+int share_state(){if(g_session_shared)return SHARE_USING;const int owner=shared_owner();return !owner?SHARE_OFF:owner==storage_user?SHARE_MINE:SHARE_OTHER;}
+bool share_set(bool on){
+ const int state=share_state();if(state==SHARE_USING||state==SHARE_OTHER)return false;
+ if(!on){remove(jf_data_path(SHARED_SESSION));plog("Account: sign-in no longer shared");return true;}
+ if(!g_token[0])return false;plog("Account: sign-in shared with this console's users");return write_atomic(SHARED_SESSION,session_text(storage_user));
+}
+bool save_session(){
+ // Using someone else's: nothing of theirs is written to this user's folder.
+ if(g_session_shared)return true;
+ // Shared, and signed in again (a new token): the copy follows.
+ if(shared_owner()==storage_user){if(g_token[0])write_atomic(SHARED_SESSION,session_text(storage_user));else remove(jf_data_path(SHARED_SESSION));}
+ return write_atomic("session.json",session_text(0));
+}
+// A user who logged out of a shared sign-in has said no to it: "no-shared"
+// in their folder, until they choose it again on the sign-in screen.
+std::string shared_name(){
+ if(!shared_owner()||shared_owner()==storage_user)return "";
+ auto j=read_file(SHARED_SESSION);return field(j.c_str(),"token").empty()?"":field(j.c_str(),"username");
+}
+bool share_use(){
+ if(shared_name().empty()||!apply_session(read_file(SHARED_SESSION)))return false;
+ g_session_shared=true;remove(jf_data_path("no-shared"));plog("Account: using the console's shared sign-in");return true;
+}
+bool load_session(){
+ g_session_shared=false;if(apply_session(read_file("session.json")))return true;
+ // No sign-in of this user's own: one shared on the console, if any (and not refused).
+ if(read_file("no-shared").empty())return share_use();
+ return false;
+}
 static int request(int method,const std::string& path,const std::string& body=""){int st=http_request(method,(std::string(g_server)+path).c_str(),body.c_str(),g_token,responseBuffer,RESPONSE_SIZE);if(st<200||st>=300)last_error=st<0?http_failure_detail():"Server request failed (HTTP "+std::to_string(st)+")";return st;}
 bool finish_login(const char* response, const std::string& fallback_username) {
     const auto token = field(response, "AccessToken");
@@ -90,7 +136,8 @@ bool login(const std::string& username, const std::string& password) {
     int status = request(HTTP_POST, "/Users/AuthenticateByName", "{\"Username\":" + json_quote(username) + ",\"Pw\":" + json_quote(password) + "}");
     return status == 200 && finish_login(responseBuffer, username);
 }
-void logout(){request(HTTP_POST,"/Sessions/Logout");g_token[0]=g_userid[0]=0;save_session();g_auth_expired=false;}
+// A shared sign-in is only put down here, not logged out: it is someone else's.
+void logout(){if(g_session_shared){g_session_shared=false;g_token[0]=g_userid[0]=0;g_auth_expired=false;write_atomic("no-shared","1");plog("Account: stopped using the shared sign-in");return;}request(HTTP_POST,"/Sessions/Logout");g_token[0]=g_userid[0]=0;save_session();g_auth_expired=false;}
 static std::string first_string(const char* j,const char* e,const char* k){auto a=find_top_value(j,e,k);char b[512]={};if(a&&*a=='[')read_json_string(skip_ws(a+1,e),e,b,sizeof b);return b;}
 static std::string decimal(const char* j,const char* e,const char* k){auto p=find_top_value(j,e,k);if(!p||(*p!='-'&&(*p<'0'||*p>'9')))return {};char b[16];snprintf(b,sizeof b,"%.1f",strtod(p,nullptr));return b;}
 static Item parse_item(const char* j){Item i;snprintf(i.base.id,sizeof i.base.id,"%s",field(j,"Id").c_str());snprintf(i.base.name,sizeof i.base.name,"%s",field(j,"Name").c_str());snprintf(i.base.type,sizeof i.base.type,"%s",field(j,"Type").c_str());i.overview=field(j,"Overview");i.duration=number(j,"RunTimeTicks")/10000;auto e=j+strlen(j);auto u=find_top_value(j,e,"UserData");if(u){i.resume=number(u,"PlaybackPositionTicks")/10000;auto f=find_top_value(u,e,"IsFavorite");i.favourite=f&&read_json_bool(f,e);f=find_top_value(u,e,"Played");i.played=f&&read_json_bool(f,e);}
@@ -120,7 +167,15 @@ static std::string page_path(const std::string& parent,int start,const std::stri
  if(parent.empty()&&query.empty()&&mode==0)path="/Users/"+encode(g_userid)+"/Views";
  // An actor's filmography, opened from a cast card on the detail page.
  else if(mode==4)path+="&Recursive=true&PersonIds="+encode(parent)+"&IncludeItemTypes=Movie,Series&SortBy=ProductionYear,SortName&SortOrder=Descending";
- else if(!parent.empty())path+="&ParentId="+encode(parent)+"&SortBy=SortName&SortOrder=Ascending";
+ // Film, show and music libraries list their films / series / albums
+ // wherever they sit in its folders, as Jellyfin's own clients do. The sort
+ // ends on DateCreated so items with the same name keep their order between
+ // pages: with SortName alone the server could put a film on two pages.
+ else if(mode==MODE_MOVIES||mode==MODE_SHOWS||mode==MODE_MUSIC)path+="&ParentId="+encode(parent)+"&Recursive=true&IncludeItemTypes="+(mode==MODE_MOVIES?"Movie":mode==MODE_SHOWS?"Series":"MusicAlbum")+"&SortBy=SortName,ProductionYear,DateCreated&SortOrder=Ascending";
+ // An album's tracks by album, not folder: tracks in disc folders (CD1, CD2)
+ // or elsewhere left a folder listing empty.
+ else if(mode==MODE_ALBUM)path+="&AlbumIds="+encode(parent)+"&Recursive=true&IncludeItemTypes=Audio&SortBy=ParentIndexNumber,IndexNumber,SortName&SortOrder=Ascending";
+ else if(!parent.empty())path+="&ParentId="+encode(parent)+"&SortBy=SortName,DateCreated&SortOrder=Ascending";
  // The PS3 jump bar: '#' lists names before A, a letter lists names starting with it.
  if(letter=="#")path+="&NameLessThan=A";else if(!letter.empty())path+="&NameStartsWith="+encode(letter);
  if(!query.empty())path+="&Recursive=true&SearchTerm="+encode(query);
@@ -196,8 +251,47 @@ bool fetch_home_row(HomeRowKind kind,const Item& library,Page& page){
  Page next;if(!parse_items(body.data(),next,error))return false;page=next;return true;
 }
 bool fetch_album_tracks(const std::string& album_id,Page& page){
- const std::string path="/Users/"+encode(g_userid)+"/Items?ParentId="+encode(album_id)+"&IncludeItemTypes=Audio&Recursive=true&SortBy=ParentIndexNumber,IndexNumber,SortName&SortOrder=Ascending&Limit=60";
+ const std::string path="/Users/"+encode(g_userid)+"/Items?AlbumIds="+encode(album_id)+"&IncludeItemTypes=Audio&Recursive=true&SortBy=ParentIndexNumber,IndexNumber,SortName&SortOrder=Ascending&Limit=60";
  if(request(HTTP_GET,path)!=200)return false;Page next;if(!parse_items(next))return false;page=next;return true;
+}
+int segments_supported(){
+ static std::string asked;static int known=-1;
+ const std::string who=std::string(g_server)+"|"+g_userid;if(asked==who)return known;
+ known=-1;
+ // Media segments arrived in 10.10.
+ if(request(HTTP_GET,"/System/Info/Public")==200){const std::string v=field(responseBuffer,"Version");int major=0,minor=0;
+  if(sscanf(v.c_str(),"%d.%d",&major,&minor)==2&&(major<10||(major==10&&minor<10))){known=0;asked=who;plog(("Segments: server "+v+" is older than 10.10").c_str());return known;}}
+ const int status=request(HTTP_GET,"/Plugins");
+ if(status==200){
+  std::string all=responseBuffer;for(char& c:all)c=(char)tolower((unsigned char)c);
+  // Any plugin that makes intro / credits segments: Intro Skipper, Chapter
+  // Segments, EDL / segment providers.
+  known=all.find("intro skipper")!=std::string::npos||all.find("introskipper")!=std::string::npos||all.find("segment")!=std::string::npos?1:0;
+ }
+ asked=who;plog(known==1?"Segments: a segment plugin is installed":known==0?"Segments: no segment plugin on the server":"Segments: can't tell (plugin list needs an admin account)");
+ return known;
+}
+std::vector<MediaSegment> fetch_segments(const std::string& item_id){
+ std::vector<MediaSegment> out;
+ if(request(HTTP_GET,"/MediaSegments/"+encode(item_id)+"?includeSegmentTypes=Intro&includeSegmentTypes=Outro")!=200)return out;
+ const char* j=responseBuffer;const char* e=j+strlen(j);auto a=find_top_value(j,e,"Items");if(!a||*a!='[')return out;++a;
+ while(a<e){a=skip_ws(a,e);if(a>=e||*a==']')break;if(*a==','){++a;continue;}auto b=object_end(a,e);if(!b)break;
+  const std::string obj(a,b);const std::string type=field(obj.c_str(),"Type");
+  // Ticks are 100 ns.
+  MediaSegment s;s.outro=type=="Outro";s.start=number(obj.c_str(),"StartTicks")/10000;s.end=number(obj.c_str(),"EndTicks")/10000;
+  if((type=="Intro"||type=="Outro")&&s.end>s.start+1000)out.push_back(s);a=b;}
+ return out;
+}
+bool fetch_adjacent_episodes(const Item& episode,Item& prev,Item& next,bool& has_prev,bool& has_next){
+ has_prev=has_next=false;if(episode.series_id.empty())return false;
+ // AdjacentTo: the episode and its neighbours in the whole series' order.
+ const std::string path="/Shows/"+encode(episode.series_id)+"/Episodes?userId="+encode(g_userid)+"&AdjacentTo="+encode(episode.base.id)+"&Fields=Overview";
+ if(request(HTTP_GET,path)!=200)return false;Page page;if(!parse_items(page))return false;
+ int at=-1;for(size_t i=0;i<page.items.size();++i)if(!strcmp(page.items[i].base.id,episode.base.id))at=(int)i;
+ if(at<0)return false;
+ if(at>0){prev=page.items[at-1];has_prev=true;}
+ if(at+1<(int)page.items.size()){next=page.items[at+1];has_next=true;}
+ return true;
 }
 bool fetch_detail(const Item& i,Item& detail){if(request(HTTP_GET,"/Users/"+encode(g_userid)+"/Items/"+encode(i.base.id))!=200)return false;detail=parse_item(responseBuffer);return detail.base.id[0];}
 bool parse_preview_item(const char* json,Item& result){result=parse_item(json);return result.base.id[0];}

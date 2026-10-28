@@ -290,14 +290,22 @@ void show_details(const JFChannel& c,const JFProgram& p){
   hint_bar({{'X',"OK"}});present();auto bt=ui_input();if(bt&(ORBIS_PAD_BUTTON_CROSS|ORBIS_PAD_BUTTON_CIRCLE))return;
  }
 }
-void play_channel(int idx,const std::function<void(const Item&)>& play){
- if(idx<0||idx>=n)return;Item item;snprintf(item.base.id,sizeof item.base.id,"%s",ch[idx].id);snprintf(item.base.name,sizeof item.base.name,"%s",ch[idx].name);snprintf(item.base.type,sizeof item.base.type,"TvChannel");
- note_recent(item.base.id);play(item);last_refresh=0;
+Item channel_item(int idx){Item item;snprintf(item.base.id,sizeof item.base.id,"%s",ch[idx].id);snprintf(item.base.name,sizeof item.base.name,"%s",ch[idx].name);snprintf(item.base.type,sizeof item.base.type,"TvChannel");return item;}
+// Plays the channel, then the one before / after it in this list while the
+// player asks for that (L1 / R1); the selection follows.
+void play_channel(int idx,const LiveTvPlay& play){
+ while(idx>=0&&idx<n){
+  const Item item=channel_item(idx);note_recent(item.base.id);
+  Item prev,next;const bool has_prev=idx>0,has_next=idx<n-1;if(has_prev)prev=channel_item(idx-1);if(has_next)next=channel_item(idx+1);
+  const int step=play(item,has_prev?&prev:nullptr,has_next?&next:nullptr);
+  if(!step)break;idx+=step;sel=idx;keep_visible();
+ }
+ last_refresh=0;
 }
 
 }   // namespace
 
-int livetv_screen(const std::function<void(const Item&)>& play){
+int livetv_screen(const LiveTvPlay& play){
  if(!ensure_worker()){last_error=T("Live TV is unavailable");return -2;}
  utc_offset=jf_utc_offset_secs();guide=false;top=0;if(search_on){search_on=false;term.clear();list_changed();}
  if(!index_ok)index_tried=false;last_refresh=0;view_changed=now_ms();if(sel>=n)sel=0;keep_visible();
