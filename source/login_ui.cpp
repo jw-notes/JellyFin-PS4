@@ -33,23 +33,25 @@ static void row(int y, const std::string& label, bool selected) {
     text(70, y + 18, T(label.c_str()), selected ? g_theme.accent : g_theme.text, 24, 1130);
 }
 
-static bool server_screen(std::string& server) {
+// offline: plays from a USB drive or the downloads with no server (may be empty).
+static bool server_screen(std::string& server, const std::function<void()>& offline) {
     int selected = 0;
     release_buttons();
     for (;;) {
         login_header("Connect to Jellyfin");
         text(60, 116, T("Enter the complete server URL, including its port."), g_theme.text_dim);
-        const std::string labels[] = {TF("Server URL: %s", server.c_str()), "Connect", "Exit application"};
-        for (int i = 0; i < 3; ++i) row(190 + i * 90, labels[i], i == selected);
+        const std::string labels[] = {TF("Server URL: %s", server.c_str()), "Connect", "Play from a USB drive or downloads", "Exit application"};
+        for (int i = 0; i < 4; ++i) row(170 + i * 80, labels[i], i == selected);
         text(60, 515, TF("Example: %s", "http://192.168.1.100:8096"), g_theme.text_dim);
         text(60, 555, T("Keep any Jellyfin base path after the port, if your server uses one."), g_theme.text_dim);
         hint_bar({{'D', "Select"}, {'X', "Edit / connect"}, {'O', "Done (in keyboard)"}});
         present();
         const auto b = pressed();
-        if (b & ORBIS_PAD_BUTTON_UP) selected = (selected + 2) % 3;
-        if (b & ORBIS_PAD_BUTTON_DOWN) selected = (selected + 1) % 3;
+        if (b & ORBIS_PAD_BUTTON_UP) selected = (selected + 3) % 4;
+        if (b & ORBIS_PAD_BUTTON_DOWN) selected = (selected + 1) % 4;
         if (b & ORBIS_PAD_BUTTON_CROSS) {
             if (selected == 0) keyboard(T("Jellyfin server URL (including port)"), server, false, KeyboardType::Url);
+            else if (selected == 2) { if (offline) offline(); }
             else if (selected == 1) {
                 login_notice("Checking server...");
                 if (connect_server(server)) { server = g_server; return true; }
@@ -161,7 +163,7 @@ static bool quick_connect_screen() {
     }
 }
 
-bool sign_in() {
+bool sign_in(const std::function<void()>& offline) {
     UiInputScope input_scope;
     // Another user of this console shares their sign-in (Settings > Account):
     // use it, or go on to sign in with an account of your own.
@@ -182,7 +184,7 @@ bool sign_in() {
     }
     std::string server = g_server[0] ? g_server : "http://";
     for (;;) {
-        if (!server_screen(server)) return false;
+        if (!server_screen(server, offline)) return false;
         int selected = 0;
         release_buttons();
         for (;;) {

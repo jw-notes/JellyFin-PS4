@@ -1,4 +1,4 @@
-# Jellyfin [PS] for PS4 — 1.09
+# Jellyfin [PS] for PS4 - 1.09
 
 The first release of Jellyfin [PS] for PS4.
 
@@ -15,7 +15,7 @@ The first release of Jellyfin [PS] for PS4.
 
 ## Package
 
-`dist/v1.09/IV0000-JFPS40000_00-JELLYFINPS400000.pkg` — title ID `JFPS40000`, version `01.09`.
+`dist/v1.09/IV0000-JFPS40000_00-JELLYFINPS400000.pkg` - title ID `JFPS40000`, version `01.09`.
 
 ## Known limitations
 

@@ -68,6 +68,7 @@ bool storage_init(int user){
   settings.viz=(int)(number(j.c_str(),"viz")%5);
   settings.home_order=field(j.c_str(),"home_order");
   if(j.find("\"home_onnow\"")!=std::string::npos)settings.home_onnow=number(j.c_str(),"home_onnow")!=0;
+  settings.download_usb=number(j.c_str(),"dl_usb")!=0;
   if(j.find("\"guide_auto\"")!=std::string::npos)settings.guide_auto=number(j.c_str(),"guide_auto")!=0;
   settings.guide_url=field(j.c_str(),"guide_url");settings.guide_found=field(j.c_str(),"guide_found");
   if(j.find("\"skip_intro\"")!=std::string::npos)settings.skip_intro=(int)number(j.c_str(),"skip_intro")%3;
@@ -76,7 +77,7 @@ bool storage_init(int user){
   if(j.find("\"pic_w\"")!=std::string::npos){settings.pic_aspect=(int)number(j.c_str(),"pic_aspect")%3;settings.pic_w=std::max(50,std::min(110,(int)number(j.c_str(),"pic_w")));settings.pic_h=std::max(50,std::min(110,(int)number(j.c_str(),"pic_h")));
    // Shifts are stored offset by 100: the JSON reader here takes no minus sign.
    settings.pic_x=std::max(-40,std::min(40,(int)number(j.c_str(),"pic_x")-100));settings.pic_y=std::max(-40,std::min(40,(int)number(j.c_str(),"pic_y")-100));}}return true;}
-bool save_settings(){return write_atomic("settings.json","{\"v\":11,\"bitrate\":"+std::to_string(settings.bitrate)+",\"resume\":"+std::to_string(settings.resume)+",\"method\":"+std::to_string(settings.method)+",\"saver\":"+std::to_string(settings.saver)+",\"saver_delay\":"+std::to_string(settings.saver_delay)+",\"language\":"+json_quote(settings.language)+",\"hd1080\":"+std::to_string(settings.hd1080)+",\"debug\":"+std::to_string(settings.debug_log)+",\"pic_aspect\":"+std::to_string(settings.pic_aspect)+",\"pic_w\":"+std::to_string(settings.pic_w)+",\"pic_h\":"+std::to_string(settings.pic_h)+",\"pic_x\":"+std::to_string(settings.pic_x+100)+",\"pic_y\":"+std::to_string(settings.pic_y+100)+",\"viz\":"+std::to_string(settings.viz)+",\"volume\":"+std::to_string(settings.volume)+",\"home_order\":"+json_quote(settings.home_order)+",\"skip_intro\":"+std::to_string(settings.skip_intro)+",\"skip_outro\":"+std::to_string(settings.skip_outro)+",\"home_onnow\":"+std::to_string(settings.home_onnow)+",\"guide_auto\":"+std::to_string(settings.guide_auto)+",\"guide_url\":"+json_quote(settings.guide_url)+",\"guide_found\":"+json_quote(settings.guide_found)+"}");}
+bool save_settings(){return write_atomic("settings.json","{\"v\":11,\"bitrate\":"+std::to_string(settings.bitrate)+",\"resume\":"+std::to_string(settings.resume)+",\"method\":"+std::to_string(settings.method)+",\"saver\":"+std::to_string(settings.saver)+",\"saver_delay\":"+std::to_string(settings.saver_delay)+",\"language\":"+json_quote(settings.language)+",\"hd1080\":"+std::to_string(settings.hd1080)+",\"debug\":"+std::to_string(settings.debug_log)+",\"pic_aspect\":"+std::to_string(settings.pic_aspect)+",\"pic_w\":"+std::to_string(settings.pic_w)+",\"pic_h\":"+std::to_string(settings.pic_h)+",\"pic_x\":"+std::to_string(settings.pic_x+100)+",\"pic_y\":"+std::to_string(settings.pic_y+100)+",\"viz\":"+std::to_string(settings.viz)+",\"volume\":"+std::to_string(settings.volume)+",\"home_order\":"+json_quote(settings.home_order)+",\"skip_intro\":"+std::to_string(settings.skip_intro)+",\"skip_outro\":"+std::to_string(settings.skip_outro)+",\"home_onnow\":"+std::to_string(settings.home_onnow)+",\"dl_usb\":"+std::to_string(settings.download_usb)+",\"guide_auto\":"+std::to_string(settings.guide_auto)+",\"guide_url\":"+json_quote(settings.guide_url)+",\"guide_found\":"+json_quote(settings.guide_found)+"}");}
 // Share Sign-in (PS3): one PS4 user lends their sign-in to the console's
 // users with none of their own. It is a copy of their session beside the
 // users' folders, with whose it is; theirs keeps it up to date.
@@ -134,9 +135,14 @@ bool finish_login(const char* response, const std::string& fallback_username) {
     if (!save_session()) plog("Signed in; session could not be saved");
     return true;
 }
-bool login(const std::string& username, const std::string& password) {
+bool login(const std::string& typed_username, const std::string& password) {
     g_token[0] = g_userid[0] = 0;
+    // A stray space typed on the PS4 keyboard makes Jellyfin refuse the name.
+    // The password is sent as typed: it may hold spaces.
+    const auto first = typed_username.find_first_not_of(" \t");
+    const std::string username = first == std::string::npos ? "" : typed_username.substr(first, typed_username.find_last_not_of(" \t") - first + 1);
     int status = request(HTTP_POST, "/Users/AuthenticateByName", "{\"Username\":" + json_quote(username) + ",\"Pw\":" + json_quote(password) + "}");
+    if (status == 401) last_error = T("Jellyfin did not accept that username and password. Check them, and that the account is enabled on the server.");
     return status == 200 && finish_login(responseBuffer, username);
 }
 // A shared sign-in is only put down here, not logged out: it is someone else's.
@@ -145,7 +151,7 @@ static std::string first_string(const char* j,const char* e,const char* k){auto 
 static std::string decimal(const char* j,const char* e,const char* k){auto p=find_top_value(j,e,k);if(!p||(*p!='-'&&(*p<'0'||*p>'9')))return {};char b[16];snprintf(b,sizeof b,"%.1f",strtod(p,nullptr));return b;}
 static Item parse_item(const char* j){Item i;snprintf(i.base.id,sizeof i.base.id,"%s",field(j,"Id").c_str());snprintf(i.base.name,sizeof i.base.name,"%s",field(j,"Name").c_str());snprintf(i.base.type,sizeof i.base.type,"%s",field(j,"Type").c_str());i.overview=field(j,"Overview");i.duration=number(j,"RunTimeTicks")/10000;auto e=j+strlen(j);auto u=find_top_value(j,e,"UserData");if(u){i.resume=number(u,"PlaybackPositionTicks")/10000;auto f=find_top_value(u,e,"IsFavorite");i.favourite=f&&read_json_bool(f,e);f=find_top_value(u,e,"Played");i.played=f&&read_json_bool(f,e);}
  i.collection=field(j,"CollectionType");i.year=(int)number(j,"ProductionYear");i.rating=field(j,"OfficialRating");i.community=decimal(j,e,"CommunityRating");
- i.series=field(j,"SeriesName");i.series_id=field(j,"SeriesId");i.season=(int)number(j,"ParentIndexNumber");i.episode=(int)number(j,"IndexNumber");i.tagline=first_string(j,e,"Taglines");
+ i.series=field(j,"SeriesName");i.series_id=field(j,"SeriesId");i.season_id=field(j,"SeasonId");i.season=(int)number(j,"ParentIndexNumber");i.episode=(int)number(j,"IndexNumber");i.tagline=first_string(j,e,"Taglines");
  i.album=field(j,"Album");i.album_id=field(j,"AlbumId");i.artist=field(j,"AlbumArtist");if(i.artist.empty())i.artist=first_string(j,e,"Artists");
  auto backdrops=find_top_value(j,e,"BackdropImageTags");i.backdrop=backdrops&&*backdrops=='['&&*skip_ws(backdrops+1,e)=='"';
  // The detail page shows every billed actor as a card (PS3 Classic); the
@@ -157,11 +163,16 @@ static Item parse_item(const char* j){Item i;snprintf(i.base.id,sizeof i.base.id
   p=next;}}
  auto genres=find_top_value(j,e,"Genres");if(genres&&*genres=='['){auto p=genres+1;for(int n=0;n<3&&p<e;){p=skip_ws(p,e);if(p>=e||*p==']')break;if(*p==','){++p;continue;}if(*p!='"')break;char genre[128];if(!read_json_string(p,e,genre,sizeof genre))break;if(n++)i.genres+=", ";i.genres+=genre;auto q=p+1;bool esc=false;while(q<e&&(esc||*q!='"')){esc=!esc&&*q=='\\';++q;}p=q+1;}}
  return i;}
-static bool parse_items(const char* json,Page& next,std::string& error){
+static bool parse_items(const char* json,Page& next,std::string& error,size_t cap=60){
  auto end=json+strlen(json);auto a=find_top_value(json,end,"Items");next.total=(int)number(json,"TotalRecordCount");if(!a||*a!='['){error="Invalid library response";return false;}a++;
- while(a<end&&next.items.size()<60){a=skip_ws(a,end);if(*a==']')break;if(*a==','){a++;continue;}auto b=object_end(a,end);if(!b){error="Truncated library response";return false;}std::string obj(a,b);auto i=parse_item(obj.c_str());if(i.base.id[0])next.items.push_back(i);a=b;}if(next.total==0)next.total=(int)next.items.size();return true;
+ while(a<end&&next.items.size()<cap){a=skip_ws(a,end);if(*a==']')break;if(*a==','){a++;continue;}auto b=object_end(a,end);if(!b){error="Truncated library response";return false;}std::string obj(a,b);auto i=parse_item(obj.c_str());if(i.base.id[0])next.items.push_back(i);a=b;}if(next.total==0)next.total=(int)next.items.size();return true;
 }
-static bool parse_items(Page& next){return parse_items(responseBuffer,next,last_error);}
+static bool parse_items(Page& next,size_t cap=60){return parse_items(responseBuffer,next,last_error,cap);}
+static const int MUSIC_TAB_MODES[MUSIC_TABS]={MODE_MUSIC,MODE_ARTISTS,MODE_PLAYLISTS,MODE_GENRES,MODE_SONGS};
+static const char* const MUSIC_TAB_NAMES[MUSIC_TABS]={"Albums","Artists","Playlists","Genres","Songs"};
+int music_tab_mode(int tab){return MUSIC_TAB_MODES[((tab%MUSIC_TABS)+MUSIC_TABS)%MUSIC_TABS];}
+int music_tab_of(int mode){for(int i=0;i<MUSIC_TABS;++i)if(MUSIC_TAB_MODES[i]==mode)return i;return -1;}
+const char* music_tab_name(int tab){return MUSIC_TAB_NAMES[((tab%MUSIC_TABS)+MUSIC_TABS)%MUSIC_TABS];}
 static std::string page_path(const std::string& parent,int start,const std::string& query,int mode,const std::string& letter){
  // Cards need only their name, year, runtime, synopsis and genres. Cast lists
  // belong to the detail and quick-peek requests: for 60 films they made the
@@ -178,6 +189,18 @@ static std::string page_path(const std::string& parent,int start,const std::stri
  // An album's tracks by album, not folder: tracks in disc folders (CD1, CD2)
  // or elsewhere left a folder listing empty.
  else if(mode==MODE_ALBUM)path+="&AlbumIds="+encode(parent)+"&Recursive=true&IncludeItemTypes=Audio&SortBy=ParentIndexNumber,IndexNumber,SortName&SortOrder=Ascending";
+ // Music tabs, as the PS3 asks for them. Artists and Genres have endpoints of
+ // their own; Playlists live in their own library, so they are asked for by
+ // type with no ParentId. Songs lists every track, so one without an album
+ // tag (which no album lists) is found here.
+ else if(mode==MODE_ARTISTS||mode==MODE_GENRES){
+  path=std::string(mode==MODE_ARTISTS?"/Artists/AlbumArtists":"/MusicGenres")+"?UserId="+encode(g_userid)+"&ParentId="+encode(parent)+"&Limit=60&StartIndex="+std::to_string(start)+"&EnableImageTypes=Primary&ImageTypeLimit=1&EnableTotalRecordCount=true&SortBy=SortName&SortOrder=Ascending";}
+ else if(mode==MODE_PLAYLISTS)path+="&Recursive=true&IncludeItemTypes=Playlist&SortBy=SortName&SortOrder=Ascending";
+ else if(mode==MODE_SONGS)path+="&ParentId="+encode(parent)+"&Recursive=true&IncludeItemTypes=Audio&SortBy=SortName,DateCreated&SortOrder=Ascending";
+ // An artist's albums read as a discography, oldest first; a genre's likewise.
+ else if(mode==MODE_ARTIST||mode==MODE_GENRE)path+=std::string(mode==MODE_ARTIST?"&AlbumArtistIds=":"&GenreIds=")+encode(parent)+"&Recursive=true&IncludeItemTypes=MusicAlbum&SortBy=ProductionYear,SortName&SortOrder=Ascending";
+ // A playlist in its own order, which only this endpoint keeps.
+ else if(mode==MODE_PLAYLIST)path="/Playlists/"+encode(parent)+"/Items?UserId="+encode(g_userid)+"&Limit=60&StartIndex="+std::to_string(start)+"&Fields=Overview,Genres&EnableImageTypes=Primary&ImageTypeLimit=1&EnableTotalRecordCount=true";
  else if(!parent.empty())path+="&ParentId="+encode(parent)+"&SortBy=SortName,DateCreated&SortOrder=Ascending";
  // The PS3 jump bar: '#' lists names before A, a letter lists names starting with it.
  if(letter=="#")path+="&NameLessThan=A";else if(!letter.empty())path+="&NameStartsWith="+encode(letter);
@@ -274,6 +297,53 @@ static bool fetch_on_now(Page& page){
  }
  next.total=(int)next.items.size();page=next;return true;
 }
+// Live search (PS3 ui_search.cpp): any thread, its own buffer -- a broad
+// term is the largest answer the app asks for -- and last_error left alone.
+// A search answered with nothing is asked once more: a slow server can
+// answer a search it gave up on with an empty list.
+bool search_library(const std::string& term,Page& page){
+ page={};if(term.empty())return true;
+ const std::string path="/Users/"+encode(g_userid)+"/Items?SearchTerm="+encode(term)+"&Recursive=true&Limit=60&IncludeItemTypes=Movie,Series,Episode,MusicAlbum,Audio,MusicArtist,BoxSet,Playlist,TvChannel&Fields=Overview,Genres&EnableImageTypes=Primary,Backdrop&ImageTypeLimit=1&EnableTotalRecordCount=true";
+ std::vector<char> body(RESPONSE_SIZE+1);
+ for(int attempt=0;attempt<2;++attempt){
+  if(http_request(HTTP_GET,(std::string(g_server)+path).c_str(),"",g_token,body.data(),(int)body.size())!=200)return false;
+  Page next;std::string error;if(!parse_items(body.data(),next,error))return false;page=next;
+  if(!page.items.empty())break;
+ }
+ return true;
+}
+// Downloads (downloads.cpp, on its worker): what an item stands for -- a
+// season or series its episodes, an album its tracks, else itself -- and an
+// item as the server describes it, kept beside the downloaded file.
+bool download_targets(const Item& item,std::vector<Item>& out){
+ out.clear();const std::string type=item.base.type;std::string path;
+ if(type=="Season")path="/Users/"+encode(g_userid)+"/Items?ParentId="+encode(item.base.id)+"&IncludeItemTypes=Episode&Recursive=true&SortBy=ParentIndexNumber,IndexNumber&Limit=1000";
+ else if(type=="Series")path="/Users/"+encode(g_userid)+"/Items?ParentId="+encode(item.base.id)+"&IncludeItemTypes=Episode&Recursive=true&SortBy=ParentIndexNumber,IndexNumber&Limit=1000";
+ else if(type=="MusicAlbum")path="/Users/"+encode(g_userid)+"/Items?AlbumIds="+encode(item.base.id)+"&IncludeItemTypes=Audio&Recursive=true&SortBy=ParentIndexNumber,IndexNumber,SortName&Limit=1000";
+ else{out.push_back(item);return true;}
+ std::vector<char> body(RESPONSE_SIZE+1);
+ if(http_request(HTTP_GET,(std::string(g_server)+path).c_str(),"",g_token,body.data(),(int)body.size())!=200)return false;
+ Page page;std::string error;if(!parse_items(body.data(),page,error,1000))return false;out=page.items;return true;
+}
+std::string item_json(const std::string& id){
+ std::vector<char> body(1024*1024);
+ if(http_request(HTTP_GET,(std::string(g_server)+"/Users/"+encode(g_userid)+"/Items/"+encode(id)).c_str(),"",g_token,body.data(),(int)body.size())!=200)return {};
+ return body.data();
+}
+// The recent searches: the terms whose results were opened, newest first.
+std::vector<std::string> recent_searches(){
+ std::vector<std::string> out;const std::string text=read_file("recent-searches.txt");size_t at=0;
+ while(at<text.size()&&out.size()<8){size_t end=text.find('\n',at);if(end==std::string::npos)end=text.size();std::string term=text.substr(at,end-at);if(!term.empty())out.push_back(term);at=end+1;}
+ return out;
+}
+void forget_search(const std::string& term){
+ std::string text;for(const auto& t:recent_searches())if(t!=term)text+=t+"\n";write_atomic("recent-searches.txt",text);
+}
+void remember_search(const std::string& term){
+ if(term.empty())return;auto same=[&](const std::string& a){if(a.size()!=term.size())return false;for(size_t i=0;i<a.size();++i)if(tolower((unsigned char)a[i])!=tolower((unsigned char)term[i]))return false;return true;};
+ std::vector<std::string> terms{term};for(const auto& t:recent_searches())if(!same(t)&&terms.size()<8)terms.push_back(t);
+ std::string text;for(const auto& t:terms)text+=t+"\n";write_atomic("recent-searches.txt",text);
+}
 bool fetch_home_row(HomeRowKind kind,const Item& library,Page& page){
  if(kind==HOME_ONNOW)return fetch_on_now(page);
  const std::string fields="&Fields=Overview,Genres&EnableImageTypes=Primary,Backdrop&ImageTypeLimit=1";std::string path;
@@ -286,12 +356,13 @@ bool fetch_home_row(HomeRowKind kind,const Item& library,Page& page){
  Page next;if(!parse_items(body.data(),next,error))return false;page=next;return true;
 }
 bool fetch_album_tracks(const std::string& album_id,Page& page){
- const std::string path="/Users/"+encode(g_userid)+"/Items?AlbumIds="+encode(album_id)+"&IncludeItemTypes=Audio&Recursive=true&SortBy=ParentIndexNumber,IndexNumber,SortName&SortOrder=Ascending&Limit=60";
- if(request(HTTP_GET,path)!=200)return false;Page next;if(!parse_items(next))return false;page=next;return true;
+ const std::string path="/Users/"+encode(g_userid)+"/Items?AlbumIds="+encode(album_id)+"&IncludeItemTypes=Audio&Recursive=true&SortBy=ParentIndexNumber,IndexNumber,SortName&SortOrder=Ascending&Limit=1000";
+ if(request(HTTP_GET,path)!=200)return false;Page next;if(!parse_items(next,1000))return false;page=next;return true;
 }
 int segments_supported(){
  static std::string asked;static int known=-1;
- const std::string who=std::string(g_server)+"|"+g_userid;if(asked==who)return known;
+ const std::string who=std::string(g_server)+"|"+g_userid;
+ if(asked==who)return known;
  known=-1;
  // Media segments arrived in 10.10.
  if(request(HTTP_GET,"/System/Info/Public")==200){const std::string v=field(responseBuffer,"Version");int major=0,minor=0;
@@ -303,18 +374,45 @@ int segments_supported(){
   // Segments, EDL / segment providers.
   known=all.find("intro skipper")!=std::string::npos||all.find("introskipper")!=std::string::npos||all.find("segment")!=std::string::npos?1:0;
  }
- asked=who;plog(known==1?"Segments: a segment plugin is installed":known==0?"Segments: no segment plugin on the server":"Segments: can't tell (plugin list needs an admin account)");
+ asked=who;plog(known==1?"Segments: a segment plugin is installed":known==0?"Segments: no segment plugin on the server":"Segments: can't tell (the plugin list is for admins); markers are still asked for");
  return known;
+}
+// A chapter whose name says what it is: an intro (or recap) or the credits.
+// Many files name theirs; "Chapter 3" says nothing and is left alone.
+static int chapter_kind(std::string name){
+ for(char& c:name)c=(char)tolower((unsigned char)c);
+ auto has=[&](const char* w){return name.find(w)!=std::string::npos;};
+ if(has("intro")||has("opening")||has("recap")||has("previously")||name=="op"||has("cold open"))return 1;
+ if(has("credit")||has("ending")||has("outro")||name=="ed"||has("end titles"))return 2;
+ return 0;
+}
+// No markers from the server: the item's chapters named as an intro or the credits.
+static std::vector<MediaSegment> chapter_segments(const std::string& item_id){
+ std::vector<MediaSegment> out;
+ if(request(HTTP_GET,"/Users/"+encode(g_userid)+"/Items/"+encode(item_id)+"?Fields=Chapters")!=200)return out;
+ const char* j=responseBuffer;const char* e=j+strlen(j);const uint64_t runtime=number(j,"RunTimeTicks")/10000;
+ auto a=find_top_value(j,e,"Chapters");if(!a||*a!='[')return out;++a;
+ std::vector<std::pair<uint64_t,int>> chapters;
+ while(a<e){a=skip_ws(a,e);if(a>=e||*a==']')break;if(*a==','){++a;continue;}auto b=object_end(a,e);if(!b)break;
+  const std::string obj(a,b);chapters.push_back({number(obj.c_str(),"StartPositionTicks")/10000,chapter_kind(field(obj.c_str(),"Name"))});a=b;}
+ for(size_t i=0;i<chapters.size();++i){if(!chapters[i].second)continue;
+  MediaSegment s;s.outro=chapters[i].second==2;s.start=chapters[i].first;s.end=i+1<chapters.size()?chapters[i+1].first:runtime;
+  // An intro is under 5 minutes, the credits under 12: a longer "chapter" is not one.
+  const uint64_t length=s.end>s.start?s.end-s.start:0;
+  if(length>=5000&&length<=(s.outro?720000ULL:300000ULL))out.push_back(s);}
+ if(!out.empty())plog(("Segments: "+std::to_string(out.size())+" from chapter names").c_str());
+ return out;
 }
 std::vector<MediaSegment> fetch_segments(const std::string& item_id){
  std::vector<MediaSegment> out;
- if(request(HTTP_GET,"/MediaSegments/"+encode(item_id)+"?includeSegmentTypes=Intro&includeSegmentTypes=Outro")!=200)return out;
+ if(request(HTTP_GET,"/MediaSegments/"+encode(item_id)+"?includeSegmentTypes=Intro&includeSegmentTypes=Outro")!=200)return chapter_segments(item_id);
  const char* j=responseBuffer;const char* e=j+strlen(j);auto a=find_top_value(j,e,"Items");if(!a||*a!='[')return out;++a;
  while(a<e){a=skip_ws(a,e);if(a>=e||*a==']')break;if(*a==','){++a;continue;}auto b=object_end(a,e);if(!b)break;
   const std::string obj(a,b);const std::string type=field(obj.c_str(),"Type");
   // Ticks are 100 ns.
   MediaSegment s;s.outro=type=="Outro";s.start=number(obj.c_str(),"StartTicks")/10000;s.end=number(obj.c_str(),"EndTicks")/10000;
   if((type=="Intro"||type=="Outro")&&s.end>s.start+1000)out.push_back(s);a=b;}
+ if(out.empty())return chapter_segments(item_id);
  return out;
 }
 bool fetch_adjacent_episodes(const Item& episode,Item& prev,Item& next,bool& has_prev,bool& has_next){
@@ -395,7 +493,7 @@ bool playback_url(const Item& i,int audio,int sub,const std::string& selected_so
  plog((std::string("Playback source: id=")+source_id+" live="+(!live_stream_id.empty()?"yes":"no")+" transcoding_url="+(!url.empty()?"yes":"no")).c_str());
  auto direct_play=find_top_value(source.c_str(),end,"SupportsDirectPlay");
  const bool server_direct=may_direct&&url.empty()&&direct_play&&read_json_bool(direct_play,end);
- if((settings.method==PLAY_DIRECT_FILE||server_direct)&&!live){last_static=true;plog(server_direct?"Playback: direct play (the original file)":"Playback: direct file (setting)");url=std::string(g_server)+(strcmp(i.base.type,"Audio")==0?"/Audio/":"/Videos/")+encode(i.base.id)+"/stream?Static=true&MediaSourceId="+encode(source_id)+"&api_key="+encode(g_token);}
+ if((settings.method==PLAY_DIRECT_FILE||server_direct)&&!live){last_static=true;plog(server_direct?"Playback: direct play (the original file)":"Playback: direct file (setting)");url=std::string(g_server)+(strcmp(i.base.type,"Audio")==0?"/Audio/":"/Videos/")+encode(i.base.id)+"/stream?Static=true&MediaSourceId="+encode(source_id)+"&ApiKey="+encode(g_token);}
  else if(url.empty()){
   auto transcode=find_top_value(source.c_str(),end,"SupportsTranscoding");
   if(live&&!live_stream_id.empty()&&!source_id.empty()&&transcode&&read_json_bool(transcode,end)){
@@ -407,11 +505,12 @@ bool playback_url(const Item& i,int audio,int sub,const std::string& selected_so
   if(url.empty()){last_error=live?"The live source opened, but the server did not offer a compatible H264/AAC stream.":"The server did not offer a compatible H264/AAC transcode.";plog(last_error.c_str());return false;}
  }
  if(!url.empty()&&url[0]=='/')url=std::string(g_server)+url;
- // AvPlayer makes its own HTTP requests and cannot inherit X-Emby-Token
+ // AvPlayer makes its own HTTP requests and cannot inherit the Authorization header
  // from our API transport. Authenticate same-server URLs when the server
  // has omitted the key; never attach our token to an external provider URL.
  const std::string base=std::string(g_server)+"/";
- if(url.rfind(base,0)==0&&url.find("api_key=")==std::string::npos){url+=(url.find('?')==std::string::npos?"?":"&");url+="api_key="+encode(g_token);}
+ // ApiKey, not the legacy api_key that Jellyfin 10.12 turns off by default.
+ if(url.rfind(base,0)==0&&url.find("api_key=")==std::string::npos&&url.find("ApiKey=")==std::string::npos&&url.find("apikey=")==std::string::npos){url+=(url.find('?')==std::string::npos?"?":"&");url+="ApiKey="+encode(g_token);}
  if(!last_static){url+=(url.find('?')==std::string::npos?"?":"&");url+="MaxWidth="+max_w+"&MaxHeight="+max_h+"&AudioSampleRate=48000&MaxAudioChannels=2";}
  if(url.rfind("http://",0)!=0&&url.rfind("https://",0)!=0){last_error="Unsupported playback URL";return false;}
  return true;

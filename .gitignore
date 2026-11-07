@@ -6,6 +6,7 @@ dist/*
 !dist/v1.10/
 !dist/v1.11/
 !dist/v1.12/
+!dist/v1.13/
 
 # Large third-party toolchains (re-downloadable)
 *.tar.gz

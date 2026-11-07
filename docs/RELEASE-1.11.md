@@ -1,4 +1,4 @@
-# Jellyfin [PS] for PS4 — 1.11
+# Jellyfin [PS] for PS4 - 1.11
 
 ## New
 
@@ -25,4 +25,4 @@
 
 ## Package
 
-`IV0000-JFPS40000_00-JELLYFINPS400000.pkg` — title ID `JFPS40000`, version `01.11`. Installs over 1.10 and keeps your sign-in and settings; Settings › Software Update offers it on 1.10.
+`IV0000-JFPS40000_00-JELLYFINPS400000.pkg` - title ID `JFPS40000`, version `01.11`. Installs over 1.10 and keeps your sign-in and settings; Settings › Software Update offers it on 1.10.

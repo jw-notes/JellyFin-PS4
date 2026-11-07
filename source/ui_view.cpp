@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "../vendor/ps3/source/ui/render/peek.h"
+#include "downloads.h"
 #include "../vendor/ps3/source/ui/render/clock_fmt.h"
 #ifndef HOST_TEST
 #include <orbis/SystemService.h>
@@ -108,7 +109,13 @@ static void header_chrome(const std::string& tab,int focused_tab){
    if(state<0)missing=g_userid;else if(state==0&&missing!=g_userid)load_image(key,"/Users/"+encode(g_userid)+"/Images/Primary?MaxWidth=96&Quality=90");
    if(state<=0||!draw_art_circle(key,ax,ay,d))avatar(ax,ay,d);ring(ax+d/2,ay+d/2,d/2,g_theme.hairline);right=ax-16;}
   std::string t,dt;console_clock(0,t,dt);const int a=boot_header_pose()?(int)(255*std::max(0.0f,std::min(1.0f,boot_header_pose()->word_alpha[7]))):255;
-  if(a>0){const int tw=face_text_width(t,17,TextFace::Classic),dw=face_text_width(dt,13,TextFace::Classic);face_text(right-tw,20,t,mix(g_theme.bg_top,g_theme.text,a),17,TextFace::Classic);face_text(right-tw-10-dw,24,dt,mix(g_theme.bg_top,g_theme.text_faint,a),13,TextFace::Classic);}}
+  if(a>0){const int tw=face_text_width(t,17,TextFace::Classic),dw=face_text_width(dt,13,TextFace::Classic);face_text(right-tw,20,t,mix(g_theme.bg_top,g_theme.text,a),17,TextFace::Classic);face_text(right-tw-10-dw,24,dt,mix(g_theme.bg_top,g_theme.text_faint,a),13,TextFace::Classic);
+   // A download running: how far, on every screen, left of the date.
+   const DownloadStatus dl=download_status();
+   if((dl.active||(dl.paused&&dl.queued))&&!boot_header_pose()){const std::string label=dl.paused?std::string(T("Downloads paused")):dl.total?TF("Downloading %d%%",(int)(100.0*dl.got/dl.total)):std::string(T("Downloading..."));
+    const int lw=face_text_width(label,13,TextFace::Classic)+20,lx=right-tw-10-dw-18-lw;round_rect(lx,19,lw,22,11,g_theme.accent_deep,230);
+    if(dl.total)round_rect(lx,19,(int)(lw*std::min(1.0,(double)dl.got/dl.total)),22,11,g_theme.accent,200);
+    face_text(lx+10,23,label,g_theme.white,13,TextFace::Classic);}}}
  int widths[3],total=20;for(int i=0;i<3;++i){widths[i]=face_text_width(T(header_tabs[i]),17,TextFace::Classic)+36;total+=widths[i];}int x=(WIDTH-total)/2;
  for(int i=0;i<3;++i){bool focused=i==focused_tab,active=tab==header_tabs[i];if(!tab.empty()){if(focused)rect(x,14,widths[i],34,g_theme.accent);else if(active)rect(x+14,45,widths[i]-28,3,g_theme.accent);face_text(x+18,20,T(header_tabs[i]),focused?g_theme.bg:active?g_theme.text:g_theme.text_dim,17,TextFace::Classic);}x+=widths[i]+10;}
 }
@@ -147,12 +154,19 @@ static void draw_jump_bar(const JumpBar& jump,int x,int top,int bottom,int curre
   if(selected){rect(x-2,y+2,24,pitch-4,g_theme.accent);color=g_theme.bg;}
   face_text(x+(20-face_text_width(label,size,TextFace::Classic))/2,y+(pitch-size)/2,label,color,size,TextFace::Classic);}
 }
-void draw_library(const Page& page,const std::string& title,int start,int selected,bool home,int focused_tab,int first,const std::string& breadcrumb,const JumpBar* jump){
+void draw_library(const Page& page,const std::string& title,int start,int selected,bool home,int focused_tab,int first,const std::string& breadcrumb,const JumpBar* jump,int music_tab){
  const auto g=library_grid(page,home);first=library_window(g,selected,std::max(0,first));int top=home?174:156,gap=home?20:24,visible=g.cols*g.rows;
  const std::string search_prefix=TF("Search: %s","");app_header(home?T("My Media"):"",title.rfind(search_prefix,0)==0?"Search":"Home",focused_tab);
  if(!home){face_text(g.x0,86,fit_face(title,900,24,TextFace::Classic),g_theme.text,24,TextFace::Classic);
   std::string sub=breadcrumb;if(sub.empty()&&jump&&!jump->filter.empty())sub=jump->filter=="#"?T("Names before A"):TF("Starting with %s",jump->filter.c_str());
-  if(!sub.empty())face_text(g.x0,122,fit_face(sub,g.grid_w,15,TextFace::Classic),g_theme.text_dim,15,TextFace::Classic);}
+  // A music library's tabs (PS3 sub-tabs), L2 / R2 between them; a letter
+  // filter shows beside them.
+  if(music_tab>=0){int x=g.x0;x+=draw_button_icon('L',x,118,22)+10;
+   for(int i=0;i<MUSIC_TABS;++i){const std::string name=T(music_tab_name(i));const int w=face_text_width(name,16,TextFace::Classic);const bool on=i==music_tab;
+    face_text(x,120,name,on?g_theme.white:g_theme.text_dim,16,TextFace::Classic);if(on)rect(x,141,w,3,g_theme.accent);x+=w+26;}
+   x+=draw_button_icon('R',x,118,22)+20;
+   if(!sub.empty())face_text(x,122,fit_face(sub,std::max(0,g.x0+g.grid_w-x),15,TextFace::Classic),g_theme.text_dim,15,TextFace::Classic);}
+  else if(!sub.empty())face_text(g.x0,122,fit_face(sub,g.grid_w,15,TextFace::Classic),g_theme.text_dim,15,TextFace::Classic);}
  int last=std::min(first+visible,(int)page.items.size());std::string count=page.items.empty()?T("No items"):std::to_string(start+first+1)+" - "+std::to_string(start+last)+" / "+std::to_string(page.total);
  if(home)text(48,143,count,g_theme.text_dim);else face_text(WIDTH-g.x0-face_text_width(count,14,TextFace::Classic),95,count,g_theme.text_dim,14,TextFace::Classic);
  for(int i=first;i<last;++i){const auto& item=page.items[i];int relative=i-first,x=g.x0+(relative%g.cols)*(g.card_w+gap),y=top+(relative/g.cols)*g.stride;bool focus=i==selected&&!(jump&&jump->active);
@@ -161,7 +175,7 @@ void draw_library(const Page& page,const std::string& title,int start,int select
   if(focus)outline(x-3,y-3,g.card_w+6,g.card_h+6,g_theme.focus_ring,2);
   if(home){text(x,y+g.card_h+12,fit_text(item.base.name,g.card_w),focus?g_theme.text:g_theme.text_dim,24,g.card_w);text(x,y+g.card_h+42,kind(item),g_theme.text_faint,24,g.card_w);}
   else{bool wide=g.card_w>g.card_h;int size=wide?(focus?20:16):(focus?21:20);TextFace face=wide?TextFace::Classic:TextFace::Poster;face_text(x,y+g.card_h+8,fit_face(item.base.name,g.card_w,size,face),focus?g_theme.text:g_theme.text_dim,size,face,g.card_w);
-   if(focus){std::string meta=item.year?std::to_string(item.year):"";if(item.duration){if(!meta.empty())meta+="  ";meta+=std::to_string(item.duration/60000)+" min";}face_text(x,y+g.card_h+34,fit_face(meta,g.card_w,14,TextFace::Poster),g_theme.text_dim,14,TextFace::Poster,g.card_w);}}
+   if(focus){std::string meta=!strcmp(item.base.type,"Audio")&&!item.artist.empty()?item.artist:item.year?std::to_string(item.year):"";if(item.duration){if(!meta.empty())meta+="  ";meta+=std::to_string(item.duration/60000)+" min";}face_text(x,y+g.card_h+34,fit_face(meta,g.card_w,14,TextFace::Poster),g_theme.text_dim,14,TextFace::Poster,g.card_w);}}
   if(item.duration&&item.resume){int fill=(int)(g.card_w*std::min(1.0,(double)item.resume/item.duration));rect(x,y+g.card_h-3,g.card_w,3,g_theme.track);rect(x,y+g.card_h-3,fill,3,g_theme.accent);}
  }
  if(!home&&page.items.empty()&&jump&&!jump->filter.empty())face_text(g.x0,top+36,TF("Nothing starts with %s. Press Left to pick another letter.",jump->filter.c_str()),g_theme.text_dim,18,TextFace::Classic);
@@ -170,8 +184,8 @@ void draw_library(const Page& page,const std::string& title,int start,int select
  if(!home&&page.total>visible){int bar_h=(g.rows-1)*g.stride+g.card_h,thumb=std::max(24,bar_h*visible/page.total),offset=(bar_h-thumb)*(start+first)/std::max(1,page.total-visible);rect(g.x0+g.grid_w+14,top,3,bar_h,g_theme.track);rect(g.x0+g.grid_w+14,top+std::min(bar_h-thumb,offset),3,thumb,g_theme.accent);}
  if(jump&&jump->active)hint_bar({{'D',"Letter"},{'X',"Jump"},{'C',"Cancel"}});
  else if(focused_tab>=0)hint_bar({{'D',"Nav"},{'X',"Select"},{'C',"Back"}});
- else if(jump&&jump->show)hint_bar({{'D',"Nav"},{'X',"Open"},{'T',"Details"},{'C',jump->filter.empty()?"Back":"Clear letter"},{'l',""},{'r',"Tabs"}});
- else hint_bar({{'D',"Nav"},{'X',"Open"},{'T',"Details"},{'C',"Back"},{'l',""},{'r',"Tabs"}});
+ else if(jump&&jump->show)hint_bar({{'D',"Nav"},{'X',"Open"},{'T',"Details"},{'O',"Download"},{'C',jump->filter.empty()?"Back":"Clear letter"},{'l',""},{'r',"Tabs"}});
+ else hint_bar({{'D',"Nav"},{'X',"Open"},{'T',"Details"},{'O',"Download"},{'C',"Back"},{'l',""},{'r',"Tabs"}});
  if(jump&&jump->show&&!jump->active){const char* label="Left at first column: A-Z";int x=WIDTH-64-hints_width({{'D',label}});draw_hints(x,674,{{'D',label}});}
 }
 
@@ -262,12 +276,75 @@ void draw_home(const HomeView& home,int header_focus){
 }
 
 // ---- search ----------------------------------------------------------------
-void draw_search(const std::string& query){
- app_header(T("Search your library"),"Search");
- rect(48,190,1184,88,g_theme.panel_hi);outline(48,190,1184,88,g_theme.focus_ring,2);
- text(72,219,fit_text(query.empty()?T("Enter a title, show, artist or album"):query,1120,32),query.empty()?g_theme.text_dim:g_theme.text,32,1120);
- text(48,330,T("Search across your Jellyfin libraries."),g_theme.text_dim);
- hint_bar({{'X',"Enter search"},{'C',"Back"},{'l',"Home"},{'r',"Settings"}});
+const char* search_kind(const Item& item){
+ static const struct{const char* type;const char* kind;} kinds[]={{"Movie","Films"},{"Series","Shows"},{"Episode","Episodes"},{"MusicAlbum","Albums"},{"Audio","Songs"},{"MusicArtist","Artists"},{"BoxSet","Collections"},{"Playlist","Playlists"},{"TvChannel","Channels"}};
+ for(const auto& k:kinds)if(!strcmp(item.base.type,k.type))return k.kind;return "Other";
+}
+// A result's second line: the show and episode, the artist, or the year.
+static std::string search_meta(const Item& item){
+ std::string meta=T(search_kind(item));
+ if(!strcmp(item.base.type,"Episode")){if(!item.series.empty())meta+="  \xC2\xB7  "+item.series;const std::string code=episode_code(item);if(!code.empty())meta+="  "+code;}
+ else if(!item.artist.empty())meta+="  \xC2\xB7  "+item.artist;
+ else if(item.year)meta+="  \xC2\xB7  "+std::to_string(item.year);
+ return meta;
+}
+// The PS3 Classic layout: the field at the top. While typing, the keyboard
+// is under it and whatever rows fit below that; Down from the keyboard's last
+// row folds it away and the list fills the screen, with the filter chips
+// over it and a box beside it describing the highlighted result.
+constexpr int SEARCH_X=150,SEARCH_W=980,SEARCH_FIELD_Y=92,SEARCH_FIELD_H=48,SEARCH_LIST_X=110,SEARCH_LIST_W=760,SEARCH_ROW=66,SEARCH_BOTTOM=640;
+static int search_keys_height(const SearchView& view){return view.keys?(int)view.editor->layout().size()*44+12:0;}
+static bool search_has_head(const SearchView& view){return !view.results.empty()||(view.editor->input.empty()&&!view.recents.empty());}
+static int search_list_y(const SearchView& view){return SEARCH_FIELD_Y+SEARCH_FIELD_H+14+search_keys_height(view)+(search_has_head(view)?38:0);}
+static int search_rows(const SearchView& view){return std::max(0,(SEARCH_BOTTOM-search_list_y(view))/SEARCH_ROW);}
+static int search_first(const SearchView& view){const int n=view.results.empty()?(int)view.recents.size():(int)view.results.size(),rows=std::max(1,search_rows(view));return std::max(0,std::min(n-rows,view.selected-rows/2));}
+PeekOrigin search_row_rect(const SearchView& view,int index){return {SEARCH_LIST_X+14,search_list_y(view)+(index-search_first(view))*SEARCH_ROW+6,36,54};}
+void draw_search_page(const SearchView& view){
+ app_header("","Search");
+ const KeyboardEditor& editor=*view.editor;const bool typed=!editor.input.empty();
+ // The field: the term and its cursor, an accent line under it.
+ rect(SEARCH_X,SEARCH_FIELD_Y,SEARCH_W,SEARCH_FIELD_H,g_theme.panel);rect(SEARCH_X,SEARCH_FIELD_Y+SEARCH_FIELD_H-2,SEARCH_W,2,g_theme.accent);
+ {const int cx=SEARCH_X+26,cy=SEARCH_FIELD_Y+21;ring(cx,cy,8,g_theme.text_dim);for(int i=0;i<6;++i)rect(cx+6+i,cy+6+i,2,2,g_theme.text_dim);}
+ if(typed)face_text(SEARCH_X+50,SEARCH_FIELD_Y+11,fit_face(view.keys?editor.displayed(false):editor.input,SEARCH_W-70,24,TextFace::Classic),g_theme.white,24,TextFace::Classic);
+ else face_text(SEARCH_X+50,SEARCH_FIELD_Y+13,T("Search your library"),g_theme.text_faint,20,TextFace::Classic);
+ if(view.keys)draw_keyboard_panel(editor,SEARCH_X,SEARCH_FIELD_Y+SEARCH_FIELD_H+14,SEARCH_W,true);
+ // The line over the list: filter chips with their counts, else what the list is.
+ const bool recent=view.results.empty()&&!typed;const int head_y=search_list_y(view)-36;
+ if(!view.results.empty()&&!view.filters.empty()){int x=SEARCH_LIST_X;
+  for(int i=0;i<(int)view.filters.size();++i){const int n=i<(int)view.filter_counts.size()?view.filter_counts[i]:0;const std::string label=std::string(T(view.filters[i].c_str()))+"  "+std::to_string(n);
+   const int w=face_text_width(label,15,TextFace::Classic)+24;if(x+w>SEARCH_LIST_X+SEARCH_LIST_W)break;const bool on=i==view.filter;
+   rect(x,head_y,w,28,on?g_theme.accent:g_theme.panel);if(!on){rect(x,head_y,w,1,g_theme.hairline);rect(x,head_y+27,w,1,g_theme.hairline);}
+   face_text(x+12,head_y+5,label,on?g_theme.bg:n?g_theme.text:g_theme.text_faint,15,TextFace::Classic);x+=w+10;}}
+ else if(recent&&!view.recents.empty())face_text(SEARCH_LIST_X,head_y+4,T("Recent searches"),g_theme.text_dim,15,TextFace::Classic);
+ else if(typed&&!view.keys)face_text(SEARCH_LIST_X,head_y+4,T(view.searching?"Searching...":view.failed?"Search failed":"No results"),g_theme.text_dim,15,TextFace::Classic);
+ if(typed&&view.keys&&view.results.empty()&&search_rows(view)>0)face_text(SEARCH_LIST_X,search_list_y(view)+8,T(view.searching?"Searching...":view.failed?"Search failed":editor.input.size()<2?"":"No results"),g_theme.text_dim,15,TextFace::Classic);
+ // The list: poster, title, and year / runtime / what it is.
+ const int n=recent?(int)view.recents.size():(int)view.results.size(),first=search_first(view),rows=search_rows(view),top=search_list_y(view);
+ for(int i=first;i<std::min(n,first+rows);++i){const int y=top+(i-first)*SEARCH_ROW;const bool sel=!view.keys&&i==view.selected;
+  if(sel){rect(SEARCH_LIST_X,y,SEARCH_LIST_W,SEARCH_ROW-6,g_theme.panel_hi);rect(SEARCH_LIST_X,y,3,SEARCH_ROW-6,g_theme.accent);}
+  if(recent){face_text(SEARCH_LIST_X+24,y+18,fit_face(view.recents[i],SEARCH_LIST_W-48,19,TextFace::Classic),sel?g_theme.white:g_theme.text,19,TextFace::Classic);continue;}
+  const Item& item=view.results[i];rect(SEARCH_LIST_X+14,y+3,36,54,g_theme.thumb_dim);draw_art_cover(item.base.id,SEARCH_LIST_X+14,y+3,36,54);
+  face_text(SEARCH_LIST_X+64,y+8,fit_face(item.base.name,SEARCH_LIST_W-80,20,TextFace::Classic),sel?g_theme.white:g_theme.text,20,TextFace::Classic);
+  std::string meta;if(!strcmp(item.base.type,"Episode")){meta=item.series;const std::string code=episode_code(item);if(!code.empty())meta+=(meta.empty()?"":"  ")+code;}
+  else if(!item.artist.empty())meta=item.artist;
+  if(item.year)meta+=(meta.empty()?"":"  \xC2\xB7  ")+std::to_string(item.year);
+  if(item.duration&&strcmp(item.base.type,"Audio")){const int m=(int)(item.duration/60000);meta+=(meta.empty()?"":"  \xC2\xB7  ")+(m>=60?std::to_string(m/60)+"h "+std::to_string(m%60)+"m":std::to_string(m)+"m");}
+  meta+=(meta.empty()?"":"  \xC2\xB7  ")+std::string(T(search_kind(item)));
+  face_text(SEARCH_LIST_X+64,y+35,fit_face(meta,SEARCH_LIST_W-80,14,TextFace::Classic),g_theme.text_dim,14,TextFace::Classic);}
+ if(n>rows&&rows>0){const int bar=rows*SEARCH_ROW-6,thumb=std::max(20,bar*rows/n),off=(bar-thumb)*first/std::max(1,n-rows);rect(SEARCH_LIST_X+SEARCH_LIST_W+6,top,3,bar,g_theme.track);rect(SEARCH_LIST_X+SEARCH_LIST_W+6,top+off,3,thumb,g_theme.accent);}
+ // The box beside the highlighted result (PS3 3.5): poster, title, what it is, synopsis.
+ if(!view.keys&&!view.results.empty()){const Item& item=view.results[std::min(view.selected,(int)view.results.size()-1)];
+  const int bx=SEARCH_LIST_X+SEARCH_LIST_W+24,bw=WIDTH-48-bx,by=top,bh=std::min(330,SEARCH_BOTTOM-by);
+  if(bw>=170&&bh>=120){round_rect(bx,by,bw,bh,10,g_theme.panel,220);
+   const bool square=!strcmp(item.base.type,"MusicAlbum")||!strcmp(item.base.type,"Audio")||!strcmp(item.base.type,"MusicArtist")||!strcmp(item.base.type,"Playlist");
+   int ph=std::min(150,bh/2),pw=square?ph:ph*2/3;rect(bx+12,by+14,pw,ph,g_theme.thumb_dim);draw_art_cover(item.base.id,bx+12,by+14,pw,ph);
+   const int tx=bx+12+pw+12,tw=bx+bw-12-tx;
+   if(tw>60){paragraph(tx,by+14,item.base.name,tw,3,g_theme.white,17,22);face_text(tx,by+84,fit_face(T(search_kind(item)),tw,13,TextFace::Classic),g_theme.accent_alt,13,TextFace::Classic);
+    if(item.year)face_text(tx,by+104,std::to_string(item.year),g_theme.text_dim,13,TextFace::Classic);}
+   if(!item.overview.empty())paragraph(bx+12,by+14+ph+12,item.overview,bw-24,std::max(1,(bh-ph-40)/19),g_theme.text_dim,14,19);}}
+ if(view.keys)hint_bar({{'X',"Type"},{'S',"Delete"},{'T',"Caps"},{'L',""},{'R',"Cursor"},{'O',"Results"},{'C',typed?"Clear":"Back"},{'l',""},{'r',"Tabs"}});
+ else if(recent)hint_bar({{'D',"Select"},{'X',"Search"},{'S',"Remove"},{'C',"Keyboard"},{'l',""},{'r',"Tabs"}});
+ else hint_bar({{'X',"Open"},{'T',"Details"},{'L',""},{'R',"Filter"},{'C',"Keyboard"},{'l',""},{'r',"Tabs"}});
 }
 
 // ---- quick peek ----------------------------------------------------------------
@@ -324,7 +401,12 @@ void draw_quick_peek(const Item& item,const PeekOrigin& origin,float progress,co
 std::vector<DetailAction> detail_actions(const Item& item){
  std::vector<DetailAction> actions;
  if(item.resume&&settings.resume){actions.push_back(ACT_RESUME);actions.push_back(ACT_START);}else actions.push_back(ACT_PLAY);
- actions.push_back(ACT_FAVOURITE);actions.push_back(ACT_WATCHED);return actions;
+ actions.push_back(ACT_FAVOURITE);actions.push_back(ACT_WATCHED);
+ // Downloads (PS3): a film or an episode, or the episode's whole season.
+ const char* t=item.base.type;
+ if(item.local.empty()&&(!strcmp(t,"Movie")||!strcmp(t,"Episode")||!strcmp(t,"Video")))actions.push_back(ACT_DOWNLOAD);
+ if(item.local.empty()&&!strcmp(t,"Episode")&&!item.season_id.empty())actions.push_back(ACT_DOWNLOAD_SEASON);
+ return actions;
 }
 static std::vector<uint32_t> composed;static std::string composed_key;
 static std::string backdrop_key(const Item& item){return std::string(item.base.id)+":backdrop";}
@@ -349,7 +431,12 @@ static void detail_background(const Item& item){
 }
 static std::string action_label(DetailAction id,const Item& item){
  if(id==ACT_RESUME)return TF("Resume %s",clock_text(item.resume).c_str());if(id==ACT_PLAY)return T("Play");if(id==ACT_START)return T("Play from start");
- if(id==ACT_FAVOURITE)return T(item.favourite?"Favourited":"Favourite");return T(item.played?"Watched":"Mark as watched");
+ if(id==ACT_FAVOURITE)return T(item.favourite?"Favourited":"Favourite");
+ // The Download button follows its download: waiting, the percentage, done.
+ if(id==ACT_DOWNLOAD){float f=0;const int s=download_state(item.base.id,&f);
+  if(s==DLS_ACTIVE)return f<0?std::string(T("Downloading...")):TF("Downloading %d%%",(int)(f*100));
+  return T(s==DLS_DONE?"Downloaded":s==DLS_WAITING?"Waiting to download":"Download");}if(id==ACT_DOWNLOAD_SEASON)return T("Download season");
+ return T(item.played?"Watched":"Mark as watched");
 }
 // A person with no photo: the default silhouette in the photo's circle.
 static void avatar(int x,int y,int d){
@@ -419,6 +506,22 @@ void draw_detail(const Item& item,const DetailView& view){
 }
 
 // ---- player OSD ------------------------------------------------------------------
+// The player's track menu (PS3 Triangle): Audio and Subtitles as two tabs,
+// one list shown, the track playing marked and the highlighted one lit.
+void draw_track_menu(const PlayerOsd& osd){
+ constexpr int MX=740,MY=96,MW=492,ROW=36;
+ const auto& names=osd.tracks_sub?osd.sub_names:osd.audio_names;const int now=osd.tracks_sub?osd.sub_now:osd.audio_now,sel=osd.tracks_sub?osd.sub_sel:osd.audio_sel;
+ const int n=(int)names.size(),rows=std::min(n,9),mh=72+rows*ROW+44;
+ round_rect(MX,MY,MW,mh,12,0x0A0C18,235,g_theme.hairline,160);
+ int x=MX+24;for(int tab=0;tab<2;++tab){const std::string name=T(tab?"Subtitles":"Audio");const bool on=(tab==1)==osd.tracks_sub;const int w=face_text_width(name,18,TextFace::Classic);
+  if(tab==0&&osd.audio_names.empty()){continue;}
+  face_text(x,MY+18,name,on?g_theme.white:g_theme.text_dim,18,TextFace::Classic);if(on)rect(x,MY+44,w,3,g_theme.accent);x+=w+28;}
+ const int top=std::max(0,std::min(n-rows,sel-rows/2));
+ for(int i=top;i<top+rows;++i){const int y=MY+64+(i-top)*ROW;const bool lit=i==sel,playing=i==now;
+  if(lit)rect(MX+12,y-4,MW-24,ROW-2,g_theme.panel_hi);if(playing)rect(MX+12,y-4,4,ROW-2,g_theme.accent);
+  face_text(MX+30,y+2,fit_face(names[i],MW-60,17,TextFace::Classic),lit||playing?g_theme.white:g_theme.text_dim,17,TextFace::Classic);}
+ draw_hints(MX+20,MY+mh-34,{{'D',"Select"},{'X',"Play"},{'T',osd.tracks_sub?"Audio":"Subtitles"},{'C',"Close"}},16);
+}
 void draw_player_osd(const PlayerOsd& osd){
  // Bottom scrim: transparent at y=459 to black 0.90 at 62% of its height.
  const int y0=459,h=HEIGHT-y0;for(int i=0;i<h;i+=2){int a=std::min(230,(int)(230.0f*i/(h*0.62f)));blend_rect(0,y0+i,WIDTH,2,0,a);}
@@ -492,10 +595,10 @@ void draw_player_osd(const PlayerOsd& osd){
  else if(osd.has_prev||osd.has_next){
   if(!osd.up_next.empty()){const std::string next=std::string(T("UP NEXT"))+"  ";const int w=face_text_width(next,12,TextFace::Classic),nw=face_text_width(fit_face(osd.up_next,360,15,TextFace::Classic),15,TextFace::Classic);
    face_text(1223-nw-w,662,next,g_theme.accent_alt,12,TextFace::Classic);face_text(1223-nw,659,fit_face(osd.up_next,360,15,TextFace::Classic),0xE0E0E0,15,TextFace::Classic);}
-  if(osd.has_prev&&osd.has_next)draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'l',"Previous"},{'r',"Next"},{'C',"Stop"}});
-  else if(osd.has_next)draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'r',"Next episode"},{'C',"Stop"}});
-  else draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'l',"Previous episode"},{'C',"Stop"}});}
- else draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'C',"Stop"},{'S',"Hide"}});
+  if(osd.has_prev&&osd.has_next)draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'l',""},{'r',"Episode"},{'T',"Tracks"},{'C',"Stop"}});
+  else if(osd.has_next)draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'r',"Next episode"},{'T',"Tracks"},{'C',"Stop"}});
+  else draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'l',"Previous episode"},{'T',"Tracks"},{'C',"Stop"}});}
+ else draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'T',"Audio / Subtitles"},{'C',"Stop"},{'S',"Hide"}});
 }
 void draw_skip_button(const std::string& label,bool button){
  // Above the bar's chips, so it reads with the bar up or away.
@@ -625,13 +728,78 @@ void draw_music_screen(const PlayerOsd& osd,const float* bands,int count,const f
  if(osd.paused){const int w=face_text_width(T("PAUSED"),13,TextFace::Classic)+16;round_rect(TX,py-34,w,20,10,g_theme.accent,220);face_text(TX+8,py-31,T("PAUSED"),g_theme.white,13,TextFace::Classic);}
  if(osd.duration){const uint64_t left=osd.duration>shown?osd.duration-shown:0;std::string rem="-"+clock_text(left),end=ends_at(left);const int rw=face_text_width(rem,15,TextFace::Classic);
   face_text(TR-rw,py+18,rem,0xE0E0E0,15,TextFace::Classic);face_text(TR-rw-20-face_text_width(end,15,TextFace::Classic),py+18,end,0x9A9EB4,15,TextFace::Classic);}
- // What plays when this one ends.
- if(!osd.up_next.empty()){const int w=face_text_width(T("UP NEXT"),12,TextFace::Classic);face_text(TX,py+52,T("UP NEXT"),g_theme.accent_alt,12,TextFace::Classic);face_text(TX+w+12,py+49,fit_face(osd.up_next,TW-w-12,17,TextFace::Classic),g_theme.text,17,TextFace::Classic);}
+ // What plays next: the next few tracks of the queue (PS3 UP NEXT), else the one.
+ if(!osd.upcoming.empty()||!osd.up_next.empty()){const int w=face_text_width(T("UP NEXT"),12,TextFace::Classic);face_text(TX,py+52,T("UP NEXT"),g_theme.accent_alt,12,TextFace::Classic);
+  if(osd.upcoming.empty())face_text(TX+w+12,py+49,fit_face(osd.up_next,TW-w-12,17,TextFace::Classic),g_theme.text,17,TextFace::Classic);
+  else for(size_t i=0;i<osd.upcoming.size()&&i<3;++i)face_text(TX+w+12,py+49+(int)i*26,fit_face(osd.upcoming[i],TW-w-12,17,TextFace::Classic),i?g_theme.text_dim:g_theme.text,17,TextFace::Classic);}
+ // Shuffle (Triangle), under the album position.
+ if(osd.shuffle&&osd.tracks>1){const std::string s=T("Shuffle");const int w=face_text_width(s,13,TextFace::Classic)+16;round_rect(TR-w,BASE+114,w,20,10,g_theme.accent,220);face_text(TR-w+8,BASE+117,s,g_theme.white,13,TextFace::Classic);}
  // Which visualizer Square has just chosen.
  if(osd.viz_toast){const std::string label=std::string(T("Visualizer"))+": "+T(music_viz_name(osd.viz));const int w=face_text_width(label,18,TextFace::Classic)+40;
   round_rect((WIDTH-w)/2,30,w,40,20,0x0A0C18,215,g_theme.accent,120);face_text((WIDTH-face_text_width(label,18,TextFace::Classic))/2,40,label,g_theme.white,18,TextFace::Classic);}
- if(osd.tracks>1)draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'D',"Seek / Volume"},{'l',"Previous"},{'r',"Next"},{'S',"Visualizer"},{'C',"Stop"}});
+ // The queue in play order (Options), the playing track marked; X plays another.
+ if(osd.queue_open&&!osd.queue_names.empty()){constexpr int QX=700,QY=92,QW=532,QH=548,ROW=34;const int rows=(QH-60)/ROW,n=(int)osd.queue_names.size();
+  round_rect(QX,QY,QW,QH,12,0x0A0C18,235,g_theme.hairline,160);face_text(QX+24,QY+18,T("Queue"),g_theme.white,20,TextFace::Classic);
+  {const std::string c=TF("Track %d of %d",osd.track,osd.tracks);face_text(QX+QW-24-face_text_width(c,14,TextFace::Classic),QY+22,c,g_theme.text_faint,14,TextFace::Classic);}
+  const int top=std::max(0,std::min(n-rows,osd.queue_sel-rows/2));
+  for(int i=top;i<std::min(n,top+rows);++i){const int y=QY+56+(i-top)*ROW;const bool sel=i==osd.queue_sel,now=i==osd.track-1;
+   if(sel)rect(QX+12,y-4,QW-24,ROW-2,g_theme.panel_hi);if(now)rect(QX+12,y-4,4,ROW-2,g_theme.accent);
+   face_text(QX+28,y+2,std::to_string(i+1),now?g_theme.accent_alt:g_theme.text_faint,15,TextFace::Classic);
+   face_text(QX+72,y,fit_face(osd.queue_names[i],QW-100,18,TextFace::Classic),sel||now?g_theme.white:g_theme.text_dim,18,TextFace::Classic);}
+  draw_hints(57,680,{{'D',"Select"},{'X',"Play"},{'C',"Close"}});return;}
+ if(osd.tracks>1)draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'D',"Seek / Volume"},{'l',""},{'r',"Track"},{'T',osd.shuffle?"Shuffle off":"Shuffle"},{'O',"Queue"},{'S',"Visualizer"},{'C',"Stop"}});
  else draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'D',"Seek / Volume"},{'L',""},{'R',"Skip 5 min"},{'S',"Visualizer"},{'C',"Stop"}});
+}
+
+// ---- downloads ----------------------------------------------------------------
+static std::string size_text(uint64_t bytes){char b[32];if(bytes>=1000000000ULL)snprintf(b,sizeof b,"%.1f GB",bytes/1e9);else snprintf(b,sizeof b,"%.0f MB",bytes/1e6);return b;}
+void draw_downloads(const std::vector<DownloadEntry>& entries,int selected,const DownloadStatus& status,const std::string& note){
+ app_header("","Home");face_text(64,86,T("Downloads"),g_theme.text,24,TextFace::Classic);
+ int top=128;
+ // What is downloading now: its name, how far, and what waits after it.
+ // Paused with nothing running: the queue waits, and says so.
+ if(!status.active&&status.paused&&status.queued){round_rect(64,top,1152,44,10,g_theme.panel,220);
+  face_text(84,top+12,fit_face(std::string(T("Paused"))+"   "+TF("%d waiting",status.queued),1100,17,TextFace::Classic),g_theme.white,17,TextFace::Classic);top+=58;}
+ if(status.active){round_rect(64,top,1152,64,10,g_theme.panel,220);
+  const float f=status.total?(float)std::min(1.0,(double)status.got/status.total):0;
+  std::string line=std::string(T(status.paused?"Paused":"Downloading"))+"  "+status.name;face_text(84,top+10,fit_face(line,800,17,TextFace::Classic),g_theme.white,17,TextFace::Classic);
+  std::string amount=status.total?TF("%d%%",(int)(f*100))+"   "+size_text(status.got)+" / "+size_text(status.total):size_text(status.got);if(status.queued)amount+="   "+TF("%d waiting",status.queued);
+  face_text(1196-face_text_width(amount,14,TextFace::Classic),top+12,amount,g_theme.text_dim,14,TextFace::Classic);
+  round_rect(84,top+42,1112,6,3,g_theme.white,41);if(f>0)round_rect(84,top+42,(int)(1112*f),6,3,g_theme.accent,255);top+=78;}
+ else if(!status.error.empty()){face_text(64,top,fit_face(std::string(T("Download failed"))+": "+status.error,1150,15,TextFace::Classic),0xE07070,15,TextFace::Classic);top+=30;}
+ if(!note.empty()){face_text(64,top,fit_face(note,1150,14,TextFace::Classic),g_theme.text_faint,14,TextFace::Classic);top+=28;}
+ if(entries.empty())face_text(64,top+20,T("Nothing downloaded yet. Choose Download on a film or episode's page."),g_theme.text_dim,18,TextFace::Classic);
+ constexpr int ROW=58;const int rows=std::max(1,(640-top)/ROW),n=(int)entries.size(),first=std::max(0,std::min(n-rows,selected-rows/2));
+ for(int i=first;i<std::min(n,first+rows);++i){const auto& e=entries[i];const int y=top+(i-first)*ROW;const bool sel=i==selected;
+  if(sel){rect(64,y,1152,ROW-6,g_theme.panel_hi);rect(64,y,3,ROW-6,g_theme.accent);}
+  rect(76,y+5,30,ROW-16,g_theme.thumb_dim);draw_art_cover(e.item.base.id,76,y+5,30,ROW-16);
+  std::string name=e.item.base.name;if(!strcmp(e.item.base.type,"Episode")&&!e.item.series.empty()){char code[24]="";if(e.item.episode)snprintf(code,sizeof code,"S%d:E%d",e.item.season,e.item.episode);name=e.item.series+"  "+code+" - "+name;}
+  face_text(122,y+8,fit_face(name,820,18,TextFace::Classic),sel?g_theme.white:g_theme.text,18,TextFace::Classic);
+  std::string meta=T(search_kind(e.item));if(e.item.year)meta+="  \xC2\xB7  "+std::to_string(e.item.year);if(e.item.duration)meta+="  \xC2\xB7  "+TF("%d min",(int)(e.item.duration/60000));
+  if(e.item.resume&&e.item.duration)meta+="  \xC2\xB7  "+std::string(T("Resume"))+" "+clock_text(e.item.resume);
+  face_text(122,y+31,fit_face(meta,820,13,TextFace::Classic),g_theme.text_faint,13,TextFace::Classic);
+  const std::string where=size_text(e.bytes)+"   "+T(e.usb?"USB drive":"Console");face_text(1196-face_text_width(where,14,TextFace::Classic),y+18,where,g_theme.text_dim,14,TextFace::Classic);}
+ if(status.active||status.queued)hint_bar({{'D',"Select"},{'X',"Play"},{'S',"Delete"},{'T',status.paused?"Resume":"Pause"},{'O',"Stop downloading"},{'C',"Back"}});
+ else hint_bar({{'D',"Select"},{'X',"Play"},{'S',"Delete"},{'C',"Back"}});
+}
+
+// ---- USB drives (PS3 Media tab) --------------------------------------------------
+void draw_local_browser(const std::string& title,const std::string& where,const std::vector<LocalRow>& rows,int selected,const std::string& empty){
+ app_header("","Home");face_text(64,86,fit_face(title,900,24,TextFace::Classic),g_theme.text,24,TextFace::Classic);
+ if(!where.empty())face_text(64,120,fit_face(where,1150,14,TextFace::Classic),g_theme.text_faint,14,TextFace::Classic);
+ constexpr int TOP=150,ROW=52;const int n=(int)rows.size(),visible=(640-TOP)/ROW,first=std::max(0,std::min(n-visible,selected-visible/2));
+ if(rows.empty())face_text(64,TOP+10,empty,g_theme.text_dim,18,TextFace::Classic);
+ for(int i=first;i<std::min(n,first+visible);++i){const auto& r=rows[i];const int y=TOP+(i-first)*ROW;const bool sel=i==selected;
+  if(sel){rect(64,y,1152,ROW-6,g_theme.panel_hi);rect(64,y,3,ROW-6,g_theme.accent);}
+  // A small glyph: a folder tab, a play triangle for video, a note for music.
+  const int gx=84,gy=y+12;const uint32_t gc=sel?g_theme.accent_alt:g_theme.text_dim;
+  if(r.kind==LOCAL_FOLDER){rect(gx,gy+4,26,18,gc);rect(gx,gy,11,6,gc);}
+  else if(r.kind==LOCAL_VIDEO){for(int k=0;k<20;++k){const int w=k<10?k*2:(20-k)*2;rect(gx+4,gy+2+k,std::max(1,w),1,gc);}}
+  else{circle(gx+8,gy+19,5,gc,255);rect(gx+12,gy+1,3,19,gc);rect(gx+12,gy+1,10,3,gc);}
+  face_text(128,y+12,fit_face(r.name,880,19,TextFace::Classic),sel?g_theme.white:g_theme.text,19,TextFace::Classic);
+  if(!r.detail.empty())face_text(1196-face_text_width(r.detail,14,TextFace::Classic),y+15,r.detail,g_theme.text_dim,14,TextFace::Classic);}
+ if(n>visible){const int bar=visible*ROW-6,thumb=std::max(20,bar*visible/n),off=(bar-thumb)*first/std::max(1,n-visible);rect(1224,TOP,3,bar,g_theme.track);rect(1224,TOP+off,3,thumb,g_theme.accent);}
+ hint_bar({{'D',"Select"},{'X',"Open / Play"},{'C',"Back"}});
 }
 
 // ---- settings (PS3 ui_settings.cpp) ------------------------------------------------
@@ -716,6 +884,11 @@ enum AboutKind { A_HEAD, A_VER, A_ITEM, A_NAME, A_TEXT, A_GAP };
 struct AboutLine { AboutKind kind; const char* a; const char* b; };
 // Updates: the PS4 releases, newest first. Add each new release at the top.
 const AboutLine about_updates[]={
+ {A_VER,"1.13",nullptr},
+ {A_ITEM,"Music tabs (Albums, Artists, Playlists, Genres, Songs), shuffle and the queue.",nullptr},
+ {A_ITEM,"Live search as on the PS3; audio and subtitles while watching.",nullptr},
+ {A_ITEM,"Downloads and USB drives, played without the server.",nullptr},
+ {A_ITEM,"Fixes: sign-in on Jellyfin 10.12 / 12; file sizes on the console.",nullptr},
  {A_VER,"1.12",nullptr},
  {A_ITEM,"On Now on Home: what's on Live TV, with its times and progress.",nullptr},
  {A_ITEM,"Fixes: Software Update downloads again; Live TV reconnects use less memory.",nullptr},

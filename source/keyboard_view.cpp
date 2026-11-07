@@ -28,3 +28,23 @@ void draw_keyboard(const std::string& title,const KeyboardEditor& editor,bool pa
     draw_hints(60,622,{{'X',"Select"},{'S',"Delete"},{'T',"Caps"},{'O',"Done"},{'C',"Cancel"}});
     draw_hints(60,660,{{'l',""},{'r',"Move text cursor"},{'R',"Letters / symbols"}});
 }
+// The same keys, sized to a panel (Search draws them beside its results).
+int draw_keyboard_panel(const KeyboardEditor& editor,int x,int y,int w,bool focused){
+    auto rows=editor.layout();int widest=1;
+    for(const auto& row:rows){int units=0;for(const auto& key:row)units+=key.units;widest=std::max(widest,units);}
+    const int step=w/widest,gap=5,key_height=38,pitch=44;
+    for(int r=0;r<(int)rows.size();r++){
+        int units=0;for(const auto& key:rows[r])units+=key.units;
+        int kx=x+(w-(units*step-gap))/2;const int ky=y+r*pitch;
+        for(int c=0;c<(int)rows[r].size();c++){
+            const auto& key=rows[r][c];const int kw=key.units*step-gap;const bool here=r==editor.row&&c==editor.column,selected=here&&focused;
+            const uint32_t bg=selected?g_theme.accent:key.kind==KeyKind::Caps&&editor.caps?g_theme.accent_deep:g_theme.panel_hi;
+            rect(kx,ky,kw,key_height,bg);if(here&&!focused){rect(kx,ky,kw,1,g_theme.text_faint);rect(kx,ky+key_height-1,kw,1,g_theme.text_faint);rect(kx,ky,1,key_height,g_theme.text_faint);rect(kx+kw-1,ky,1,key_height,g_theme.text_faint);}
+            const std::string label=key.kind==KeyKind::Character||key.kind==KeyKind::Scheme?key.label:std::string(T(key.label.c_str()));
+            const int size=key.kind==KeyKind::Character?20:15,lw=text_width(label,size);
+            text(kx+std::max(4,(kw-lw)/2),ky+(key_height-size)/2-2,label,selected?g_theme.bg:g_theme.text,size,kw-8);
+            kx+=key.units*step;
+        }
+    }
+    return (int)rows.size()*pitch;
+}

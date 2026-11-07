@@ -131,11 +131,14 @@ static int perform(int method,const char* url,const char* body,const char* token
         pthread_mutex_unlock(&cancel_mutex);
         // Jellyfin's sign-in header goes to the Jellyfin server only (any server
         // while one is still being chosen): GitHub answers it with 401.
+        // The token rides in that header too (Token="..."): Jellyfin 10.12 turns
+        // the legacy X-Emby-Token header off by default, and a token it does
+        // not see answers 401, which sent the app back to sign-in (issue #1).
         if(!g_server[0]||!strncmp(url,g_server,strlen(g_server))){
             std::string auth="MediaBrowser Client=\"JellyFin PS4\", Device=\"PS4\", DeviceId=\""+device_id+"\", Version=\"0.4.0\"";
+            if(token&&*token)auth+=std::string(", Token=\"")+token+"\"";
             sceHttpAddRequestHeader(req,"Authorization",auth.c_str(),0);
         }
-        if(token&&*token)sceHttpAddRequestHeader(req,"X-Emby-Token",token,0);
         sceHttpAddRequestHeader(req,"Accept","application/json",0);
         sceHttpAddRequestHeader(req,"Accept-Encoding","identity",0);
         sceHttpAddRequestHeader(req,"Content-Type","application/json",0);
@@ -196,6 +199,50 @@ int http_download_file(const char* url,const char* path,const std::function<bool
                 if(n<0&&!stopped){failed("Read response",n,req);status=-1;}
                 if(fclose(out))status=-1;
                 if(status==200&&total&&got!=total){set_failure("The download ended early.");status=-1;}
+            }
+        }
+        sceHttpDeleteRequest(req);
+    }
+    if(con>=0)sceHttpDeleteConnection(con);
+    plog((std::string("HTTP download status=")+std::to_string(status)+" target="+target).c_str());
+    pthread_mutex_lock(&mutex);if(--in_flight==0)pthread_cond_broadcast(&idle);pthread_mutex_unlock(&mutex);return status;
+}
+// The same, carrying on from `offset` bytes already in `path` (a paused or
+// interrupted download): asks for the rest with a Range header and appends.
+// A server that sends the whole file again (200) has it written from the
+// start. `progress` hears the bytes of the whole file. Returns 200 when the
+// file is complete, whichever way it came.
+int http_download_resume(const char* url,const char* path,uint64_t offset,const std::function<bool(uint64_t,uint64_t)>& progress){
+    set_failure("");
+    pthread_mutex_lock(&mutex);
+    if(tmpl<0||!url||(strncmp(url,"http://",7)&&strncmp(url,"https://",8))){failure_details[pthread_self()]="HTTP is not initialized or the address is invalid.";pthread_mutex_unlock(&mutex);return -1;}
+    ++in_flight;pthread_mutex_unlock(&mutex);
+    const std::string target=http_log_target(url);plog((std::string("HTTP download target=")+target+" from="+std::to_string(offset)).c_str());
+    int con=sceHttpCreateConnectionWithURL(tmpl,url,false),req=-1,status=-1;
+    if(con<0)failed("Create connection",con);
+    else{req=sceHttpCreateRequestWithURL2(con,"GET",url,0);if(req<0)failed("Create request",req);}
+    if(req>=0){
+        sceHttpAddRequestHeader(req,"Accept","application/octet-stream",0);
+        if(offset){const std::string range="bytes="+std::to_string(offset)+"-";sceHttpAddRequestHeader(req,"Range",range.c_str(),0);}
+        int rc=sceHttpSendRequest(req,nullptr,0);
+        if(rc<0)failed("Send request",rc,req);
+        else if((rc=sceHttpGetStatusCode(req,&status))<0){failed("Read status",rc,req);status=-1;}
+        else if(status==200||(status==206&&offset)){
+            // 206: the rest, appended. 200: the server ignored the range, so start again.
+            const uint64_t base=status==206?offset:0;
+            int32_t result=0;size_t length=0;const uint64_t rest=sceHttpGetResponseContentLength(req,&result,&length)>=0&&result==0?length:0,total=rest?base+rest:0;uint64_t got=base;
+            FILE* out=fopen(path,base?"ab":"wb");
+            if(!out){set_failure(std::string("Could not write ")+path+".");status=-1;}
+            else{
+                std::vector<char> buffer(256*1024);int n=0;bool stopped=false;
+                while((n=sceHttpReadData(req,buffer.data(),buffer.size()))>0){
+                    if(fwrite(buffer.data(),1,n,out)!=(size_t)n){set_failure(std::string("Could not write ")+path+" (is the drive full?).");status=-1;break;}
+                    got+=n;if(!progress(got,total)){stopped=true;set_failure("Cancelled.");status=-1;break;}
+                }
+                if(n<0&&!stopped){failed("Read response",n,req);status=-1;}
+                if(fclose(out))status=-1;
+                if(status>0&&total&&got!=total){set_failure("The download ended early.");status=-1;}
+                if(status==206)status=200;
             }
         }
         sceHttpDeleteRequest(req);

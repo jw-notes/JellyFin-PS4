@@ -15,4 +15,7 @@ bool quick_connect_begin(QuickConnectSession& session);
 QuickConnectStatus quick_connect_poll(const QuickConnectSession& session);
 bool quick_connect_finish(const QuickConnectSession& session);
 
-bool sign_in();
+#include <functional>
+// offline: the screen for playing without a server (USB drive, downloads),
+// offered on the first sign-in screen.
+bool sign_in(const std::function<void()>& offline = {});

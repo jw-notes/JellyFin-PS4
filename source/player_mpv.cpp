@@ -124,7 +124,7 @@ bool player_open(const std::string& url){
  // a browser's user agent (some providers turn others away), and its best
  // variant within about 4.5 Mbps (a 720p one): the screen is 720p, and a
  // 1080p channel cost 25 ms a frame to shrink, half its frames dropped.
- const bool remote=url.rfind(std::string(g_server)+"/",0)!=0;
+ const bool remote=url.find("://")!=std::string::npos&&url.rfind(std::string(g_server)+"/",0)!=0;
  // Some channels have one heavy variant only (1080p, 50-60 fps): the decoder
  // may drop frames when it falls behind rather than the picture stalling, and
  // skips deblocking on frames nothing refers to. A channel at 23.237.104.106

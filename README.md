@@ -25,12 +25,14 @@ A native Jellyfin client for PS4 consoles, built with the OpenOrbis toolchain. I
 - **Libraries**: poster grids with an A–Z jump bar (press Left at the first column), quick peek with the cast (Triangle) and fast paging; the next page is fetched in the background. Artwork shimmers while it loads and fades in when it arrives.
 - **Details page**: backdrop, poster, rating, quality chips, Resume / Play from start / Favourite / Watched, version, audio and subtitle selection, synopsis, genres, director and the cast as photo cards. Select an actor to see their filmography. "Ends at" shows when a film or episode would finish.
 - **Playback**: 1080p at up to 20 Mbps by default. Files the PS4 can decode play straight from the server (direct play) and start in 1–3 seconds; anything else is converted by the server. A PS3-style buffering screen covers the start. The player bar shows the title, progress, times and when it ends; Left / Right scrub. Up moves to Play / Pause, **Volume** and **Picture** (size, position and Fit / Fill / Stretch), and X uses what's highlighted. TV shows play on to the next episode, across seasons, and L1 / R1 skip episodes. **Skip Intros** and **Skip Credits** (Off, Button or Auto) use the server's intro and credits markers (Jellyfin 10.10+ with a plugin such as Intro Skipper); in shows the credits offer *Skip to Next Episode*.
-- **Music**: a Now Playing screen with the cover, track details and four visualizers — Bars, Aurora, Halo and Scope (Square switches). Albums play through: the next track starts by itself, L1 / R1 skip, Up / Down set the volume.
+- **Music**: Albums, Artists, Playlists, Genres and Songs tabs (L2 / R2), so tracks without an album tag are found too. A Now Playing screen with the cover, the next tracks and four visualizers - Bars, Aurora, Halo and Scope (Square switches). The queue plays through: L1 / R1 skip, Triangle shuffles, Options shows the whole queue to pick from, Up / Down set the volume.
 - **Live TV**: a channel grid with logos, categories (L2 / R2), Favourites and Recently watched, a guide (Square) and channel search (touchpad). Channels from an M3U tuner play straight from their source, falling back to the server when they need it, and reconnect by themselves if the picture stops. In the player, L1 / R1 change channel and Up / Down set the volume.
-- **Live TV guide on the PS4** (Settings › Live TV): any user can download an XMLTV guide — from the address you enter, or the one your playlist names (`url-tvg`) — and have it updated at launch. The player bar shows what's on now, the time left and what's next.
+- **Live TV guide on the PS4** (Settings › Live TV): any user can download an XMLTV guide - from the address you enter, or the one your playlist names (`url-tvg`) - and have it updated at launch. The player bar shows what's on now, the time left and what's next.
+- **Search**: the keyboard and live results on one screen - they update as you type, L2 / R2 filter them by kind, and your recent searches are kept.
+- **Downloads**: films, episodes and whole seasons saved to the console or (with GoldHEN 2.3+) a USB drive, and played from there.
 - **Screensaver**: full-screen artwork from Home with title and synopsis.
 - **Languages**: English, Japanese, Portuguese (Brazil), German, French and Spanish, following the console or chosen in Settings.
-- **Settings** in five groups — Playback, Live TV, Display, Account and System — with Software Update, which finds new releases and downloads them for the Package Installer. The controller's light bar takes the theme's colour.
+- **Settings** in five groups - Playback, Live TV, Display, Account and System - with Software Update, which finds new releases and downloads them for the Package Installer. The controller's light bar takes the theme's colour.
 - **Sign-in**: server URL with a real connection check, then Quick Connect or username and password. Sessions and settings are saved per PS4 user, and **Share Sign-in** (Settings › Account) lends your account to the console's users who have none of their own.
 
 | | |
@@ -57,7 +59,7 @@ A native Jellyfin client for PS4 consoles, built with the OpenOrbis toolchain. I
 
 ## Install
 
-1. Copy `dist/v1.12/IV0000-JFPS40000_00-JELLYFINPS400000.pkg` to your PS4 and install it with your package installer. It installs over an earlier version and keeps your sign-in and settings.
+1. Copy `dist/v1.13/IV0000-JFPS40000_00-JELLYFINPS400000.pkg` to your PS4 and install it with your package installer. It installs over an earlier version and keeps your sign-in and settings.
 2. Open **Jellyfin [PS]**, enter your server's full URL including the port (for example `http://192.168.1.100:8096`), then sign in with Quick Connect or your username and password.
 
 ### Updates
@@ -71,13 +73,13 @@ Settings › System › **Software Update** checks this project's latest GitHub 
 | D-pad | Move |
 | X | Open / select / play |
 | Circle | Back |
-| Triangle | Quick peek (libraries), favourite (Live TV), Skip Intro / Skip to Next Episode (player) |
+| Triangle | Quick peek (libraries, search), favourite (Live TV), audio / subtitles or Skip Intro (player), shuffle (music) |
 | Square | Favourites (Home), guide (Live TV), hide the bar (player), visualizer (music) |
 | L1 / R1 | Home, Search, Settings; previous / next track (music), episode (TV shows) or channel (Live TV) |
 | Left / Right (player) | Scrub; on the controls row, choose Play / Pause, Volume or Picture |
 | Up / Down (player) | Between the scrub bar and the controls; volume in Live TV and music |
-| L2 / R2 | Live TV category; skip five minutes in the player |
-| Options | Settings |
+| L2 / R2 | Music tab, search filter, Live TV category; skip five minutes in the player |
+| Options | Settings; the queue (music); results (search) |
 | Touchpad | Refresh Home, search channels (Live TV) |
 
 ## Playback
@@ -92,6 +94,7 @@ Settings › System › **Software Update** checks this project's latest GitHub 
 - Settings, session and the Live TV guide: `/data/JellyFin-PS4/user-<id>/`
 - A shared sign-in (Share Sign-in): `/data/JellyFin-PS4/shared-session.json`
 - Diagnostic log, when Settings › System › **Debug Logging** is on (it is off by default; never passwords or tokens): `/data/JellyFin-PS4-logs/user-<id>.log`
+- Downloads: `/data/JellyFin-PS4/downloads/`, or `JellyFin/` on a USB drive (each with a `.json` beside it)
 - Downloaded updates: `/data/pkg/JellyFin-PS4.pkg`
 - Extra themes: `/data/JellyFin-PS4/themes/`
 - Put `0` in `bootanim.txt` in the user folder to turn the startup animation off.

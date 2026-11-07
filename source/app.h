@@ -10,7 +10,7 @@
 struct Person { std::string id,name,role; bool image=false; };
 // A Live TV channel's current show (Home's On Now row): its name, episode,
 // image (the programme's id; empty: the channel's logo) and times.
-struct Item { JFItem base{}; std::string overview,cast,genres,rating,collection,director,community,series,series_id,tagline,album,album_id,artist,now_on,now_sub,now_image; time_t now_start=0,now_stop=0; std::vector<Person> people; int year=0,season=0,episode=0; uint64_t resume=0, duration=0; bool favourite=false, played=false, backdrop=false; };
+struct Item { JFItem base{}; std::string overview,cast,genres,rating,collection,director,community,series,series_id,tagline,album,album_id,artist,now_on,now_sub,now_image; time_t now_start=0,now_stop=0; std::vector<Person> people; std::string local,season_id; int year=0,season=0,episode=0; uint64_t resume=0, duration=0; bool favourite=false, played=false, backdrop=false; };
 struct Page { std::vector<Item> items; int total=0; };
 // saver: the Artwork screensaver; saver_delay: idle seconds before it starts.
 // language: "auto" (follow the console) or a code such as "ja" (language.h).
@@ -34,7 +34,9 @@ struct Settings { int bitrate=20000000; bool resume=true; int method=PLAY_AUTO; 
  // and the one found in the playlist (remembered so non-admins have it too).
  bool guide_auto=true; std::string guide_url,guide_found;
  // home_onnow: Home's On Now row of Live TV channels.
- bool home_onnow=true; };
+ bool home_onnow=true;
+ // download_usb: Downloads go to a USB drive (needs GoldHEN to leave the sandbox).
+ bool download_usb=false; };
 enum { SKIP_OFF, SKIP_BUTTON, SKIP_AUTO };
 // An intro or the credits, as the server marks them, in ms from the start.
 struct MediaSegment { bool outro=false; uint64_t start=0,end=0; };
@@ -67,6 +69,8 @@ std::string http_failure_detail();
 // Stream a GET to a file (see http_ps4.cpp); returns the HTTP status or -1.
 #include <functional>
 int http_download_file(const char* url,const char* path,const std::function<bool(uint64_t,uint64_t)>& progress);
+// The same, carrying on from `offset` bytes already in `path` (Range); 200 when complete.
+int http_download_resume(const char* url,const char* path,uint64_t offset,const std::function<bool(uint64_t,uint64_t)>& progress);
 // The same through FFmpeg's HTTPS (updater.cpp), for hosts the console's own
 // HTTP library cannot reach (GitHub's release files). 200, or -1.
 int ffmpeg_download_file(const char* url,const char* path,const std::function<bool(uint64_t,uint64_t)>& progress);
@@ -74,7 +78,17 @@ int http_context_id();
 int http_ssl_context_id();
 // Page modes beyond 0 (a folder), 1 Continue, 2 Favourites, 3 Live TV and
 // 4 a filmography: a film / show / music library, and an album's tracks.
-enum { MODE_MOVIES=5, MODE_SHOWS=6, MODE_MUSIC=7, MODE_ALBUM=8 };
+enum { MODE_MOVIES=5, MODE_SHOWS=6, MODE_MUSIC=7, MODE_ALBUM=8,
+ // A music library's other tabs (PS3 sub-tabs: Albums, Artists, Playlists,
+ // Genres, Songs) -- `parent` stays the library -- and what they open: an
+ // artist's or genre's albums, and a playlist's tracks in its own order.
+ MODE_ARTISTS=9, MODE_PLAYLISTS=10, MODE_GENRES=11, MODE_SONGS=12,
+ MODE_ARTIST=13, MODE_GENRE=14, MODE_PLAYLIST=15 };
+// The music tabs in L2 / R2 order, and which one a mode is (-1: not a tab).
+constexpr int MUSIC_TABS=5;
+int music_tab_mode(int tab);
+int music_tab_of(int mode);
+const char* music_tab_name(int tab);
 bool fetch_page(const std::string& parent, int start, const std::string& query, int mode, Page& page, const std::string& letter="");
 // Library pages are cached; neighbouring pages are fetched ahead in the background.
 void prefetch_page(const std::string& parent,int start,const std::string& query,int mode,const std::string& letter="");
@@ -89,6 +103,19 @@ enum HomeRowKind { HOME_CONTINUE, HOME_NEXTUP, HOME_LATEST, HOME_ONNOW };
 bool fetch_home_row(HomeRowKind kind,const Item& library,Page& page);
 // An album's tracks in disc and track order.
 bool fetch_album_tracks(const std::string& album_id,Page& page);
+// Search (PS3 live search): films, shows, episodes, music, collections,
+// playlists and channels matching `term`. Thread-safe, its own buffer.
+bool search_library(const std::string& term,Page& page);
+// The last eight terms whose results were opened, newest first; remember_search
+// puts one at the front (a repeat, compared without case, moves up).
+std::vector<std::string> recent_searches();
+// Downloads (downloads.cpp): the episodes / tracks an item stands for, and an
+// item's JSON as the server gives it. Any thread.
+bool download_targets(const Item& item,std::vector<Item>& out);
+std::string item_json(const std::string& id);
+void remember_search(const std::string& term);
+// Square on a recent search removes it.
+void forget_search(const std::string& term);
 // The episodes either side of `episode` in its series, across seasons.
 // has_prev / has_next say which exist.
 bool fetch_adjacent_episodes(const Item& episode,Item& prev,Item& next,bool& has_prev,bool& has_next);

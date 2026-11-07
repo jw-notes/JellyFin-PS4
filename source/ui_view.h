@@ -5,6 +5,9 @@
 #include <string>
 #include <vector>
 #include "../vendor/ps3/source/ui/render/classic_grid.h"
+#include "keyboard_model.h"
+#include "downloads.h"
+#include "local_media.h"
 void app_header(const std::string& title,const std::string& tab="Home",int focused_tab=-1);
 // The bottom hint strip, every glyph a controller icon.
 void hint_bar(std::initializer_list<Hint> hints);
@@ -16,7 +19,8 @@ constexpr int JUMP_ENTRIES=27;
 struct JumpBar { bool show=false, active=false; int sel=1; std::string filter; };
 std::string jump_letter(int entry);
 int jump_entry(const std::string& name);
-void draw_library(const Page& page,const std::string& title,int start,int selected,bool home,int focused_tab=-1,int first=-1,const std::string& breadcrumb="",const JumpBar* jump=nullptr);
+// music_tab: a music library's tab (MUSIC_TABS), a strip under the title; -1 none.
+void draw_library(const Page& page,const std::string& title,int start,int selected,bool home,int focused_tab=-1,int first=-1,const std::string& breadcrumb="",const JumpBar* jump=nullptr,int music_tab=-1);
 
 // Classic Home (PS3 ui_home_classic.inc): My Media, Continue Watching, Next Up
 // and Latest rows under the Home / Search / Settings header.
@@ -41,7 +45,7 @@ PeekOrigin library_focus_rect(const ClassicGrid& g,int selected,int first,bool h
 
 // Detail page (PS3 Classic ui_info.cpp): backdrop, poster, actions,
 // selectors, overview, genres/director and the cast as round photo cards.
-enum DetailAction { ACT_RESUME, ACT_PLAY, ACT_START, ACT_FAVOURITE, ACT_WATCHED };
+enum DetailAction { ACT_RESUME, ACT_PLAY, ACT_START, ACT_FAVOURITE, ACT_WATCHED, ACT_DOWNLOAD, ACT_DOWNLOAD_SEASON };
 std::vector<DetailAction> detail_actions(const Item& item);
 constexpr int DETAIL_CAST_VISIBLE=6;
 struct DetailView { std::string version,video,audio,audio_chip,subtitles; int row=0,col=0,cast_first=0; };
@@ -52,8 +56,16 @@ void draw_detail(const Item& item,const DetailView& view);
 // control: the bar's focused control, in screen order (PS3 HUD), -1 none;
 // volume_active: its slider is open. picture: Fit / Fill / Stretch; volume 0..100.
 enum OsdControl { OSD_PLAY, OSD_VOLUME, OSD_PICTURE, OSD_CONTROLS, OSD_SCRUB=16 };
-struct PlayerOsd { std::string title,subtitle,audio,subtitles,album,art,up_next,picture; int track=0,tracks=0,viz=0,control=-1,volume=100; bool volume_active=false; bool viz_toast=false; uint64_t position=0,duration=0,target=0; bool paused=false,live=false,scrubbing=false,started=false,audio_only=false,has_prev=false,has_next=false; };
+struct PlayerOsd { std::string title,subtitle,audio,subtitles,album,art,up_next,picture; int track=0,tracks=0,viz=0,control=-1,volume=100; bool volume_active=false; bool viz_toast=false; uint64_t position=0,duration=0,target=0; bool paused=false,live=false,scrubbing=false,started=false,audio_only=false,has_prev=false,has_next=false;
+ // Music (PS3 Now Playing): shuffle (Triangle), the next few tracks, and the
+ // whole queue in play order, open over the screen (Options) at queue_sel.
+ bool shuffle=false,queue_open=false; std::vector<std::string> upcoming,queue_names; int queue_sel=0;
+ // Video: the audio / subtitle menu (Triangle), PS3 style -- one list at a
+ // time, Left / Right switch. tracks_open: shown; tracks_sub: the subtitle list.
+ bool tracks_open=false,tracks_sub=false; std::vector<std::string> audio_names,sub_names; int audio_sel=0,sub_sel=0,audio_now=0,sub_now=0; };
 void draw_player_osd(const PlayerOsd& osd);
+// The audio / subtitle menu over the picture (osd.tracks_open).
+void draw_track_menu(const PlayerOsd& osd);
 // The L1 picture mode's banner: what it is set to, and the buttons.
 void draw_picture_banner(const std::string& state,bool moving);
 // "Skip Intro" / "Next Episode" over the picture's lower right, with the
@@ -70,7 +82,28 @@ void draw_music_screen(const PlayerOsd& osd,const float* bands,int count,const f
 
 // `under`: the page beneath, undimmed (the peek dims it in the same pass).
 void draw_quick_peek(const Item& item,const PeekOrigin& origin,float progress,const std::string& status="",const uint32_t* under=nullptr);
-void draw_search(const std::string& query);
+// Search (PS3 Classic search): the field at the top; while typing (keys) the
+// keyboard under it, the results updating as the term is typed; in the list
+// the keyboard folds away, filter chips with their counts sit over the
+// results and a box beside them says what the highlighted one is. With
+// nothing typed the list is the recent searches. filters: the kinds the
+// results hold, "All" first, filter_counts how many each; filter: the one shown.
+struct SearchView { const KeyboardEditor* editor=nullptr; bool keys=true,searching=false,failed=false; std::vector<Item> results; std::vector<std::string> recents,filters; std::vector<int> filter_counts; int filter=0,selected=0,total=0; };
+void draw_search_page(const SearchView& view);
+// The search list's row `index` on screen, for the quick peek to grow from.
+PeekOrigin search_row_rect(const SearchView& view,int index);
+// The on-screen keyboard drawn into a panel of width w (search); its height.
+int draw_keyboard_panel(const KeyboardEditor& editor,int x,int y,int w,bool focused);
+// What kind of item a result is, as the filter names it ("Films", "Songs"...).
+const char* search_kind(const Item& item);
+// Downloads: what is downloading now (a progress bar), then the downloaded
+// films and episodes with their size and whether they are on a USB drive.
+// note: where new downloads go, when that needs saying.
+void draw_downloads(const std::vector<DownloadEntry>& entries,int selected,const DownloadStatus& status,const std::string& note);
+// A folder on a USB drive: its sub-folders, videos and music, one row each,
+// with a detail at the right (a size, "Folder"). empty: what to say when bare.
+struct LocalRow { std::string name,detail; LocalKind kind=LOCAL_OTHER; };
+void draw_local_browser(const std::string& title,const std::string& where,const std::vector<LocalRow>& rows,int selected,const std::string& empty);
 std::string fit_text(const std::string& text,int width,int size=24);
 std::string fit_face(const std::string& text,int width,int size,TextFace face);
 void paragraph(int x,int y,const std::string& text,int width,int lines,uint32_t color,int size=24,int pitch=29);

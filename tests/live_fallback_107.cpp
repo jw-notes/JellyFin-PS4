@@ -7,6 +7,6 @@ int main(int argc,char** argv){
  Item channel;snprintf(channel.base.id,sizeof channel.base.id,"channel-id");snprintf(channel.base.type,sizeof channel.base.type,"TvChannel");
  std::string url,session,source;assert(playback_url(channel,-1,-1,"",url,session,source));
  assert(source=="opened-source"&&session=="catalogue-session");
- for(const char* part:{"/Videos/channel-id/master.m3u8?","LiveStreamId=opened-live","MediaSourceId=opened-source","VideoCodec=h264","AudioCodec=aac","api_key=fixture-token"})assert(url.find(part)!=std::string::npos);
+ for(const char* part:{"/Videos/channel-id/master.m3u8?","LiveStreamId=opened-live","MediaSourceId=opened-source","VideoCodec=h264","AudioCodec=aac","ApiKey=fixture-token"})assert(url.find(part)!=std::string::npos);
  end_playback(session);puts("PASS NoCompatibleStream recovery: real source catalogue -> OpenToken -> opened live source -> authenticated HLS endpoint -> query-based close");
 }

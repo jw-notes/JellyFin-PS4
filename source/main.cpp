@@ -16,6 +16,8 @@
 #include "music_viz.h"
 #include "language.h"
 #include "updater.h"
+#include "downloads.h"
+#include "local_media.h"
 #include "../vendor/ps3/source/player/core/picture_size.h"
 #include <orbis/_types/pad.h>
 #include <pthread.h>
@@ -26,6 +28,9 @@
 #include <algorithm>
 #include <list>
 #include <functional>
+#include <random>
+#include <memory>
+#include <atomic>
 #include "../vendor/ps3/source/ui/render/peek.h"
 #ifndef JF_BUILD_VERSION
 #define JF_BUILD_VERSION "host"
@@ -65,8 +70,12 @@ static void order_libraries(std::vector<Item>& libraries){
 }
 // Settings changed Home's order: load it again.
 static bool home_dirty=false;
+// The Downloads page (below): Settings > System opens it too.
+static void downloads_screen();
+// What Options downloads from a library: one file, or all of an album, season or series.
+static bool downloadable(const char* t){for(const char* k:{"Movie","Episode","Video","Audio","MusicAlbum","Season","Series"})if(!strcmp(t,k))return true;return false;}
 enum SettingSection { SEC_PLAYBACK, SEC_LIVETV, SEC_DISPLAY, SEC_ACCOUNT, SEC_SYSTEM, SEC__COUNT };
-enum SettingId { SET_QUALITY, SET_HD1080, SET_RESUME, SET_SKIP_INTRO, SET_SKIP_OUTRO, SET_METHOD, SET_GUIDE_UPDATE, SET_GUIDE_AUTO, SET_GUIDE_URL, SET_ONNOW, SET_SHARE, SET_THEME, SET_LANGUAGE, SET_HOME_ORDER, SET_SAVER, SET_SAVER_DELAY, SET_SIGN_OUT, SET_UPDATE, SET_ABOUT, SET_DEBUG, SET_EXIT };
+enum SettingId { SET_QUALITY, SET_HD1080, SET_RESUME, SET_SKIP_INTRO, SET_SKIP_OUTRO, SET_METHOD, SET_GUIDE_UPDATE, SET_GUIDE_AUTO, SET_GUIDE_URL, SET_ONNOW, SET_SHARE, SET_THEME, SET_LANGUAGE, SET_HOME_ORDER, SET_SAVER, SET_SAVER_DELAY, SET_SIGN_OUT, SET_DOWNLOADS, SET_DOWNLOAD_TO, SET_UPDATE, SET_ABOUT, SET_DEBUG, SET_EXIT };
 struct SettingDef { SettingId id; SettingSection section; const char* label; const char* description; bool action; };
 static const SettingDef SETTING_ROWS[]={
  {SET_QUALITY,SEC_PLAYBACK,"Quality","The highest bitrate the server streams at. Lower it if playback\nstops to buffer; raise it for a sharper picture on a fast network.",false},
@@ -86,6 +95,8 @@ static const SettingDef SETTING_ROWS[]={
  {SET_SAVER_DELAY,SEC_DISPLAY,"Screensaver Delay","How long the menus wait, untouched, before the screensaver\nstarts: 30 seconds to 30 minutes.",false},
  {SET_SHARE,SEC_ACCOUNT,"Share Sign-in","On: this console's users with no sign-in of their own use this account.\nOne account can be shared; users signed in to their own keep it.",false},
  {SET_SIGN_OUT,SEC_ACCOUNT,"Log Out","Sign out of this Jellyfin account.\nYou will need to log in again to browse your library.",true},
+ {SET_DOWNLOADS,SEC_SYSTEM,"Downloads","What is downloading and what is saved. X opens it: play, delete or stop\na download.",true},
+ {SET_DOWNLOAD_TO,SEC_SYSTEM,"Save Downloads To","Where films and episodes you download are saved. A USB drive needs GoldHEN 2.3\nor later; without a drive plugged in they go to the console.",false},
  {SET_UPDATE,SEC_SYSTEM,"Software Update","Checked at every launch. X checks again, and downloads a new version\nto /data/pkg when there is one; install it from the Package Installer.",true},
  {SET_ABOUT,SEC_SYSTEM,"About","The version, who made the app, and the licences of\neverything in it.",true},
  {SET_DEBUG,SEC_SYSTEM,"Debug Logging","Write a diagnostic log to /data/JellyFin-PS4-logs (never passwords\nor tokens). Turn it on when reporting a problem.",false},
@@ -117,15 +128,19 @@ static SettingsRowView setting_view(const SettingDef& r){
   v.description=a.empty()?std::string(T("Not set. Taken from your playlist when it names its guide (url-tvg);"))+"\n"+T("X to enter an XMLTV address (.xml or .xml.gz) yourself."):
    std::string(T(playlist?"From your playlist:":"Entered:"))+" "+a+"\n"+T("X to change it; clear it to use the playlist's own guide.");break;}
  case SET_SKIP_INTRO:case SET_SKIP_OUTRO:{
-  // Greyed out, and fixed, when the server has nothing to mark them with.
-  if(segments_supported()==0){v.value=T("Not on server");v.dim=true;v.description=T("Your Jellyfin server has no intro / credits markers. Install the Intro Skipper\nplugin (Jellyfin 10.10+), then scan the library, to use this.");break;}
-  const int s=r.id==SET_SKIP_INTRO?settings.skip_intro:settings.skip_outro;v.value=T(s==SKIP_AUTO?"Auto":s==SKIP_BUTTON?"Button":"Off");v.lit=s==SKIP_AUTO;break;}
+  // Every account asks the server for markers. When an admin account shows
+  // there is no marker plugin, say what still works: named chapters.
+  const int s=r.id==SET_SKIP_INTRO?settings.skip_intro:settings.skip_outro;v.value=T(s==SKIP_AUTO?"Auto":s==SKIP_BUTTON?"Button":"Off");v.lit=s==SKIP_AUTO;
+  if(segments_supported()==0)v.description=T("No intro skipping plugin was found on your server, so only chapters named Intro\nor Credits are skipped. Install Intro Skipper (and scan) for every episode.");
+  break;}
  case SET_METHOD:v.value=T(settings.method==PLAY_DIRECT_FILE?"Direct file":settings.method==PLAY_TRANSCODE?"Always transcode":"Auto");break;
  case SET_THEME:v.value=theme_current_name();break;
  case SET_LANGUAGE:v.value=language_label();break;
  case SET_SAVER:v.value=T(settings.saver?"Artwork":"Off");v.lit=settings.saver;break;
  case SET_SAVER_DELAY:v.value=screensaver_delay_label();v.dim=!settings.saver;break;
  case SET_DEBUG:v.value=T(settings.debug_log?"On":"Off");v.lit=settings.debug_log;break;
+ case SET_DOWNLOADS:{const DownloadStatus s=download_status();if(s.active)v.value=s.total?TF("Downloading %d%%",(int)(100.0*s.got/s.total)):T("Downloading...");break;}
+ case SET_DOWNLOAD_TO:{v.value=T(settings.download_usb?"USB drive":"Console");const std::string s=usb_status();if(!s.empty())v.description=std::string(T(s.c_str()))+"\n"+T("Downloads already saved stay where they are.");break;}
  case SET_UPDATE:{const int s=update_state();v.value=s==UPD_CHECKING?T("Checking..."):s==UPD_CURRENT?T("Up to date"):s==UPD_AVAILABLE?TF("Version %s available",update_version().c_str()):s==UPD_FAILED?T("Check failed"):"";v.lit=s==UPD_AVAILABLE;v.action=false;break;}
  default:break;
  }
@@ -141,13 +156,14 @@ static bool setting_step(SettingId id,int dir){
  case SET_ONNOW:settings.home_onnow=!settings.home_onnow;home_dirty=true;break;
  // Kept beside the users' folders, not in settings.json.
  case SET_SHARE:return share_set(share_state()!=SHARE_MINE);
- case SET_SKIP_INTRO:if(segments_supported()==0)return false;settings.skip_intro=(settings.skip_intro+dir+3)%3;break;
- case SET_SKIP_OUTRO:if(segments_supported()==0)return false;settings.skip_outro=(settings.skip_outro+dir+3)%3;break;
+ case SET_SKIP_INTRO:settings.skip_intro=(settings.skip_intro+dir+3)%3;break;
+ case SET_SKIP_OUTRO:settings.skip_outro=(settings.skip_outro+dir+3)%3;break;
  case SET_METHOD:settings.method=(settings.method+dir+3)%3;break;
  case SET_THEME:theme_step(dir);return true;   // the theme keeps its own file
  case SET_LANGUAGE:language_step(dir);break;
  case SET_SAVER:settings.saver=!settings.saver;break;
  case SET_SAVER_DELAY:if(!settings.saver)return false;screensaver_delay_step(dir);break;
+ case SET_DOWNLOAD_TO:settings.download_usb=!settings.download_usb;break;
  case SET_DEBUG:if(settings.debug_log)plog("Debug logging turned off");settings.debug_log=!settings.debug_log;if(settings.debug_log)plog("Debug logging turned on");break;
  default:return false;
  }
@@ -240,6 +256,7 @@ static int settings_screen(){
   if(b&ORBIS_PAD_BUTTON_CROSS){
    if(!d.action){setting_step(d.id,1);continue;}
    if(d.id==SET_ABOUT){about_screen();wait_release();}
+   if(d.id==SET_DOWNLOADS){downloads_screen();wait_release();}
    if(d.id==SET_HOME_ORDER){home_order_screen();wait_release();}
    if(d.id==SET_GUIDE_UPDATE)guide_update_now();
    if(d.id==SET_GUIDE_URL){std::string url=settings.guide_url;
@@ -251,23 +268,21 @@ static int settings_screen(){
   }
  }
 }
-static int search_screen(std::string& query){
- UiInputScope input_scope;
- for(;;){draw_search(query);present();auto b=press();
-  if(b&ORBIS_PAD_BUTTON_L1)return 0;
-  if(b&ORBIS_PAD_BUTTON_R1)return 2;
-  if(b&ORBIS_PAD_BUTTON_CIRCLE)return -1;
-  if(b&ORBIS_PAD_BUTTON_CROSS){if(keyboard(T("Search Jellyfin"),query)&&!query.empty())return 3;ui_input_sync();}
-
- }
-}
 // How playback ended: stopped (Circle, an error), the end of the stream, or a
 // skip to the next / previous track of an album.
-enum PlayEnd { PLAY_STOPPED, PLAY_ENDED, PLAY_NEXT, PLAY_PREVIOUS };
+enum PlayEnd { PLAY_STOPPED, PLAY_ENDED, PLAY_NEXT, PLAY_PREVIOUS, PLAY_JUMP };
 // Where a track sits in its album (the Now Playing screen), or an episode in
 // its series: what comes next, and whether L1 / R1 can go back or on.
-struct PlayQueue { int track=0,tracks=0; bool has_prev=false,has_next=false; std::string up_next; };
-static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,const std::string& audio_label="",const std::string& subtitle_label="",const PlayQueue* queue=nullptr){
+// Music's queue (PS3): its tracks' names in play order and the next few,
+// shuffle -- Triangle flips it and on_shuffle rearranges what is left -- and
+// the track the queue screen (Options) chose, with PLAY_JUMP.
+struct PlayQueue { int track=0,tracks=0; bool has_prev=false,has_next=false; std::string up_next;
+ std::vector<std::string> names,upcoming; bool shuffle=false; int jump=-1; std::function<void(PlayQueue&)> on_shuffle; };
+// A track switch restarts the stream where it was, whatever the Resume setting.
+static bool play_resume_once=false;
+static std::string audio_chip(const std::string& label);
+static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,const std::string& audio_label="",const std::string& subtitle_label="",PlayQueue* queue=nullptr){
+ const bool resume_on=settings.resume||play_resume_once;play_resume_once=false;
  UiInputScope input_scope;ScreensaverInhibit no_saver;++play_generation;page_cache_clear();std::string url,session,source_id;
  const bool live=!strcmp(item.base.type,"TvChannel"),audio_only=!strcmp(item.base.type,"Audio");
  // The PS3 player HUD: title, play state, progress and times. Left/Right move
@@ -275,7 +290,7 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
  // the target settles, so a run of presses is one request to the server.
  PlayerOsd osd;osd.live=live;osd.audio_only=audio_only;osd.duration=item.duration;osd.audio=audio_label;osd.subtitles=subtitle_label;
  if(!strcmp(item.base.type,"Episode")&&!item.series.empty()){osd.title=item.series;char code[32]="";if(item.episode)snprintf(code,sizeof code,"S%d:E%d - ",item.season,item.episode);osd.subtitle=code+std::string(item.base.name);}
- else if(audio_only){osd.title=item.base.name;osd.subtitle=item.artist;osd.album=item.album;if(item.year)osd.album+=(osd.album.empty()?"":"  \xC2\xB7  ")+std::to_string(item.year);if(queue){osd.track=queue->track;osd.tracks=queue->tracks;osd.up_next=queue->up_next;}}
+ else if(audio_only){osd.title=item.base.name;osd.subtitle=item.artist;osd.album=item.album;if(item.year)osd.album+=(osd.album.empty()?"":"  \xC2\xB7  ")+std::to_string(item.year);if(queue){osd.track=queue->track;osd.tracks=queue->tracks;osd.up_next=queue->up_next;osd.upcoming=queue->upcoming;osd.shuffle=queue->shuffle;}}
  else{osd.title=item.base.name;if(item.year)osd.subtitle=std::to_string(item.year);}
  if(!audio_only&&queue){osd.has_prev=queue->has_prev;osd.has_next=queue->has_next;osd.up_next=queue->up_next;}
  const bool series=osd.has_prev||osd.has_next;
@@ -293,8 +308,10 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
  buffering_begin(item,osd.subtitle.empty()||audio_only?osd.title:osd.title+"  \xC2\xB7  "+osd.subtitle);
  if(settings.debug_log)plog(("Playback: starting; "+resource_report()).c_str());
  const uint64_t play_pressed=mono_ms();bool prepared=false;std::vector<MediaSegment> segments;std::vector<bool> segment_done;
- buffering_run([&]{prepared=playback_url(item,audio,subtitle,source,url,session,source_id);
-  if(prepared&&!live&&!audio_only&&(settings.skip_intro||settings.skip_outro)&&segments_supported()!=0)segments=fetch_segments(item.base.id);});
+ // A download plays from its file: no server, no progress reports.
+ const bool offline=!item.local.empty();
+ buffering_run([&]{if(offline){url=item.local;prepared=true;return;}prepared=playback_url(item,audio,subtitle,source,url,session,source_id);
+  if(prepared&&!live&&!audio_only&&(settings.skip_intro||settings.skip_outro))segments=fetch_segments(item.base.id);});
  segment_done.assign(segments.size(),false);
  if(!segments.empty())plog(("Playback: "+std::to_string(segments.size())+" intro / credits markers").c_str());
  plog(("Playback: PlaybackInfo took "+std::to_string(mono_ms()-play_pressed)+" ms"+(settings.hd1080?" (1080p)":"")).c_str());
@@ -302,11 +319,22 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
  buffering_step(T("CONNECTING"),false,T("Cancel"));
  if(!player_open(url)){buffering_finish(false);end_playback(session);error_screen();return PLAY_STOPPED;}
  // A channel played directly gets 15 seconds before it falls back to the server.
- const bool remote=playback_is_remote();const int start_limit=remote?15:45;
+ const bool remote=!offline&&playback_is_remote();const int start_limit=remote?15:45;
  bool paused=false,started=false,play_failed=false,cancelled=false,finished=false;PlayEnd skip=PLAY_STOPPED;time_t began=time(nullptr),last_report=began;bool reported=false;
  // A transcode starts at the resume point; the original file is sought to it.
- const bool is_static=playback_is_static();
- uint64_t base=settings.resume&&!is_static?item.resume:0;bool direct_resume_pending=is_static&&settings.resume&&item.resume;
+ const bool is_static=offline||playback_is_static();
+ uint64_t base=resume_on&&!is_static?item.resume:0;bool direct_resume_pending=is_static&&resume_on&&item.resume;
+ // Audio and subtitles in the player (PS3 Triangle): the item's tracks, asked
+ // for when the menu opens; picking one restarts the stream with it.
+ static JFMediaSources track_sources;int track_source=0;bool restart=false;
+ auto open_tracks=[&]{Item fresh;if(!fetch_detail(item,fresh))return false;memset(&track_sources,0,sizeof track_sources);jellyfin_parse_media_sources(responseBuffer,&track_sources);
+  if(!track_sources.n_sources)return false;track_source=0;for(int i=0;i<track_sources.n_sources;++i)if(source==track_sources.source[i].id||source_id==track_sources.source[i].id)track_source=i;
+  const JFTracks& t=track_sources.source[track_source].tracks;
+  osd.audio_names.clear();for(int i=0;i<t.n_audio;++i)osd.audio_names.push_back(t.audio[i].label);
+  osd.sub_names={T("Off")};for(int i=0;i<t.n_subs;++i)osd.sub_names.push_back(t.subs[i].label);
+  osd.audio_now=t.default_audio>=0&&t.default_audio<t.n_audio?t.default_audio:0;if(audio>=0)for(int i=0;i<t.n_audio;++i)if(t.audio[i].index==audio)osd.audio_now=i;
+  osd.sub_now=0;if(subtitle>=0)for(int i=0;i<t.n_subs;++i)if(t.subs[i].index==subtitle)osd.sub_now=i+1;
+  osd.audio_sel=osd.audio_now;osd.sub_sel=osd.sub_now;osd.tracks_sub=osd.audio_names.empty();osd.tracks_open=true;return true;};
  uint64_t osd_until=now_ms()+5000,target=0,scrub_at=0,hold_until=0;bool scrubbing=false;int scrub_presses=0;
  bool picture=false,picture_move=false;uint64_t viz_toast_until=0,tri_since=0;bool tri_down=false,tri_used=false,volume_changed=false,volume_active=false;uint64_t volume_until=0,skip_toast_until=0;std::string skip_toast;int control=-1;
  uint64_t reconnect_at=0,reconnect_us=0,reconnect_window=0;int reconnects=0;
@@ -349,6 +377,7 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
     :std::string(T("Picture size"))+"   "+T("Width")+" "+std::to_string(settings.pic_w)+"%   "+T("Height")+" "+std::to_string(settings.pic_h)+"%   "+T(shape),picture_move);
   }
   if(audio_only&&now<volume_until)draw_volume_banner(settings.volume);
+  if(osd.tracks_open)draw_track_menu(osd);
   // Intro / credits markers: the one playing now, not yet acted on.
   // Credits only count in a show with a next episode (they skip to it); a
   // film's are left alone.
@@ -358,6 +387,21 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
   if(seg_mode==SKIP_BUTTON&&!picture)draw_skip_button(T(seg_next?"Skip to Next Episode":"Skip Intro"),true);
   if(now<skip_toast_until&&!picture)draw_skip_button(skip_toast,false);
   present();auto b=press();
+  // Music's queue (Options): Up / Down choose a track, X plays it, Circle or
+  // Options closes it. It has the buttons to itself while it is open.
+  if(audio_only&&queue&&osd.queue_open){
+   const int n=(int)osd.queue_names.size();
+   if(b&ORBIS_PAD_BUTTON_UP)osd.queue_sel=(osd.queue_sel+n-1)%n;
+   else if(b&ORBIS_PAD_BUTTON_DOWN)osd.queue_sel=(osd.queue_sel+1)%n;
+   else if(b&ORBIS_PAD_BUTTON_CROSS){osd.queue_open=false;if(osd.queue_sel!=osd.track-1){queue->jump=osd.queue_sel;skip=PLAY_JUMP;break;}}
+   else if(b&(ORBIS_PAD_BUTTON_CIRCLE|ORBIS_PAD_BUTTON_OPTIONS))osd.queue_open=false;
+   b=0;
+  }
+  if(audio_only&&queue&&osd.tracks>1&&(b&ORBIS_PAD_BUTTON_OPTIONS)){osd.queue_names=queue->names;osd.queue_sel=std::max(0,osd.track-1);osd.queue_open=!osd.queue_names.empty();b=0;}
+  // Shuffle (PS3 Triangle): the rest of the queue in a new order, or back in order.
+  if(audio_only&&queue&&osd.tracks>1&&queue->on_shuffle&&(b&ORBIS_PAD_BUTTON_TRIANGLE)){
+   queue->shuffle=!queue->shuffle;queue->on_shuffle(*queue);osd.shuffle=queue->shuffle;osd.track=queue->track;osd.up_next=queue->up_next;osd.upcoming=queue->upcoming;
+   plog(queue->shuffle?"Music: shuffle on":"Music: shuffle off");b&=~ORBIS_PAD_BUTTON_TRIANGLE;}
   // Skip it: by itself (Auto) or with Triangle (Button). Credits go on to the
   // next episode.
   if(seg_at>=0&&!picture&&(seg_mode==SKIP_AUTO||(seg_mode==SKIP_BUTTON&&(b&ORBIS_PAD_BUTTON_TRIANGLE)))){
@@ -377,6 +421,21 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
   // Picture (PS3 L1): the size, position and shape -- Fit / Fill / Stretch --
   // kept for every video, because they correct for the screen, not the film.
   // Holding Triangle 3 s resets it: held, so a bump cannot undo it.
+  // The track menu: Up / Down choose, Left / Right or Triangle switch between
+  // audio and subtitles, X plays the choice from here, Circle closes it.
+  if(osd.tracks_open){
+   const int n=osd.tracks_sub?(int)osd.sub_names.size():(int)osd.audio_names.size();int& sel=osd.tracks_sub?osd.sub_sel:osd.audio_sel;
+   if(n&&(b&ORBIS_PAD_BUTTON_UP))sel=(sel+n-1)%n;
+   else if(n&&(b&ORBIS_PAD_BUTTON_DOWN))sel=(sel+1)%n;
+   else if((b&(ORBIS_PAD_BUTTON_LEFT|ORBIS_PAD_BUTTON_RIGHT|ORBIS_PAD_BUTTON_TRIANGLE))&&!osd.audio_names.empty())osd.tracks_sub=!osd.tracks_sub;
+   else if(b&ORBIS_PAD_BUTTON_CROSS){if(osd.audio_sel!=osd.audio_now||osd.sub_sel!=osd.sub_now){restart=true;break;}osd.tracks_open=false;}
+   else if(b&ORBIS_PAD_BUTTON_CIRCLE)osd.tracks_open=false;
+   osd_until=now+5000;b=0;
+  }
+  else if(!audio_only&&!live&&!offline&&started&&!picture&&!volume_active&&(b&ORBIS_PAD_BUTTON_TRIANGLE)){
+   if(!open_tracks()){skip_toast=T("No other tracks");skip_toast_until=now+2000;}
+   osd_until=now+5000;b=0;
+  }
   if(picture){
    if(b&ORBIS_PAD_BUTTON_CIRCLE){picture=false;save_settings();}
    else{
@@ -466,8 +525,8 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
    // The transcode starts at the resume point; earlier positions are clamped to it.
    player_seek(target>base?target-base:0);if(target<base)target=base;scrubbing=false;hold_until=now+3000;osd_until=now+3000;
   }
-  if(started&&!reported){reported=true;report_playback("",item,session,source_id,pos,paused);last_report=time(nullptr);}
-  if(time(nullptr)-last_report>=10){report_playback("/Progress",item,session,source_id,pos,paused);last_report=time(nullptr);
+  if(started&&!reported&&!offline){reported=true;report_playback("",item,session,source_id,pos,paused);last_report=time(nullptr);}
+  if(!offline&&time(nullptr)-last_report>=10){report_playback("/Progress",item,session,source_id,pos,paused);last_report=time(nullptr);
    // Every 30 s: free memory, so a leak shows before it runs out.
    if(settings.debug_log&&(last_report-began)%30<10)plog(("Playback: "+resource_report()).c_str());}
   if(started&&!paused&&!player_active()&&time(nullptr)-began>2){finished=true;break;}
@@ -495,27 +554,52 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
  }
  if(buffering_active())buffering_finish(false);
  if(picture||volume_changed)save_settings();
- uint64_t pos=base+player_time();player_close();finish_playback(item,session,source_id,pos,paused);
+ uint64_t pos=base+player_time();player_close();
+ if(!offline)finish_playback(item,session,source_id,pos,paused);
+ else if(started){download_played(item,pos);if(g_token[0]&&strncmp(item.base.id,"local:",6))finish_playback(item,"","",pos,paused);}
+ // A new audio or subtitle track: the same item again from here, with it.
+ if(restart){const JFMediaSource& s=track_sources.source[track_source];const JFTracks& t=s.tracks;
+  const int new_audio=t.n_audio?t.audio[osd.audio_sel].index:audio,new_sub=osd.sub_sel>0?t.subs[osd.sub_sel-1].index:-1;
+  const std::string new_audio_label=t.n_audio?audio_chip(t.audio[osd.audio_sel].label):audio_label,new_sub_label=osd.sub_sel>0?std::string(t.subs[osd.sub_sel-1].label):"";
+  plog(("Playback: switching to audio "+std::to_string(new_audio)+", subtitles "+std::to_string(new_sub)).c_str());
+  item.resume=pos;play_resume_once=true;wait_release();
+  return play(item,new_audio,new_sub,source.empty()?std::string(s.id):source,new_audio_label.empty()?std::string(t.audio[osd.audio_sel].label):new_audio_label,new_sub_label,queue);}
  // A channel's own stream would not play: try it once more through the server.
  if(remote&&!started&&!cancelled){plog(("Live TV: direct stream did not start ("+last_error+"); through the server").c_str());playback_force_server_once();return play(item,audio,subtitle,source,audio_label,subtitle_label,queue);}
  if((!started&&!cancelled)||play_failed)error_screen();wait_release();
  if(play_failed)return PLAY_STOPPED;return skip!=PLAY_STOPPED?skip:finished?PLAY_ENDED:PLAY_STOPPED;}
-// Music plays on through its album: R1 / L1 skip, and when a track ends the
-// next one starts by itself.
+// Music plays through a queue -- an album, a playlist, the Songs tab from the
+// chosen track -- in order or shuffled (Triangle; kept for the next queue).
+// R1 / L1 skip, the queue screen (Options) jumps, and when a track ends the
+// next starts by itself. Shuffling keeps the playing track and deals the
+// rest after it, as the PS3 does.
+static bool music_shuffle=false;
+static void play_tracks(const std::vector<Item>& list,int at,uint64_t resume=0){
+ if(list.empty())return;const int count=(int)list.size();at=std::max(0,std::min(count-1,at));
+ static std::minstd_rand dealer((unsigned)mono_us());
+ std::vector<int> order;int pos=0;
+ auto arrange=[&](int current){order.resize(count);for(int i=0;i<count;++i)order[i]=i;
+  if(music_shuffle&&count>1){std::swap(order[0],order[current]);for(int i=count-1;i>1;--i){const int j=1+(int)(dealer()%(unsigned)i);std::swap(order[i],order[j]);}pos=0;}else pos=current;};
+ auto fill=[&](PlayQueue& q){q.track=pos+1;q.tracks=count;q.shuffle=music_shuffle;q.names.clear();for(int i:order)q.names.push_back(list[i].base.name);
+  q.upcoming.clear();for(int k=pos+1;k<count&&k<=pos+3;++k)q.upcoming.push_back(list[order[k]].base.name);q.up_next=q.upcoming.empty()?"":q.upcoming[0];};
+ arrange(at);bool first=true;
+ for(;;){
+  const int index=order[pos];Item track=list[index];track.resume=first?resume:0;first=false;
+  PlayQueue queue;fill(queue);queue.on_shuffle=[&](PlayQueue& q){music_shuffle=q.shuffle;arrange(index);fill(q);};
+  const PlayEnd end=play(track,-1,-1,"","","",&queue);
+  if(end==PLAY_JUMP&&queue.jump>=0&&queue.jump<count)pos=queue.jump;
+  else if(end==PLAY_PREVIOUS)pos=std::max(0,pos-1);
+  else if((end==PLAY_NEXT||end==PLAY_ENDED)&&pos+1<count)++pos;
+  else break;
+ }
+}
+// A track from its page: the whole album is the queue.
 static void play_music(const Item& first){
  Page album;if(first.album_id.empty()||!fetch_album_tracks(first.album_id,album)||album.items.empty())album.items={first};
  int at=-1;for(size_t i=0;i<album.items.size();++i)if(!strcmp(album.items[i].base.id,first.base.id))at=(int)i;
  if(at<0){album.items.insert(album.items.begin(),first);at=0;}
- const int count=(int)album.items.size();
- for(;;){
-  Item track=album.items[at];track.resume=!strcmp(track.base.id,first.base.id)?first.resume:0;
-  if(track.album.empty())track.album=first.album;if(track.album_id.empty())track.album_id=first.album_id;if(track.artist.empty())track.artist=first.artist;
-  PlayQueue queue;queue.track=at+1;queue.tracks=count;if(at+1<count)queue.up_next=album.items[at+1].base.name;
-  const PlayEnd end=play(track,-1,-1,"","","",&queue);
-  if(end==PLAY_PREVIOUS)at=std::max(0,at-1);
-  else if((end==PLAY_NEXT||end==PLAY_ENDED)&&at+1<count)++at;
-  else break;
- }
+ for(auto& track:album.items){if(track.album.empty())track.album=first.album;if(track.album_id.empty())track.album_id=first.album_id;if(track.artist.empty())track.artist=first.artist;}
+ play_tracks(album.items,at,first.resume);
 }
 // A series plays on: when an episode ends the next starts by itself (from its
 // beginning), and R1 / L1 skip. The first keeps the detail page's choices.
@@ -579,6 +663,10 @@ static bool detail_screen(const Item& initial,Person& person){
      Item fresh;if(fetch_detail(item,fresh)){fresh.people=fresh.people.empty()?item.people:fresh.people;item=fresh;request_detail_art(item);}
      view.col=0;wait_release();continue;
     }
+    // Download it, or its whole season: queued, the page says Downloaded.
+    if(action==ACT_DOWNLOAD||action==ACT_DOWNLOAD_SEASON){Item target=item;
+     if(action==ACT_DOWNLOAD_SEASON){target=Item{};snprintf(target.base.id,sizeof target.base.id,"%s",item.season_id.c_str());snprintf(target.base.type,sizeof target.base.type,"%s","Season");snprintf(target.base.name,sizeof target.base.name,"%s",item.base.name);target.series=item.series;}
+     if(!download_item(target))error_screen();else home_dirty=true;continue;}
     if(action==ACT_FAVOURITE){if(jf_set_favourite(item.base.id,!item.favourite)){item.favourite=!item.favourite;page_cache_clear();}else{last_error=T("Favourite update failed");error_screen();}}
     if(action==ACT_WATCHED){if(jf_set_played(item.base.id,!item.played)){item.played=!item.played;page_cache_clear();if(item.played)item.resume=0;view.col=std::min(view.col,(int)detail_actions(item).size()-1);}else{last_error=T("Watched update failed");error_screen();}}
    }
@@ -592,9 +680,94 @@ static bool detail_screen(const Item& initial,Person& person){
 
  }
 }
+// Downloads: the files saved here (PS3 offline downloads). X plays one from
+// its file, Square deletes it, Triangle stops what is downloading.
+static void downloads_screen(){
+ UiInputScope input_scope;wait_release();int selected=0;
+ auto entries=downloads_list();int seen=download_status().finished;
+ for(;;){
+  const DownloadStatus status=download_status();
+  if(status.finished!=seen){seen=status.finished;entries=downloads_list();}
+  selected=std::max(0,std::min(selected,(int)entries.size()-1));
+  for(int i=std::max(0,selected-8);i<std::min((int)entries.size(),selected+9);++i)load_art(entries[i].item.base.id);
+  std::string note=usb_status();if(!note.empty())note=T(note.c_str());else if(settings.download_usb)note=T("New downloads are saved to the USB drive.");
+  draw_downloads(entries,selected,status,note);present();const auto b=press();
+  if(b&ORBIS_PAD_BUTTON_CIRCLE)return;
+  if(b&ORBIS_PAD_BUTTON_UP)selected=std::max(0,selected-1);
+  if(b&ORBIS_PAD_BUTTON_DOWN)selected=std::min((int)entries.size()-1,selected+1);
+  if((b&ORBIS_PAD_BUTTON_TRIANGLE)&&(status.active||status.queued||status.paused))download_pause(!status.paused);
+  if((b&ORBIS_PAD_BUTTON_OPTIONS)&&(status.active||status.queued)&&confirm(T("Stop downloading?"),T("The file downloading now and the ones waiting are removed."),T("Stop"),[&]{draw_downloads(entries,selected,status,note);}))download_cancel();
+  if(entries.empty())continue;
+  const DownloadEntry entry=entries[selected];
+  if(b&ORBIS_PAD_BUTTON_CROSS){play(entry.item,-1,-1,"");entries=downloads_list();wait_release();}
+  if((b&ORBIS_PAD_BUTTON_SQUARE)&&confirm(T("Delete this download?"),entry.item.base.name,T("Delete"),[&]{draw_downloads(entries,selected,status,note);})){download_delete(entry);entries=downloads_list();}
+ }
+}
+// USB drives (PS3 Media tab): read by themselves, whatever Save Downloads To
+// says. The drives, then their folders; X opens a folder or plays a file, and
+// a song plays its folder's music from it (shuffle and the queue as ever).
+static void usb_screen(){
+ UiInputScope input_scope;wait_release();
+ std::vector<std::string> path;std::vector<int> back_to;int selected=0;std::vector<LocalEntry> entries;
+ auto load=[&]{entries.clear();
+  if(path.empty()){int n=1;for(const auto& drive:usb_drives()){LocalEntry e;e.name=TF("USB drive %d",n++);e.path=drive;e.kind=LOCAL_FOLDER;entries.push_back(e);}}
+  else list_local_folder(path.back(),entries);};
+ load();
+ // One drive in: straight into it.
+ const bool one_drive=entries.size()==1;if(one_drive){path.push_back(entries[0].path);back_to.push_back(0);load();}
+ plog(("USB: browsing, "+std::to_string(usb_drives().size())+" drive(s)").c_str());
+ std::string signature=usb_drives_signature();uint64_t checked=mono_ms();
+ for(;;){
+  // A drive plugged in or pulled out while the page is open.
+  if(mono_ms()-checked>2000){checked=mono_ms();const std::string now=usb_drives_signature();
+   if(now!=signature){signature=now;if(!path.empty()&&now.find(path.front()+";")==std::string::npos){path.clear();back_to.clear();selected=0;}load();}}
+  std::vector<LocalRow> rows;
+  for(const auto& e:entries){LocalRow r;r.name=e.name;r.kind=e.kind;
+   if(e.kind==LOCAL_FOLDER)r.detail=path.empty()?e.path:std::string();
+   else{char b[32];if(e.bytes>=1000000000ULL)snprintf(b,sizeof b,"%.1f GB",e.bytes/1e9);else snprintf(b,sizeof b,"%.1f MB",e.bytes/1e6);r.detail=b;}
+   rows.push_back(r);}
+  selected=std::max(0,std::min(selected,(int)rows.size()-1));
+  std::string title=T("USB Drive");if(path.size()>1){const auto s=path.back().rfind('/');title=path.back().substr(s+1);}
+  draw_local_browser(title,path.empty()?std::string():path.back(),rows,selected,
+   path.empty()?T("No USB drive found. Plug one in and it shows here by itself."):T("No videos or music in this folder."));
+  present();const auto b=press();
+  if(b&ORBIS_PAD_BUTTON_CIRCLE){
+   if(path.empty()||(one_drive&&path.size()==1))return;
+   path.pop_back();selected=back_to.back();back_to.pop_back();load();continue;}
+  if(b&ORBIS_PAD_BUTTON_UP)selected=std::max(0,selected-1);
+  if(b&ORBIS_PAD_BUTTON_DOWN)selected=std::min((int)rows.size()-1,selected+1);
+  if(b&ORBIS_PAD_BUTTON_L2)selected=std::max(0,selected-9);
+  if(b&ORBIS_PAD_BUTTON_R2)selected=std::min((int)rows.size()-1,selected+9);
+  if(!(b&ORBIS_PAD_BUTTON_CROSS)||entries.empty())continue;
+  const LocalEntry e=entries[selected];
+  if(e.kind==LOCAL_FOLDER){path.push_back(e.path);back_to.push_back(selected);selected=0;load();continue;}
+  plog(("USB: playing "+e.name).c_str());
+  if(e.kind==LOCAL_VIDEO)play(local_item(e),-1,-1,"");
+  else{std::vector<Item> list;int at=0;for(const auto& f:entries)if(f.kind==LOCAL_AUDIO){if(f.path==e.path)at=(int)list.size();list.push_back(local_item(f));}play_tracks(list,at);}
+  wait_release();
+ }
+}
+// No server needed (sign-in screen, or a server that cannot be reached): the
+// USB drive and the downloads, as the PS3's Media tab and Offline library.
+static void offline_screen(){
+ UiInputScope input_scope;wait_release();int selected=0;
+ for(;;){
+  std::vector<LocalRow> rows;LocalRow usb;usb.name=T("USB Drive");usb.kind=LOCAL_FOLDER;const auto drives=usb_drives();
+  usb.detail=drives.empty()?T("No drive found"):TF("%d drive(s)",(int)drives.size());rows.push_back(usb);
+  LocalRow dl;dl.name=T("Downloads");dl.kind=LOCAL_FOLDER;rows.push_back(dl);
+  draw_local_browser(T("Without a server"),T("Videos and music on a USB drive, and what you have downloaded."),rows,selected,"");present();
+  const auto b=press();
+  if(b&ORBIS_PAD_BUTTON_CIRCLE)return;
+  if(b&ORBIS_PAD_BUTTON_UP)selected=0;
+  if(b&ORBIS_PAD_BUTTON_DOWN)selected=1;
+  if(b&ORBIS_PAD_BUTTON_CROSS){if(selected==0)usb_screen();else downloads_screen();wait_release();}
+ }
+}
 struct Location {std::string parent,title,query;int mode=0,start=0,selected=0,first=0;std::string breadcrumb{};std::string letter{};bool letters=false;};
+// An album lists its tracks; an artist or genre its albums; a playlist its items in order.
+static int child_mode(const char* t){return !strcmp(t,"MusicAlbum")?MODE_ALBUM:!strcmp(t,"MusicArtist")?MODE_ARTIST:!strcmp(t,"MusicGenre")?MODE_GENRE:!strcmp(t,"Playlist")?MODE_PLAYLIST:0;}
 static Location child_location(const Location& current,const Item& item,bool home){
- Location next{item.base.id,home?item.base.name:current.title,"",!strcmp(item.base.type,"MusicAlbum")?MODE_ALBUM:0,0,0};
+ Location next{item.base.id,home?item.base.name:current.title,"",child_mode(item.base.type),0,0};
  if(!home){std::string parent=current.breadcrumb;if(!strcmp(item.base.type,"Series"))next.breadcrumb=std::string(item.base.name)+" / Seasons";
  else if(!strcmp(item.base.type,"Season")){const std::string suffix=" / Seasons";if(parent.size()>=suffix.size()&&parent.compare(parent.size()-suffix.size(),suffix.size(),suffix)==0)parent.resize(parent.size()-suffix.size());next.breadcrumb=parent+" / "+item.base.name+" / Episodes";}
  else next.breadcrumb=(parent.empty()?"":parent+" / ")+item.base.name;}
@@ -617,6 +790,92 @@ template<class Background> static bool quick_peek_screen(const Item& initial,con
  }
  return false;
 }
+// Search (PS3 Classic search): the field, the keyboard under it while typing,
+// and the list -- Down from the keyboard's last row folds it away.
+// The search runs on a worker once typing pauses (450 ms after a letter),
+// never for a single character, and an answer for a term no longer typed is
+// dropped. L2 / R2 narrow the answer to one kind without asking again. The
+// term is kept between visits. `open` shows a result and says whether it
+// navigated away (a library page), which leaves Search.
+// Returns the tab to go to (0 Home, 2 Settings), or -1 to go back.
+struct SearchJob{std::string term;Page page;bool ok=false,threaded=false;std::atomic<bool> done{false};pthread_t thread{};};
+static void* search_worker(void* p){background_priority();auto job=(SearchJob*)p;job->ok=search_library(job->term,job->page);job->done=true;return nullptr;}
+static std::string search_term;
+static int search_screen(const std::function<bool(const Item&)>& open){
+ UiInputScope input_scope;KeyboardEditor editor(search_term);editor.cursor=editor.input.size();
+ SearchView view;view.editor=&editor;view.recents=recent_searches();
+ Page answer;std::string shown;std::unique_ptr<SearchJob> job;uint64_t typed_at=0;bool dirty=!search_term.empty();
+ auto trimmed=[&]{const auto a=editor.input.find_first_not_of(' ');return a==std::string::npos?std::string():editor.input.substr(a,editor.input.find_last_not_of(' ')-a+1);};
+ auto list_size=[&]{return !view.results.empty()?(int)view.results.size():editor.input.empty()?(int)view.recents.size():0;};
+ auto filter=[&]{view.results.clear();const std::string want=view.filters.empty()?"":view.filters[view.filter];
+  for(const auto& item:answer.items)if(view.filter==0||want==search_kind(item))view.results.push_back(item);
+  view.total=view.filter==0?std::max(answer.total,(int)answer.items.size()):(int)view.results.size();view.selected=std::min(view.selected,std::max(0,(int)view.results.size()-1));};
+ auto take=[&](const Page& page,const std::string& term,bool ok){answer=page;shown=term;view.failed=!ok;view.filters={"All"};
+  for(const auto& item:answer.items){const std::string kind=search_kind(item);if(std::find(view.filters.begin(),view.filters.end(),kind)==view.filters.end())view.filters.push_back(kind);}
+  view.filter_counts.assign(view.filters.size(),0);view.filter_counts[0]=std::max(answer.total,(int)answer.items.size());
+  for(const auto& item:answer.items)for(size_t f=1;f<view.filters.size();++f)if(view.filters[f]==search_kind(item))++view.filter_counts[f];
+  view.filter=0;view.selected=0;filter();plog(("Search: "+std::to_string(answer.items.size())+" results").c_str());};
+ auto finish_job=[&]{if(job&&job->threaded)pthread_join(job->thread,nullptr);job.reset();};
+ auto leave=[&](int tab){finish_job();search_term=editor.input;wait_release();return tab;};
+ auto edited=[&]{typed_at=mono_ms();dirty=true;};
+ uint32_t previous=buttons();uint64_t repeat_at=0;
+ for(;;){
+  const std::string term=trimmed();
+  // Typing has paused: search for the term (one letter means nothing yet).
+  if(dirty&&!job&&mono_ms()-typed_at>=450){dirty=false;
+   if(term.size()<2){answer={};shown.clear();view.results.clear();view.filters.clear();view.failed=false;view.selected=0;}
+   else if(term!=shown){job.reset(new SearchJob);job->term=term;job->threaded=pthread_create(&job->thread,nullptr,search_worker,job.get())==0;if(!job->threaded)search_worker(job.get());}}
+  if(job&&job->done){const bool current=job->term==trimmed();if(current)take(job->page,job->term,job->ok);finish_job();if(!current)dirty=true;}
+  view.searching=job!=nullptr||(dirty&&term.size()>=2&&term!=shown);
+  if(view.keys==false&&list_size()==0)view.keys=true;
+  for(int i=0;i<(int)view.results.size()&&i<view.selected+10;++i)if(i>=view.selected-10)load_art(view.results[i].base.id);
+  draw_search_page(view);present();
+  const uint32_t current=buttons();uint32_t b=current&~previous;
+  constexpr uint32_t repeat_mask=ORBIS_PAD_BUTTON_UP|ORBIS_PAD_BUTTON_DOWN|ORBIS_PAD_BUTTON_LEFT|ORBIS_PAD_BUTTON_RIGHT|ORBIS_PAD_BUTTON_SQUARE|ORBIS_PAD_BUTTON_L2|ORBIS_PAD_BUTTON_R2;
+  const uint64_t now=mono_ms();if(current!=previous)repeat_at=now+350;else if((current&repeat_mask)&&now>=repeat_at){b|=current&repeat_mask;repeat_at=now+85;}
+  previous=current;
+  if(b&ORBIS_PAD_BUTTON_TOUCH_PAD)return leave(0);
+  // L1 / R1 change tab, as on every other screen: Home and Settings.
+  if(b&(ORBIS_PAD_BUTTON_L1|ORBIS_PAD_BUTTON_R1))return leave((b&ORBIS_PAD_BUTTON_L1)?0:2);
+  if(view.keys){
+   const std::string before=editor.input;
+   if(b&ORBIS_PAD_BUTTON_CIRCLE){if(editor.input.empty())return leave(-1);editor.input.clear();editor.cursor=0;}
+   if(b&ORBIS_PAD_BUTTON_OPTIONS&&list_size()){view.keys=false;continue;}
+   // Down from the keyboard's last row folds it away onto the list (PS3).
+   if((b&ORBIS_PAD_BUTTON_DOWN)&&list_size()&&editor.row>=(int)editor.layout().size()-1){view.keys=false;view.selected=0;continue;}
+   if(b&ORBIS_PAD_BUTTON_UP)editor.move(0,-1);
+   if(b&ORBIS_PAD_BUTTON_DOWN)editor.move(0,1);
+   if(b&ORBIS_PAD_BUTTON_LEFT)editor.move(-1,0);
+   if(b&ORBIS_PAD_BUTTON_RIGHT)editor.move(1,0);
+   // L2 / R2 move the text cursor (letters / symbols: the Symbols key).
+   if(b&ORBIS_PAD_BUTTON_L2)editor.move_cursor(-1);
+   if(b&ORBIS_PAD_BUTTON_R2)editor.move_cursor(1);
+   if(b&ORBIS_PAD_BUTTON_SQUARE)editor.backspace();
+   if(b&ORBIS_PAD_BUTTON_TRIANGLE)editor.caps=!editor.caps;
+   // Done (the wide key) goes to the results, as Options does.
+   if((b&ORBIS_PAD_BUTTON_CROSS)&&editor.activate()&&list_size())view.keys=false;
+   if(editor.input!=before)edited();
+   usleep(1000);continue;
+  }
+  // The list: results, or the recent searches before anything is typed.
+  const int n=list_size();
+  if((b&(ORBIS_PAD_BUTTON_CIRCLE|ORBIS_PAD_BUTTON_OPTIONS))||((b&ORBIS_PAD_BUTTON_UP)&&view.selected==0)){view.keys=true;continue;}
+  if(b&ORBIS_PAD_BUTTON_UP)view.selected=std::max(0,view.selected-1);
+  if(b&ORBIS_PAD_BUTTON_DOWN)view.selected=std::min(n-1,view.selected+1);
+  if((b&(ORBIS_PAD_BUTTON_L2|ORBIS_PAD_BUTTON_R2))&&view.filters.size()>1){const int k=(int)view.filters.size();view.filter=(view.filter+((b&ORBIS_PAD_BUTTON_R2)?1:k-1))%k;view.selected=0;filter();}
+  if(view.results.empty()){
+   // A recent search: search for it again now.
+   if((b&ORBIS_PAD_BUTTON_CROSS)&&n){editor.input=view.recents[view.selected];editor.cursor=editor.input.size();typed_at=0;dirty=true;view.selected=0;}
+   if((b&ORBIS_PAD_BUTTON_SQUARE)&&n){forget_search(view.recents[view.selected]);view.recents=recent_searches();view.selected=std::min(view.selected,std::max(0,(int)view.recents.size()-1));}
+   usleep(1000);continue;}
+  bool go=b&ORBIS_PAD_BUTTON_CROSS;const Item item=view.results[view.selected];
+  if(b&ORBIS_PAD_BUTTON_TRIANGLE){const SearchView under=view;go=quick_peek_screen(item,search_row_rect(under,under.selected),[&]{draw_search_page(under);});previous=buttons();}
+  if(go){remember_search(shown);view.recents=recent_searches();search_term=editor.input;
+   if(open(item))return leave(-1);
+   previous=buttons();}
+  usleep(1000);
+ }
+}
 // Classic Home rows, in the PS3 order: My Media, Continue Watching, Next Up,
 // then Latest for the first movie, show and music library.
 // One Home row's request, run on its own thread.
@@ -634,8 +893,13 @@ static bool load_home(HomeView& home,bool quiet=false){
  jobs.emplace_back(HOME_CONTINUE,Item{},T("Continue Watching"),SHAPE_WIDE);row_start(jobs.back());
  jobs.emplace_back(HOME_NEXTUP,Item{},T("Next Up"),SHAPE_WIDE);row_start(jobs.back());
  if(settings.home_onnow){jobs.emplace_back(HOME_ONNOW,Item{},T("On Now"),SHAPE_SQUARE);row_start(jobs.back());}
- Page views;if(!fetch_page("",0,"",0,views)){for(auto& job:jobs)row_join(job);return false;}
+ Page views;if(!fetch_page("",0,"",0,views)){for(auto& job:jobs)row_join(job);
+  if(g_auth_expired||(usb_drives().empty()&&downloads_list().empty()))return false;
+  plog("Home: the server cannot be reached; showing the USB drive and downloads");views={};}
  order_libraries(views.items);
+ // A USB drive with something on it: its own card, as the PS3's Media tab.
+ if(!usb_drives().empty()){Item u;snprintf(u.base.id,sizeof u.base.id,"%s","nav:usb");snprintf(u.base.name,sizeof u.base.name,"%s",T("USB Drive"));snprintf(u.base.type,sizeof u.base.type,"%s","Navigation");u.overview=T("Videos and music on your USB drive, played without the server.");views.items.push_back(u);}
+ if(download_status().active||!downloads_list().empty()){Item d;snprintf(d.base.id,sizeof d.base.id,"%s","nav:downloads");snprintf(d.base.name,sizeof d.base.name,"%s",T("Downloads"));snprintf(d.base.type,sizeof d.base.type,"%s","Navigation");d.overview=T("Films and episodes saved to this console or a USB drive.");views.items.push_back(d);}
  bool movies=false,shows=false,music=false;
  for(const auto& library:views.items){
   bool want=(library.collection=="movies"&&!movies)||(library.collection=="tvshows"&&!shows)||(library.collection=="music"&&!music);if(!want)continue;
@@ -656,7 +920,7 @@ static Location library_location(const Item& library){
  const int mode=library.collection=="movies"?MODE_MOVIES:library.collection=="tvshows"?MODE_SHOWS:library.collection=="music"?MODE_MUSIC:0;
  Location next{library.base.id,library.base.name,"",mode,0,0};next.letters=library.collection!="playlists";return next;
 }
-int main(){if(!platform_init()){platform_shutdown();platform_exit(1);}plog("Jellyfin [PS] PS4 build " JF_BUILD_VERSION " (MPV/FFmpeg)");theme_load_setting();language_apply();boot_begin();boot_pump();if(http_init()<0){boot_leave();last_error=T("PS4 networking initialization failed. See app.log.");error_screen();app_shutdown();http_end();platform_shutdown();platform_exit(2);}bool authenticated=load_session();boot_pump();update_check_start(8000);std::vector<Location> stack;stack.push_back({"","Home","",0,0,0});Page page;bool reload=true;int header_focus=-1,pending_tab=-1;
+int main(){if(!platform_init()){platform_shutdown();platform_exit(1);}plog("Jellyfin [PS] PS4 build " JF_BUILD_VERSION " (MPV/FFmpeg)");downloads_startup();theme_load_setting();language_apply();boot_begin();boot_pump();if(http_init()<0){boot_leave();last_error=T("PS4 networking initialization failed. See app.log.");error_screen();app_shutdown();http_end();platform_shutdown();platform_exit(2);}bool authenticated=load_session();boot_pump();update_check_start(8000);std::vector<Location> stack;stack.push_back({"","Home","",0,0,0});Page page;bool reload=true;int header_focus=-1,pending_tab=-1;
  HomeView home;int home_generation=-1;JumpBar jump;
  bool update_offered=false;
  std::vector<uint32_t> boot_still;
@@ -672,26 +936,34 @@ int main(){if(!platform_init()){platform_shutdown();platform_exit(1);}plog("Jell
    if(next==-2)error_screen();else if(next>=0)pending_tab=next;
    reload=true;ui_input_sync();return;
   }
+  if(!strcmp(item.base.id,"nav:usb")){usb_screen();reload=true;ui_input_sync();return;}
+  if(!strcmp(item.base.id,"nav:downloads")){downloads_screen();reload=true;home_dirty=true;ui_input_sync();return;}
   // A channel (Home's On Now): straight to the player.
   if(!strcmp(item.base.type,"TvChannel")){play(item,-1,-1,"");reload=true;ui_input_sync();return;}
   if(!strncmp(item.base.id,"nav:",4)){int mode=!strcmp(item.base.id,"nav:live")?3:!strcmp(item.base.id,"nav:continue")?1:2;stack.push_back({"",item.base.name,"",mode,0,0});reload=true;ui_input_sync();return;}
   if(!strcmp(item.base.type,"CollectionFolder")||!strcmp(item.base.type,"UserView")){stack.push_back(library_location(item));reload=true;ui_input_sync();return;}
-  if(is_container(item.base.type)){stack.push_back(child_location(stack.back(),item,from_home));reload=true;ui_input_sync();return;}
+  if(is_container(item.base.type)||child_mode(item.base.type)){stack.push_back(child_location(stack.back(),item,from_home));reload=true;ui_input_sync();return;}
+  // A track: its album is the queue.
+  if(!strcmp(item.base.type,"Audio")){play_music(item);reload=true;ui_input_sync();return;}
   Person person;if(detail_screen(item,person)){Location next{person.id,person.name,"",4,0,0};next.breadcrumb=T("Filmography");stack.push_back(next);}
   reload=true;ui_input_sync();
  };
- while(running){if(!authenticated||!g_token[0]||g_auth_expired){boot_leave();facts_stop();art_stop();page_cache_stop();authenticated=sign_in();if(!authenticated)break;stack.resize(1);reload=true;home_generation=-1;}
+ while(running){if(!authenticated||!g_token[0]||g_auth_expired){boot_leave();facts_stop();art_stop();page_cache_stop();authenticated=sign_in(offline_screen);if(!authenticated)break;stack.resize(1);reload=true;home_generation=-1;}
   // The Live TV guide: loaded once signed in, updated in the background when due.
-  {static bool guide_started=false;if(!guide_started){guide_started=true;guide_start();}}
+  {static bool guide_started=false;if(!guide_started){guide_started=true;guide_start();downloads_resume_queue();}}
   if(pending_tab>=0){
   int tab=pending_tab;pending_tab=-1;plog((std::string("Navigation: tab=")+(tab==0?"Home":tab==1?"Search":"Settings")).c_str());
   if(tab==0){stack.resize(1);header_focus=-1;reload=true;}
-  else if(tab==1){std::string query;int next=search_screen(query);if(next==3){stack.push_back({"",TF("Search: %s",query.c_str()),query,0,0,0});reload=true;header_focus=-1;}else if(next>=0)pending_tab=next;}
+  else if(tab==1){const int next=search_screen([&](const Item& item){const size_t before=stack.size();open_item(item,false);return stack.size()!=before||pending_tab>=0;});if(next>=0)pending_tab=next;header_focus=-1;reload=true;}
   else{int next=settings_screen();if(next>=0)pending_tab=next;header_focus=-1;reload=true;}
   ui_input_sync();continue;
  }
  const bool at_home=stack.size()==1;
  if(at_home){
+  // A USB drive plugged in or pulled out: My Media's USB Drive card follows.
+  {static std::string usb_seen=usb_drives_signature();static uint64_t usb_at=0;
+   if(!boot_active()&&mono_ms()-usb_at>2000){usb_at=mono_ms();const std::string now=usb_drives_signature();
+    if(now!=usb_seen){usb_seen=now;home_dirty=true;reload=true;plog(now.empty()?"USB: drive removed":("USB: drives "+now).c_str());}}}
   // Rows are kept while browsing; Continue Watching and Next Up change with playback.
   if(reload&&(home_generation!=play_generation||!home.loaded||home_dirty)){home_dirty=false;
    // On a cold start the rows load behind the boot animation.
@@ -753,7 +1025,7 @@ int main(){if(!platform_init()){platform_shutdown();platform_exit(1);}plog("Jell
  jump.show=loc.letters;jump.filter=loc.letter;if(!jump.show)jump.active=false;
  auto grid=library_grid(page,false);int columns=grid.cols;loc.first=library_window(grid,loc.selected,loc.first);int first=loc.first;
  for(int k=first;k<std::min(first+columns*grid.rows,(int)page.items.size());++k)load_art(page.items[k].base.id);
- draw_library(page,loc.title,loc.start,loc.selected,false,header_focus,first,loc.breadcrumb,&jump);
+ draw_library(page,loc.title,loc.start,loc.selected,false,header_focus,first,loc.breadcrumb,&jump,music_tab_of(loc.mode));
  present();auto b=press();int count=(int)page.items.size();if(b){char trace[128];snprintf(trace,sizeof trace,"Controls: events=0x%06x selected=%d mode=%d header=%d",b,loc.selected,loc.mode,header_focus);plog(trace);}
  // Route one action per input sample. Never keep a reference into stack after
  // pushing/popping a screen, and never stack the current shortcut view again.
@@ -766,12 +1038,20 @@ int main(){if(!platform_init()){platform_shutdown();platform_exit(1);}plog("Jell
   continue;
  }
  if(b&ORBIS_PAD_BUTTON_TOUCH_PAD){stack.resize(1);header_focus=-1;reload=true;ui_input_sync();continue;}
+ // A music library's tabs (PS3 sub-tabs): L2 / R2. The library stays the parent.
+ if((b&(ORBIS_PAD_BUTTON_L2|ORBIS_PAD_BUTTON_R2))&&music_tab_of(loc.mode)>=0){
+  loc.mode=music_tab_mode(music_tab_of(loc.mode)+((b&ORBIS_PAD_BUTTON_R2)?1:-1));loc.start=loc.selected=loc.first=0;loc.letter.clear();header_focus=-1;reload=true;
+  plog((std::string("Navigation: music tab ")+music_tab_name(music_tab_of(loc.mode))).c_str());ui_input_sync();continue;}
  if(b&(ORBIS_PAD_BUTTON_L1|ORBIS_PAD_BUTTON_R1)){int current=loc.query.empty()?0:1;pending_tab=(current+((b&ORBIS_PAD_BUTTON_L1)?2:1))%3;header_focus=-1;ui_input_sync();continue;}
+ if((b&ORBIS_PAD_BUTTON_OPTIONS)&&header_focus<0&&count&&downloadable(page.items[loc.selected].base.type)){
+  const Item item=page.items[loc.selected];const Location view=loc;const Page shown=page;
+  if(confirm(T("Download this?"),item.base.name,T("Download"),[&]{draw_library(shown,view.title,view.start,view.selected,false,-1,view.first,view.breadcrumb,&jump,music_tab_of(view.mode));})){if(!download_item(item))error_screen();else home_dirty=true;}
+  ui_input_sync();continue;}
  if((b&ORBIS_PAD_BUTTON_OPTIONS)||(header_focus==2&&(b&ORBIS_PAD_BUTTON_CROSS))){pending_tab=2;ui_input_sync();continue;}
  if(header_focus==1&&(b&ORBIS_PAD_BUTTON_CROSS)){pending_tab=1;ui_input_sync();continue;}
  if((b&ORBIS_PAD_BUTTON_TRIANGLE)&&header_focus<0&&count){
   const Item item=page.items[loc.selected];const Location view=loc;const Page shown=page;
-  if(quick_peek_screen(item,library_focus_rect(grid,view.selected,view.first,false),[&]{draw_library(shown,view.title,view.start,view.selected,false,-1,view.first,view.breadcrumb,&jump);}))open_item(item,false);
+  if(quick_peek_screen(item,library_focus_rect(grid,view.selected,view.first,false),[&]{draw_library(shown,view.title,view.start,view.selected,false,-1,view.first,view.breadcrumb,&jump,music_tab_of(view.mode));}))open_item(item,false);
   continue;
  }
  if(header_focus==0&&(b&ORBIS_PAD_BUTTON_CROSS)){stack.resize(1);header_focus=-1;reload=true;ui_input_sync();continue;}
@@ -793,5 +1073,8 @@ int main(){if(!platform_init()){platform_shutdown();platform_exit(1);}plog("Jell
   if(jump.show&&(loc.selected%columns==0||!count)){jump.active=true;jump.sel=!loc.letter.empty()?jump_entry(loc.letter=="#"?"":loc.letter):count?jump_entry(page.items[loc.selected].base.name):1;ui_input_sync();}
   else if(loc.selected==0&&loc.start>=60){loc.start-=60;loc.selected=59;reload=true;}else loc.selected=std::max(0,loc.selected-1);}
  else if(b&ORBIS_PAD_BUTTON_RIGHT){if(loc.selected==count-1&&loc.start+60<page.total){loc.start+=60;loc.selected=0;reload=true;}else loc.selected=std::min(std::max(0,count-1),loc.selected+1);}
+ // A track in a list of tracks (Songs, a playlist) plays that list on from it;
+ // in an album, the whole album.
+ else if((b&ORBIS_PAD_BUTTON_CROSS)&&count&&!strcmp(page.items[loc.selected].base.type,"Audio")&&loc.mode!=MODE_ALBUM){play_tracks(page.items,loc.selected);reload=true;ui_input_sync();continue;}
  else if((b&ORBIS_PAD_BUTTON_CROSS)&&count){open_item(page.items[loc.selected],false);continue;}
- }boot_leave();livetv_stop();player_close();facts_stop();art_stop();update_shutdown();app_shutdown();http_end();platform_shutdown();platform_exit(0);}
+ }boot_leave();livetv_stop();player_close();downloads_stop();facts_stop();art_stop();update_shutdown();app_shutdown();http_end();platform_shutdown();platform_exit(0);}
