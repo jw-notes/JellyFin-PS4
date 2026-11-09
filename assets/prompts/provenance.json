@@ -37,6 +37,38 @@
     "r2": [
       5,
       3
+    ],
+    "options": [
+      5,
+      10
+    ],
+    "touchpad": [
+      4,
+      2
+    ],
+    "dpad_updown": [
+      8,
+      4
+    ],
+    "dpad_leftright": [
+      9,
+      7
+    ],
+    "dpad_left": [
+      9,
+      9
+    ],
+    "dpad_right": [
+      8,
+      0
+    ],
+    "dpad_up": [
+      8,
+      2
+    ],
+    "dpad_down": [
+      9,
+      5
     ]
   }
 }

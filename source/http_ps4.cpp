@@ -212,7 +212,17 @@ int http_download_file(const char* url,const char* path,const std::function<bool
 // A server that sends the whole file again (200) has it written from the
 // start. `progress` hears the bytes of the whole file. Returns 200 when the
 // file is complete, whichever way it came.
-int http_download_resume(const char* url,const char* path,uint64_t offset,const std::function<bool(uint64_t,uint64_t)>& progress){
+namespace {
+struct FileSink:DownloadSink{
+    std::string path;FILE* out=nullptr;explicit FileSink(const char* p):path(p){}
+    bool begin(uint64_t base)override{out=fopen(path.c_str(),base?"ab":"wb");return out!=nullptr;}
+    bool write(const char* bytes,size_t count)override{return fwrite(bytes,1,count,out)==count;}
+    bool finish(bool)override{return fclose(out)==0;}
+    std::string describe()const override{return path;}
+};
+}
+int http_download_resume(const char* url,const char* path,uint64_t offset,const std::function<bool(uint64_t,uint64_t)>& progress){FileSink sink(path);return http_download_to(url,sink,offset,progress);}
+int http_download_to(const char* url,DownloadSink& sink,uint64_t offset,const std::function<bool(uint64_t,uint64_t)>& progress){
     set_failure("");
     pthread_mutex_lock(&mutex);
     if(tmpl<0||!url||(strncmp(url,"http://",7)&&strncmp(url,"https://",8))){failure_details[pthread_self()]="HTTP is not initialized or the address is invalid.";pthread_mutex_unlock(&mutex);return -1;}
@@ -231,17 +241,17 @@ int http_download_resume(const char* url,const char* path,uint64_t offset,const 
             // 206: the rest, appended. 200: the server ignored the range, so start again.
             const uint64_t base=status==206?offset:0;
             int32_t result=0;size_t length=0;const uint64_t rest=sceHttpGetResponseContentLength(req,&result,&length)>=0&&result==0?length:0,total=rest?base+rest:0;uint64_t got=base;
-            FILE* out=fopen(path,base?"ab":"wb");
-            if(!out){set_failure(std::string("Could not write ")+path+".");status=-1;}
+            if(!sink.begin(base)){set_failure("Could not write "+sink.describe()+".");status=-1;}
             else{
                 std::vector<char> buffer(256*1024);int n=0;bool stopped=false;
                 while((n=sceHttpReadData(req,buffer.data(),buffer.size()))>0){
-                    if(fwrite(buffer.data(),1,n,out)!=(size_t)n){set_failure(std::string("Could not write ")+path+" (is the drive full?).");status=-1;break;}
+                    if(!sink.write(buffer.data(),n)){set_failure("Could not write "+sink.describe()+" (is the drive full?).");status=-1;break;}
                     got+=n;if(!progress(got,total)){stopped=true;set_failure("Cancelled.");status=-1;break;}
                 }
                 if(n<0&&!stopped){failed("Read response",n,req);status=-1;}
-                if(fclose(out))status=-1;
-                if(status>0&&total&&got!=total){set_failure("The download ended early.");status=-1;}
+                const bool whole=status>0&&(!total||got==total);
+                if(!sink.finish(whole)&&status>0){if(whole)set_failure("Could not finish writing "+sink.describe()+".");status=-1;}
+                if(status>0&&!whole){set_failure("The download ended early.");status=-1;}
                 if(status==206)status=200;
             }
         }

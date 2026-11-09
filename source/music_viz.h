@@ -10,6 +10,7 @@
 // bands (40 Hz - 16 kHz), normalises them to the frame's loudest and eases
 // them: a fast attack, a slow fall.
 #include <stdint.h>
+#include <string>
 constexpr int MUSIC_VIZ_BANDS=28;
 
 // Clear the tap and the smoothing (call when music starts).
@@ -26,3 +27,12 @@ void music_viz_wave(float* out,int n);
 // any). Live TV's watchdog: a picture stopped while this keeps moving is a
 // stitched ad break, not a stream that has stalled.
 uint64_t audio_last_sound_ms();
+// The same tap, for the diagnostics and the downmix limiter (audio_limiter.h).
+// Console only: there is no tap on the host. The limiter is switched on while a
+// source of more than two channels plays, so stereo and music are never touched.
+void audio_limiter_enable(bool on);
+void audio_stats_reset();
+// What reached the speakers since the reset: peak, RMS and frames limited.
+std::string audio_stats_report();
+// The sound port SDL opened and the state the console reports for it.
+std::string audio_port_report();

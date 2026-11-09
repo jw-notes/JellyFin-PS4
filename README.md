@@ -29,10 +29,11 @@ A native Jellyfin client for PS4 consoles, built with the OpenOrbis toolchain. I
 - **Live TV**: a channel grid with logos, categories (L2 / R2), Favourites and Recently watched, a guide (Square) and channel search (touchpad). Channels from an M3U tuner play straight from their source, falling back to the server when they need it, and reconnect by themselves if the picture stops. In the player, L1 / R1 change channel and Up / Down set the volume.
 - **Live TV guide on the PS4** (Settings › Live TV): any user can download an XMLTV guide - from the address you enter, or the one your playlist names (`url-tvg`) - and have it updated at launch. The player bar shows what's on now, the time left and what's next.
 - **Search**: the keyboard and live results on one screen - they update as you type, L2 / R2 filter them by kind, and your recent searches are kept.
-- **Downloads**: films, episodes and whole seasons saved to the console or (with GoldHEN 2.3+) a USB drive, and played from there.
+- **Subtitles** drawn by the console: SubRip, WebVTT, ASS and PGS, inside the file or beside it, so a film with subtitles still plays directly. Three faces (Open Sans, Noto Sans, Roboto Condensed) and three looks (White, Soft Yellow, Soft Grey) in Settings › Subtitles; the server burns them in only when it converts the video and they are pictures (PGS, DVD), or when you choose Server there.
+- **Downloads**: films, episodes and whole seasons saved to the console or a USB drive (through GoldHEN's FTP server when the sandbox stays on), and played from there.
 - **Screensaver**: full-screen artwork from Home with title and synopsis.
 - **Languages**: English, Japanese, Portuguese (Brazil), German, French and Spanish, following the console or chosen in Settings.
-- **Settings** in five groups - Playback, Live TV, Display, Account and System - with Software Update, which finds new releases and downloads them for the Package Installer. The controller's light bar takes the theme's colour.
+- **Settings** in six groups - Playback, Subtitles, Live TV, Display, Account and System - with Software Update, which finds new releases and downloads them for the Package Installer. The controller's light bar takes the theme's colour.
 - **Sign-in**: server URL with a real connection check, then Quick Connect or username and password. Sessions and settings are saved per PS4 user, and **Share Sign-in** (Settings › Account) lends your account to the console's users who have none of their own.
 
 | | |
@@ -59,7 +60,7 @@ A native Jellyfin client for PS4 consoles, built with the OpenOrbis toolchain. I
 
 ## Install
 
-1. Copy `dist/v1.13/IV0000-JFPS40000_00-JELLYFINPS400000.pkg` to your PS4 and install it with your package installer. It installs over an earlier version and keeps your sign-in and settings.
+1. Copy `dist/v1.14/IV0000-JFPS40000_00-JELLYFINPS400000.pkg` to your PS4 and install it with your package installer. It installs over an earlier version and keeps your sign-in and settings.
 2. Open **Jellyfin [PS]**, enter your server's full URL including the port (for example `http://192.168.1.100:8096`), then sign in with Quick Connect or your username and password.
 
 ### Updates
@@ -109,7 +110,7 @@ From PowerShell in this folder:
 
 This uses a WSL distribution (`kali-linux` by default) with Clang 18 and the project-local OpenOrbis toolchain and PS4 port libraries under `tools/`. The package is written to `dist/<version>/` and validated.
 
-Host-side previews and tests run in WSL: `tools/test_ui_110.sh` renders every new screen and benchmarks it, and `tools/readme_shots.sh [playlist.m3u]` renders the screenshots above (Live TV takes its channel names from the playlist). Run `python tools/fetch_free_art.py` first to download their artwork.
+Host-side previews and tests run in WSL: `tools/test.sh` runs the core checks, `tools/test_ui_113.sh` renders the music screens, and `tools/readme_shots.sh [playlist.m3u]` renders the screenshots above (Live TV takes its channel names from the playlist). Run `python tools/fetch_free_art.py` first to download their artwork.
 
 The films, shows and music in the screenshots were chosen because their artwork is free to use: Blender Foundation open movies (Creative Commons), public-domain films and TV episodes, and public-domain classical works with portraits of their composers. Every image comes from Wikimedia Commons; authors, licences and sources are listed in [docs/screenshots/CREDITS.md](docs/screenshots/CREDITS.md).
 

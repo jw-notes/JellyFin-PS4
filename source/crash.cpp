@@ -21,5 +21,9 @@ void install_crash_diagnostics(int user){
  snprintf(path,sizeof path,"/data/JellyFin-PS4-logs/user-%08x-crash.log",user);
 #endif
  crash_fd=open(path,O_WRONLY|O_CREAT|O_APPEND,0644);
- for(int number:{SIGSEGV,SIGABRT,SIGILL,SIGFPE})if(signal(number,fatal_signal)==SIG_ERR)plog("Crash signal handler unavailable");
+ // A write to a connection the other end has closed must fail, not end the app
+ // with no word in any log: the toolchain's MSG_NOSIGNAL is Linux's value, which
+ // the console's FreeBSD kernel does not read as "no signal".
+ signal(SIGPIPE,SIG_IGN);
+ for(int number:{SIGSEGV,SIGBUS,SIGABRT,SIGILL,SIGFPE})if(signal(number,fatal_signal)==SIG_ERR)plog("Crash signal handler unavailable");
 }

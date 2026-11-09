@@ -40,6 +40,9 @@ static i18n_lang system_language(){
 void language_apply(){
  const int code=i18n_from_code(settings.language.c_str());
  i18n_set(code>=0?(i18n_lang)code:system_language());
+ // The audio language follows the interface: "pt-BR" -> "pt". The details page
+ // and the track menu start on a track in it (jf_tracks_pick_start).
+ snprintf(g_audio_lang,3,"%s",i18n_code(i18n_current()));
 }
 // Auto, then each language in the PS3's order.
 void language_step(int dir){

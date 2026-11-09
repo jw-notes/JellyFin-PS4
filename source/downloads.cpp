@@ -43,6 +43,28 @@ std::atomic<bool> cancel{false},stopping{false},paused{false};
 bool started=false;pthread_t worker;
 std::string usb_problem="Downloads are saved to the console.";
 
+// A drive the app cannot open itself is written through GoldHEN's FTP server
+// (local_media.cpp): these go to it for paths on such a drive, to the file
+// system for everything else.
+uint64_t store_size(const std::string& path){return local_via_ftp(path)?ftp_file_size(path):local_file_size(path);}
+void store_remove(const std::string& path){if(local_via_ftp(path))ftp_delete(path);else remove(path.c_str());}
+void store_make_folder(const std::string& path){if(local_via_ftp(path))ftp_make_folder(path);else mkdir(path.c_str(),0700);}
+// On FTP an old copy is cleared first: what a rename over a file does there is not known.
+bool store_rename(const std::string& from,const std::string& to){if(local_via_ftp(from)){ftp_delete(to);return ftp_rename(from,to);}return rename(from.c_str(),to.c_str())==0;}
+struct UploadSink:DownloadSink{
+ std::string path;FtpUpload* upload=nullptr;explicit UploadSink(const std::string& p):path(p){}
+ ~UploadSink(){if(upload)ftp_upload_close(upload,false);}
+ // base is the .part's size, asked of the server just before: the end APPE adds to.
+ bool begin(uint64_t base)override{upload=ftp_upload_open(path,base!=0);return upload!=nullptr;}
+ bool write(const char* bytes,size_t count)override{return ftp_upload_write(upload,bytes,count);}
+ bool finish(bool complete)override{FtpUpload* closing=upload;upload=nullptr;return ftp_upload_close(closing,complete);}
+ std::string describe()const override{return "the USB drive";}
+};
+// What is on drives read through FTP. Each file listed is a conversation with
+// the server and the Media tab asks often, so it is kept until something changes.
+pthread_mutex_t usb_list_lock=PTHREAD_MUTEX_INITIALIZER;
+std::vector<DownloadEntry> usb_list;std::string usb_list_drives;std::atomic<bool> usb_list_stale{true};
+
 std::string console_dir(){
 #ifdef HOST_TEST
  return data_dir+"/downloads";
@@ -61,10 +83,13 @@ std::vector<std::string> folders(){
  if(sandbox::lifted())for(int i=0;i<8;++i)out.push_back("/mnt/usb"+std::to_string(i)+"/JellyFin");
  return out;
 }
+// The first drive reached through FTP ("/mnt/usb0"), "" when none is.
+std::string first_ftp_drive(){const auto drives=usb_drives();return !drives.empty()&&local_via_ftp(drives[0])?drives[0]:"";}
+std::string first_drive(){return sandbox::lifted()?first_usb():first_ftp_drive();}
 // Where the next file goes: the USB drive when chosen and reachable.
 std::string target_dir(bool& usb){
  usb=false;
- if(settings.download_usb&&sandbox::lifted()){const std::string drive=first_usb();if(!drive.empty()){usb=true;return drive+"/JellyFin";}}
+ if(settings.download_usb){const std::string drive=first_drive();if(!drive.empty()){usb=true;return drive+"/JellyFin";}}
  return console_dir();
 }
 // Free space where `dir` lives, and its file system ("msdosfs" is FAT32).
@@ -107,10 +132,11 @@ uint64_t listed_size(const std::string& json){
  const auto at=json.find("\"Size\":");if(at==std::string::npos)return 0;
  return strtoull(json.c_str()+at+7,nullptr,10);
 }
-bool write_text(const std::string& path,const std::string& text){FILE* f=fopen(path.c_str(),"wb");if(!f)return false;const bool ok=fwrite(text.data(),1,text.size(),f)==text.size();return fclose(f)==0&&ok;}
+bool file_write_text(const std::string& path,const std::string& text){FILE* f=fopen(path.c_str(),"wb");if(!f)return false;const bool ok=fwrite(text.data(),1,text.size(),f)==text.size();return fclose(f)==0&&ok;}
+bool write_text(const std::string& path,const std::string& text){return local_via_ftp(path)?ftp_write_text(path,text):file_write_text(path,text);}
 std::string read_text(const std::string& path){std::string out;FILE* f=fopen(path.c_str(),"rb");if(!f)return out;char buf[8192];size_t n;while((n=fread(buf,1,sizeof buf,f))>0)out.append(buf,n);fclose(f);return out;}
 // stat() sizes are wrong on the console (local_media.h): seek to the end instead.
-uint64_t file_size(const std::string& path){return local_file_size(path);}
+uint64_t file_size(const std::string& path){return store_size(path);}
 std::string gb(uint64_t bytes){char b[24];snprintf(b,sizeof b,"%.1f GB",bytes/1e9);return b;}
 
 // The queue, kept in the user's folder: one item a line, its fields by tabs.
@@ -138,7 +164,7 @@ void fail(const Item& item,const std::string& why){pthread_mutex_lock(&lock);sta
 // false when it was paused or the app is stopping, so it goes back in the queue.
 bool run(const Item& item){
  bool usb=false;const std::string dir=target_dir(usb);
- mkdir(dir.c_str(),0700);
+ store_make_folder(dir);
  const std::string json=item_json(item.base.id);
  if(json.empty()){fail(item,T("Could not reach the server for"));return true;}
  const std::string path=dir+"/"+file_name(item,json),part=path+".part",token=encode(g_token);
@@ -159,18 +185,20 @@ bool run(const Item& item){
  const std::string stream=std::string(g_server)+(!strcmp(item.base.type,"Audio")?"/Audio/":"/Videos/")+encode(item.base.id)+"/stream?Static=true&ApiKey="+token;
  std::string url=download;int st=-1;
  for(int attempt=0;attempt<4;++attempt){
-  st=http_download_resume(url.c_str(),part.c_str(),file_size(part),progress);
+  if(local_via_ftp(part)){UploadSink sink(part);st=http_download_to(url.c_str(),sink,file_size(part),progress);}
+  else st=http_download_resume(url.c_str(),part.c_str(),file_size(part),progress);
   if(st==200||cancel||stopping||paused)break;
-  if(st==401||st==403){if(url==download){url=stream;remove(part.c_str());continue;}break;}
+  if(st==401||st==403){if(url==download){url=stream;store_remove(part);continue;}break;}
   if(st>0&&st!=416&&st<500)break;
-  if(st==416)remove(part.c_str());
+  if(st==416)store_remove(part);
   plog("Download: interrupted; trying again from where it stopped");
   for(int t=0;t<50&&!cancel&&!stopping&&!paused;++t)usleep(100000);
  }
  if(paused||stopping){plog(paused?"Download: paused":"Download: stopped; it carries on next time");return false;}
- if(cancel){remove(part.c_str());plog("Download: cancelled");return true;}
+ if(cancel){store_remove(part);plog("Download: cancelled");return true;}
  if(st!=200){fail(item,st>0?"HTTP "+std::to_string(st):http_failure_detail());return true;}
- if(rename(part.c_str(),path.c_str())!=0||!write_text(path+".json",json)){remove(part.c_str());fail(item,T("Could not save"));return true;}
+ if(!store_rename(part,path)||!write_text(path+".json",json)){store_remove(part);fail(item,T("Could not save"));return true;}
+ usb_list_stale=true;
  pthread_mutex_lock(&lock);done_ids.insert(item.base.id);++status.finished;pthread_mutex_unlock(&lock);
  plog("Download: complete");return true;
 }
@@ -199,11 +227,8 @@ void scan_done(){
 }  // namespace
 
 void downloads_startup(){
-#ifdef HOST_TEST
- usb_problem="USB drives are not available on this host.";
-#else
- usb_problem=sandbox::leave()?"":"GoldHEN 2.3 or later is needed to save to USB drives. Downloads are saved to the console.";
-#endif
+ // Where GoldHEN will not lift the sandbox, drives are written through its FTP server.
+ sandbox::leave();usb_problem.clear();
  pthread_mutex_lock(&lock);load_queue();pthread_mutex_unlock(&lock);
  if(!queue.empty())plog(("Download: "+std::to_string(queue.size())+" waiting from last time").c_str());
 }
@@ -213,8 +238,7 @@ void downloads_resume_queue(){
 std::string usb_status(){
  if(!settings.download_usb)return "";
  if(!usb_problem.empty())return usb_problem;
- if(!sandbox::lifted())return "Restart the app to save downloads to a USB drive.";
- return first_usb().empty()?"No USB drive found. Downloads are saved to the console.":"";
+ return first_drive().empty()?"No USB drive found. Downloads are saved to the console.":"";
 }
 bool download_item(const Item& item){
  std::vector<Item> targets;
@@ -255,6 +279,26 @@ void download_cancel(){pthread_mutex_lock(&lock);
  status.queued=0;cancel=true;paused=false;status.paused=false;save_queue_locked();pthread_cond_signal(&wake);pthread_mutex_unlock(&lock);plog("Download: cancelled");}
 std::vector<DownloadEntry> downloads_list(){
  std::vector<DownloadEntry> out;
+ // Saved on drives read through FTP: <file>.json beside each, as below.
+ if(!sandbox::lifted()){
+  const auto drives=usb_drives();std::string signature;for(const auto& d:drives)signature+=d+";";
+  pthread_mutex_lock(&usb_list_lock);
+  if(usb_list_stale.exchange(false)||signature!=usb_list_drives){
+   usb_list.clear();usb_list_drives=signature;
+   for(const auto& drive:drives){if(!local_via_ftp(drive))continue;
+    const std::string dir=drive+"/JellyFin";std::vector<LocalEntry> files;if(!ftp_folder_files(dir,files))continue;
+    for(const auto& file:files){const std::string& name=file.name;if(name.size()<6||name.compare(name.size()-5,5,".json"))continue;
+     const std::string media=name.substr(0,name.size()-5);uint64_t bytes=0;bool has_resume=false;
+     for(const auto& other:files){if(other.name==media)bytes=other.bytes;if(other.name==media+".resume")has_resume=true;}
+     if(!bytes)continue;
+     std::string json;if(!ftp_read_text(dir+"/"+name,json))continue;
+     DownloadEntry entry;if(!parse_preview_item(json.c_str(),entry.item))continue;
+     entry.path=dir+"/"+media;entry.item.local=local_file_url(entry.path);entry.bytes=bytes;entry.usb=true;
+     if(has_resume){std::string resume;if(ftp_read_text(entry.path+".resume",resume)&&!resume.empty())entry.item.resume=strtoull(resume.c_str(),nullptr,10);}
+     usb_list.push_back(entry);}}
+  }
+  out=usb_list;pthread_mutex_unlock(&usb_list_lock);
+ }
  for(const auto& dir:folders()){DIR* d=opendir(dir.c_str());if(!d)continue;
   while(auto e=readdir(d)){const std::string name=e->d_name;if(name.size()<6||name.compare(name.size()-5,5,".json"))continue;
    const std::string path=dir+"/"+name.substr(0,name.size()-5);const uint64_t bytes=local_file_size(path);if(!bytes)continue;
@@ -274,11 +318,21 @@ void download_played(const Item& item,uint64_t position_ms){
  if(item.local.empty())return;
  // Near the end counts as watched: no resume point.
  const bool done=item.duration&&position_ms+120000>item.duration;
+ // A download on a drive read through FTP keeps its resume point there, like any
+ // other. A file merely browsed to is left alone: its folder is not ours to write in.
+ if(item.local.find("://")!=std::string::npos){
+  if(!local_is_drive_url(item.local)||!strncmp(item.base.id,"local:",6))return;
+  const std::string path=local_url_path(item.local)+".resume";
+  if(done||position_ms<30000)ftp_delete(path);else ftp_write_text(path,std::to_string(position_ms));
+  usb_list_stale=true;return;
+ }
  if(done||position_ms<30000)remove((item.local+".resume").c_str());
  else write_text(item.local+".resume",std::to_string(position_ms));
 }
 bool download_delete(const DownloadEntry& entry){
- const bool ok=remove(entry.path.c_str())==0;remove((entry.path+".json").c_str());remove((entry.path+".resume").c_str());
+ bool ok;
+ if(local_via_ftp(entry.path)){ok=ftp_delete(entry.path);ftp_delete(entry.path+".json");ftp_delete(entry.path+".resume");usb_list_stale=true;}
+ else{ok=remove(entry.path.c_str())==0;remove((entry.path+".json").c_str());remove((entry.path+".resume").c_str());}
  pthread_mutex_lock(&lock);done_ids.erase(entry.item.base.id);pthread_mutex_unlock(&lock);
  plog(ok?"Download: deleted":"Download: delete failed");return ok;
 }

@@ -35,8 +35,11 @@ struct Settings { int bitrate=20000000; bool resume=true; int method=PLAY_AUTO; 
  bool guide_auto=true; std::string guide_url,guide_found;
  // home_onnow: Home's On Now row of Live TV channels.
  bool home_onnow=true;
- // download_usb: Downloads go to a USB drive (needs GoldHEN to leave the sandbox).
- bool download_usb=false; };
+ // download_usb: Downloads go to a USB drive (directly, or through GoldHEN's FTP server).
+ bool download_usb=false;
+ // Subtitles (subtitles.h): drawn by the console or burned in by the server,
+ // and the console's face and look.
+ bool sub_console=true; int sub_font=0,sub_colour=0; };
 enum { SKIP_OFF, SKIP_BUTTON, SKIP_AUTO };
 // An intro or the credits, as the server marks them, in ms from the start.
 struct MediaSegment { bool outro=false; uint64_t start=0,end=0; };
@@ -71,6 +74,11 @@ std::string http_failure_detail();
 int http_download_file(const char* url,const char* path,const std::function<bool(uint64_t,uint64_t)>& progress);
 // The same, carrying on from `offset` bytes already in `path` (Range); 200 when complete.
 int http_download_resume(const char* url,const char* path,uint64_t offset,const std::function<bool(uint64_t,uint64_t)>& progress);
+// The same into anything. begin says where the bytes start (0: over the top of
+// whatever was there, as the server ignored the range); a false from begin or
+// write stops the download. finish(false) is a download given up on.
+struct DownloadSink { virtual ~DownloadSink(){} virtual bool begin(uint64_t base)=0; virtual bool write(const char* bytes,size_t count)=0; virtual bool finish(bool complete)=0; virtual std::string describe()const=0; };
+int http_download_to(const char* url,DownloadSink& sink,uint64_t offset,const std::function<bool(uint64_t,uint64_t)>& progress);
 // The same through FFmpeg's HTTPS (updater.cpp), for hosts the console's own
 // HTTP library cannot reach (GitHub's release files). 200, or -1.
 int ffmpeg_download_file(const char* url,const char* path,const std::function<bool(uint64_t,uint64_t)>& progress);
@@ -131,6 +139,17 @@ bool playback_is_remote();
 // The next playback_url() goes through the server even where a channel could
 // be played directly (after a direct stream failed to start).
 void playback_force_server_once();
+// The next playback_url() asks the server for an H264/AAC transcode, whatever
+// could be sent as it is (after the player could not decode the original).
+void playback_force_transcode_once();
+// Which audio track of the file to play after a playback_url() that sends the
+// original file, as the player numbers them; 0 when the player may choose.
+int playback_audio_track();
+// The subtitles the player draws for the stream playback_url() gave: a track in
+// the file (1 for its first subtitle track; 0 none) or a file the server sends
+// beside it (""). Neither when there are none, or the server burned them in.
+int playback_subtitle_track();
+std::string playback_subtitle_url();
 // Stopped report, transcode clean-up and live stream close, on a thread of
 // their own: leaving the player does not wait for the server.
 void finish_playback(const Item& item,const std::string& session,const std::string& source,uint64_t ms,bool paused);

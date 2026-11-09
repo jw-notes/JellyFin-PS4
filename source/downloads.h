@@ -4,8 +4,9 @@
 //
 // Where: the console's /data/JellyFin-PS4/downloads, or <usb>/JellyFin on the
 // first connected USB drive when Settings > System > Save Downloads To is
-// "USB drive" -- that needs GoldHEN 2.3+ to leave the app sandbox
-// (sandbox_ps4.h), done at startup. Each download is the item's original file
+// "USB drive". That is written directly when GoldHEN lifts the app's sandbox at
+// startup (sandbox_ps4.h), else through its FTP server, which must be on. Each
+// download is the item's original file
 // plus <file>.json, the item as the server described it, which is what the
 // Downloads page lists.
 //

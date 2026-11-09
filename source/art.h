@@ -23,8 +23,9 @@ bool draw_art_circle(const std::string& id,int x,int y,int d);
 // alpha 0..255 fades the mark over what is already drawn.
 void draw_brand_mark(int x,int y,int size,int alpha=255);
 
-// Controller glyphs: X C S T (face buttons), D (d-pad), l r (L1 R1),
-// L R (L2 R2), O (Options) and P (touchpad).
+// Controller glyphs: X C S T (face buttons), D (d-pad), the d-pad with only some
+// directions lit -- | (up / down), - (left / right), < > ^ v (left, right, up,
+// down) -- l r (L1 R1), L R (L2 R2), O (Options) and P (touchpad).
 int draw_button_icon(char glyph,int x,int y,int height);
 struct Hint{char glyph;const char* label;};
 int draw_hints(int x,int y,std::initializer_list<Hint> hints,int size=18);

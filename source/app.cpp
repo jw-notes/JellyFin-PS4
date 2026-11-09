@@ -17,11 +17,18 @@
 #include <atomic>
 #include <algorithm>
 #include <map>
+#include "subtitles.h"
 #include <set>
 #include <deque>
 #include <vector>
 static std::string live_stream_id;
-static bool last_static=false,last_remote=false,force_server=false;
+static bool last_static=false,last_remote=false,force_server=false,force_transcode=false;
+static int last_audio_track=0,last_sub_track=0;
+static std::string last_sub_url;
+int playback_subtitle_track(){return last_sub_track;}
+std::string playback_subtitle_url(){return last_sub_url;}
+void playback_force_transcode_once(){force_transcode=true;}
+int playback_audio_track(){return last_audio_track;}
 bool playback_is_static(){return last_static;}
 bool playback_is_remote(){return last_remote;}
 void playback_force_server_once(){force_server=true;}
@@ -69,6 +76,8 @@ bool storage_init(int user){
   settings.home_order=field(j.c_str(),"home_order");
   if(j.find("\"home_onnow\"")!=std::string::npos)settings.home_onnow=number(j.c_str(),"home_onnow")!=0;
   settings.download_usb=number(j.c_str(),"dl_usb")!=0;
+  if(j.find("\"sub_console\"")!=std::string::npos)settings.sub_console=number(j.c_str(),"sub_console")!=0;
+  settings.sub_font=(int)(number(j.c_str(),"sub_font")%SUBFONT_COUNT);settings.sub_colour=(int)(number(j.c_str(),"sub_colour")%SUBCOLOUR_COUNT);
   if(j.find("\"guide_auto\"")!=std::string::npos)settings.guide_auto=number(j.c_str(),"guide_auto")!=0;
   settings.guide_url=field(j.c_str(),"guide_url");settings.guide_found=field(j.c_str(),"guide_found");
   if(j.find("\"skip_intro\"")!=std::string::npos)settings.skip_intro=(int)number(j.c_str(),"skip_intro")%3;
@@ -77,7 +86,7 @@ bool storage_init(int user){
   if(j.find("\"pic_w\"")!=std::string::npos){settings.pic_aspect=(int)number(j.c_str(),"pic_aspect")%3;settings.pic_w=std::max(50,std::min(110,(int)number(j.c_str(),"pic_w")));settings.pic_h=std::max(50,std::min(110,(int)number(j.c_str(),"pic_h")));
    // Shifts are stored offset by 100: the JSON reader here takes no minus sign.
    settings.pic_x=std::max(-40,std::min(40,(int)number(j.c_str(),"pic_x")-100));settings.pic_y=std::max(-40,std::min(40,(int)number(j.c_str(),"pic_y")-100));}}return true;}
-bool save_settings(){return write_atomic("settings.json","{\"v\":11,\"bitrate\":"+std::to_string(settings.bitrate)+",\"resume\":"+std::to_string(settings.resume)+",\"method\":"+std::to_string(settings.method)+",\"saver\":"+std::to_string(settings.saver)+",\"saver_delay\":"+std::to_string(settings.saver_delay)+",\"language\":"+json_quote(settings.language)+",\"hd1080\":"+std::to_string(settings.hd1080)+",\"debug\":"+std::to_string(settings.debug_log)+",\"pic_aspect\":"+std::to_string(settings.pic_aspect)+",\"pic_w\":"+std::to_string(settings.pic_w)+",\"pic_h\":"+std::to_string(settings.pic_h)+",\"pic_x\":"+std::to_string(settings.pic_x+100)+",\"pic_y\":"+std::to_string(settings.pic_y+100)+",\"viz\":"+std::to_string(settings.viz)+",\"volume\":"+std::to_string(settings.volume)+",\"home_order\":"+json_quote(settings.home_order)+",\"skip_intro\":"+std::to_string(settings.skip_intro)+",\"skip_outro\":"+std::to_string(settings.skip_outro)+",\"home_onnow\":"+std::to_string(settings.home_onnow)+",\"dl_usb\":"+std::to_string(settings.download_usb)+",\"guide_auto\":"+std::to_string(settings.guide_auto)+",\"guide_url\":"+json_quote(settings.guide_url)+",\"guide_found\":"+json_quote(settings.guide_found)+"}");}
+bool save_settings(){return write_atomic("settings.json","{\"v\":11,\"bitrate\":"+std::to_string(settings.bitrate)+",\"resume\":"+std::to_string(settings.resume)+",\"method\":"+std::to_string(settings.method)+",\"saver\":"+std::to_string(settings.saver)+",\"saver_delay\":"+std::to_string(settings.saver_delay)+",\"language\":"+json_quote(settings.language)+",\"hd1080\":"+std::to_string(settings.hd1080)+",\"debug\":"+std::to_string(settings.debug_log)+",\"pic_aspect\":"+std::to_string(settings.pic_aspect)+",\"pic_w\":"+std::to_string(settings.pic_w)+",\"pic_h\":"+std::to_string(settings.pic_h)+",\"pic_x\":"+std::to_string(settings.pic_x+100)+",\"pic_y\":"+std::to_string(settings.pic_y+100)+",\"viz\":"+std::to_string(settings.viz)+",\"volume\":"+std::to_string(settings.volume)+",\"home_order\":"+json_quote(settings.home_order)+",\"skip_intro\":"+std::to_string(settings.skip_intro)+",\"skip_outro\":"+std::to_string(settings.skip_outro)+",\"home_onnow\":"+std::to_string(settings.home_onnow)+",\"dl_usb\":"+std::to_string(settings.download_usb)+",\"guide_auto\":"+std::to_string(settings.guide_auto)+",\"guide_url\":"+json_quote(settings.guide_url)+",\"guide_found\":"+json_quote(settings.guide_found)+",\"sub_console\":"+std::to_string(settings.sub_console)+",\"sub_font\":"+std::to_string(settings.sub_font)+",\"sub_colour\":"+std::to_string(settings.sub_colour)+"}");}
 // Share Sign-in (PS3): one PS4 user lends their sign-in to the console's
 // users with none of their own. It is a copy of their session beside the
 // users' folders, with whose it is; theirs keeps it up to date.
@@ -428,12 +437,43 @@ bool fetch_adjacent_episodes(const Item& episode,Item& prev,Item& next,bool& has
 }
 bool fetch_detail(const Item& i,Item& detail){if(request(HTTP_GET,"/Users/"+encode(g_userid)+"/Items/"+encode(i.base.id))!=200)return false;detail=parse_item(responseBuffer);return detail.base.id[0];}
 bool parse_preview_item(const char* json,Item& result){result=parse_item(json);return result.base.id[0];}
+// One query parameter set, replacing it when the URL has it already.
+static void set_url_param(std::string& url,const std::string& name,const std::string& value){
+ const auto query=url.find('?');
+ if(query!=std::string::npos){size_t at=query+1;
+  while(at<url.size()){auto stop=url.find('&',at);if(stop==std::string::npos)stop=url.size();
+   if(url.compare(at,name.size()+1,name+"=")==0){url.replace(at,stop-at,name+"="+value);return;}at=stop+1;}}
+ url+=(query==std::string::npos?"?":"&")+name+"="+value;
+}
+// The chosen subtitles, as the server decided to deliver them (playback_subtitle_track/_url).
+static void choose_subtitles(const Item& i,const std::string& source,const std::string& source_id,int sub,std::string& url){
+ const PlaybackSubtitle s=playback_subtitle(source,sub);
+ if(!s.found){plog(("Subtitles: stream "+std::to_string(sub)+" is not in this source").c_str());return;}
+ auto with_key=[](std::string address){if(!address.empty()&&address[0]=='/')address=std::string(g_server)+address;
+  if(address.find("ApiKey=")==std::string::npos&&address.find("api_key=")==std::string::npos){address+=(address.find('?')==std::string::npos?"?":"&");address+="ApiKey="+encode(g_token);}return address;};
+ const std::string what="Subtitles: stream "+std::to_string(sub)+" "+s.codec+(s.external?" (a file beside it)":"")+", delivered "+(s.delivery.empty()?std::string("as nothing said"):s.delivery);
+ if(s.delivery=="External"&&!s.delivery_url.empty()){last_sub_url=with_key(s.delivery_url);plog((what+"; drawn here from the server's file").c_str());return;}
+ if(last_static){
+  // The original file: what is inside it the player draws, whatever the server
+  // said; a text file beside it, the server sends as it is.
+  if(!s.external&&s.ordinal>0){last_sub_track=s.ordinal;plog((what+"; drawn here, player subtitle track "+std::to_string(s.ordinal)).c_str());return;}
+  const std::string ext=s.codec=="subrip"?"srt":s.codec=="webvtt"?"vtt":s.codec;
+  if(s.external&&(ext=="srt"||ext=="ass"||ext=="ssa"||ext=="vtt")){last_sub_url=with_key("/Videos/"+encode(i.base.id)+"/"+encode(source_id)+"/Subtitles/"+std::to_string(sub)+"/0/Stream."+ext);plog((what+"; drawn here from the file beside it").c_str());return;}
+  plog((what+"; the player cannot show these").c_str());return;}
+ // A transcode the server burns them into. Jellyfin 12.2 leaves the method out
+ // of the URL for picture subtitles, and has named another track than the one
+ // asked for: say both.
+ if(!url.empty()){
+  set_url_param(url,"SubtitleStreamIndex",std::to_string(sub));set_url_param(url,"SubtitleMethod","Encode");plog((what+"; burned into the picture by the server").c_str());return;}
+ plog((what+"; nothing to draw them with").c_str());
+}
 bool playback_url(const Item& i,int audio,int sub,const std::string& selected_source,std::string& url,std::string& session,std::string& source_id){
  // 720p by default; 1080p (Settings > Playback) lifts the profile's ceiling and the URL's.
  const std::string max_w=settings.hd1080?"1920":"1280",max_h=settings.hd1080?"1080":"720";
  const std::string profile="{\"Name\":\"JellyFin PS4\",\"MaxStreamingBitrate\":"+std::to_string(settings.bitrate)+",\"DirectPlayProfiles\":[{\"Container\":\"mp4,m4v,mkv,mov\",\"Type\":\"Video\",\"VideoCodec\":\"h264\",\"AudioCodec\":\"aac,mp3,ac3,eac3,flac,opus,vorbis\"},{\"Container\":\"mp3,flac,m4a,mp4,aac,ogg,oga,opus,wav,webma,webm\",\"Type\":\"Audio\"}],\"TranscodingProfiles\":[{\"Container\":\"ts\",\"Type\":\"Video\",\"VideoCodec\":\"h264\",\"AudioCodec\":\"aac\",\"Protocol\":\"hls\",\"Context\":\"Streaming\",\"MaxAudioChannels\":\"2\",\"MinSegments\":\"2\",\"BreakOnNonKeyFrames\":true},{\"Container\":\"mp4\",\"Type\":\"Audio\",\"AudioCodec\":\"aac\",\"Protocol\":\"http\",\"Context\":\"Streaming\"}],\"CodecProfiles\":[{\"Type\":\"Video\",\"Codec\":\"h264\",\"Conditions\":[{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoBitDepth\",\"Value\":\"8\",\"IsRequired\":true},{\"Condition\":\"LessThanEqual\",\"Property\":\"Width\",\"Value\":\""+max_w+"\",\"IsRequired\":true},{\"Condition\":\"LessThanEqual\",\"Property\":\"Height\",\"Value\":\""+max_h+"\",\"IsRequired\":true}]},{\"Type\":\"VideoAudio\",\"Codec\":\"aac\",\"Conditions\":[{\"Condition\":\"Equals\",\"Property\":\"AudioSampleRate\",\"Value\":\"48000\",\"IsRequired\":true}]}],\"SubtitleProfiles\":[{\"Format\":\"srt\",\"Method\":\"Encode\"},{\"Format\":\"ass\",\"Method\":\"Encode\"},{\"Format\":\"pgssub\",\"Method\":\"Encode\"}]}";
  const bool live=!strcmp(i.base.type,"TvChannel");
- live_stream_id.clear();session.clear();source_id.clear();url.clear();last_static=last_remote=false;
+ const bool forced_transcode=force_transcode;force_transcode=false;
+ live_stream_id.clear();session.clear();source_id.clear();url.clear();last_static=last_remote=false;last_audio_track=0;last_sub_track=0;last_sub_url.clear();
  // Live TV: most channels are a plain HTTP stream (an M3U tuner) the player
  // can open itself -- no server transcode to start, and the provider's best
  // variant rather than whichever it lists first. The source is then asked
@@ -441,11 +481,24 @@ bool playback_url(const Item& i,int audio,int sub,const std::string& selected_so
  const bool live_direct=!strcmp(i.base.type,"TvChannel")&&settings.method!=PLAY_TRANSCODE&&!force_server;force_server=false;
  // Auto: the server may send a file the player decodes itself as it is
  // (direct play: no transcode to wait for), or copy its H264 video and
- // convert only the audio (direct stream). Not with a chosen audio track or
- // burned-in subtitles, which only the server can apply, nor for Live TV.
- const bool may_direct=!live&&settings.method==PLAY_AUTO&&audio<0&&sub<0;
- const bool may_copy=!live&&settings.method!=PLAY_TRANSCODE;
- std::string body="{\"UserId\":"+json_quote(g_userid)+",\"ItemId\":"+json_quote(i.base.id)+",\"DeviceProfile\":"+profile+",\"EnableDirectPlay\":"+std::string(may_direct?"true":"false")+",\"EnableDirectStream\":"+(may_copy?"true":"false")+",\"EnableTranscoding\":true,\"AutoOpenLiveStream\":"+std::string(live_direct?"false":"true")+",\"MaxAudioChannels\":2,\"MaxStreamingBitrate\":"+std::to_string(settings.bitrate)+",\"StartTimeTicks\":"+std::to_string(!live&&settings.resume?i.resume*10000:0)+",\"SubtitleStreamIndex\":"+std::to_string(sub);
+ // convert only the audio (direct stream). Not with burned-in subtitles,
+ // which only the server can apply, nor for Live TV. A chosen audio track can
+ // go direct: the player selects it in the file, and with its index the server
+ // checks that track's codec against the profile.
+ // Subtitles the console draws itself (Settings > Subtitles) do not stop it.
+ const bool may_direct=!live&&settings.method==PLAY_AUTO&&(sub<0||settings.sub_console)&&!forced_transcode;
+ // What the console draws: from inside a file it plays as it is (Embed), and a
+ // text file beside it (External), which a transcode gets too. Without these
+ // the server burns subtitles into the picture, which means converting it.
+ // Embed only for the containers played directly: a transcode's MPEG-TS cannot
+ // carry them, so there the server burns picture subtitles in.
+ std::string device=profile;
+ if(settings.sub_console){device.pop_back();device+=",\"SubtitleProfiles\":[";bool first=true;
+  for(const char* format:{"srt","subrip","ass","ssa","vtt","webvtt"}){device+=std::string(first?"":",")+"{\"Format\":\""+format+"\",\"Method\":\"External\"}";first=false;}
+  for(const char* format:{"srt","subrip","ass","ssa","vtt","webvtt","pgssub","pgs","dvdsub","mov_text"})device+=std::string(",{\"Format\":\"")+format+"\",\"Method\":\"Embed\",\"Container\":\"mkv,mp4,m4v,mov\"}";
+  device+="]}";}
+ const bool may_copy=!live&&settings.method!=PLAY_TRANSCODE&&!forced_transcode;
+ std::string body="{\"UserId\":"+json_quote(g_userid)+",\"ItemId\":"+json_quote(i.base.id)+",\"DeviceProfile\":"+device+",\"EnableDirectPlay\":"+std::string(may_direct?"true":"false")+",\"EnableDirectStream\":"+(may_copy?"true":"false")+",\"EnableTranscoding\":true,\"AutoOpenLiveStream\":"+std::string(live_direct?"false":"true")+",\"MaxAudioChannels\":2,\"MaxStreamingBitrate\":"+std::to_string(settings.bitrate)+",\"StartTimeTicks\":"+std::to_string(!live&&settings.resume?i.resume*10000:0)+",\"SubtitleStreamIndex\":"+std::to_string(sub);
  if(!selected_source.empty())body+=",\"MediaSourceId\":"+json_quote(selected_source);
  if(audio>=0)body+=",\"AudioStreamIndex\":"+std::to_string(audio);
  body+="}";
@@ -491,9 +544,26 @@ bool playback_url(const Item& i,int audio,int sub,const std::string& selected_so
  source_id=field(source.c_str(),"Id");live_stream_id=field(source.c_str(),"LiveStreamId");url=field(source.c_str(),"TranscodingUrl");
  end=source.c_str()+source.size();auto support=find_top_value(source.c_str(),end,"SupportsDirectStream");
  plog((std::string("Playback source: id=")+source_id+" live="+(!live_stream_id.empty()?"yes":"no")+" transcoding_url="+(!url.empty()?"yes":"no")).c_str());
+ // The player's default track is the file's; the details page and the track
+ // menu show the one for the console's language (jf_tracks_pick_start). When
+ // they differ, ask again for the shown one: the server needs the source id
+ // to apply an index, and then checks that track's codec against the profile.
+ if(audio<0&&!live&&strcmp(i.base.type,"Audio")!=0&&!source_id.empty()){
+  static JFMediaSources shown;memset(&shown,0,sizeof shown);const std::string wrapped="{\"MediaSources\":["+source+"]}";jellyfin_parse_media_sources(wrapped.c_str(),&shown);
+  if(shown.n_sources&&shown.source[0].tracks.n_audio>1){const JFTracks& tracks=shown.source[0].tracks;const int wanted=tracks.audio[tracks.default_audio].index;
+   if(wanted!=playback_default_audio(source)){plog(("Playback: the server chose audio stream "+std::to_string(playback_default_audio(source))+", the page shows "+std::to_string(wanted)+"; asking for that").c_str());force_transcode=forced_transcode;const std::string same_source=source_id;return playback_url(i,wanted,sub,same_source,url,session,source_id);}}
+ }
+ const int selected_audio=audio>=0?audio:playback_default_audio(source);
+ for(const auto& line:playback_source_report(source,selected_audio))plog(line.c_str());
  auto direct_play=find_top_value(source.c_str(),end,"SupportsDirectPlay");
- const bool server_direct=may_direct&&url.empty()&&direct_play&&read_json_bool(direct_play,end);
- if((settings.method==PLAY_DIRECT_FILE||server_direct)&&!live){last_static=true;plog(server_direct?"Playback: direct play (the original file)":"Playback: direct file (setting)");url=std::string(g_server)+(strcmp(i.base.type,"Audio")==0?"/Audio/":"/Videos/")+encode(i.base.id)+"/stream?Static=true&MediaSourceId="+encode(source_id)+"&ApiKey="+encode(g_token);}
+ const bool direct_flag=direct_play&&read_json_bool(direct_play,end);
+ const bool direct_stream_flag=support&&read_json_bool(support,end);
+ {const std::string reasons=playback_url_param(url,"TranscodeReasons");
+  plog(("Playback: server decision SupportsDirectPlay="+std::string(direct_flag?"yes":"no")+" SupportsDirectStream="+(direct_stream_flag?"yes":"no")+" audio_codec="+(playback_url_param(url,"AudioCodec").empty()?std::string("n/a"):playback_url_param(url,"AudioCodec"))+" video_codec="+(playback_url_param(url,"VideoCodec").empty()?std::string("n/a"):playback_url_param(url,"VideoCodec"))+" reasons="+(reasons.empty()?std::string("none"):reasons)+(forced_transcode?" (transcode forced)":"")).c_str());}
+ const bool server_direct=may_direct&&url.empty()&&direct_flag;
+ if((settings.method==PLAY_DIRECT_FILE||server_direct)&&!live&&!forced_transcode){last_static=true;
+  // Original file: the player must select the same track the server checked.
+  {const int ordinal=selected_audio>=0?playback_audio_ordinal(source,selected_audio):-1;last_audio_track=ordinal>0?ordinal:0;plog(("Playback: player audio track "+std::to_string(last_audio_track)+" for stream "+std::to_string(selected_audio)+(last_audio_track?"":" (the player chooses)")).c_str());}plog(server_direct?"Playback: direct play (the original file)":"Playback: direct file (setting)");url=std::string(g_server)+(strcmp(i.base.type,"Audio")==0?"/Audio/":"/Videos/")+encode(i.base.id)+"/stream?Static=true&MediaSourceId="+encode(source_id)+"&ApiKey="+encode(g_token);}
  else if(url.empty()){
   auto transcode=find_top_value(source.c_str(),end,"SupportsTranscoding");
   if(live&&!live_stream_id.empty()&&!source_id.empty()&&transcode&&read_json_bool(transcode,end)){
@@ -511,6 +581,7 @@ bool playback_url(const Item& i,int audio,int sub,const std::string& selected_so
  const std::string base=std::string(g_server)+"/";
  // ApiKey, not the legacy api_key that Jellyfin 10.12 turns off by default.
  if(url.rfind(base,0)==0&&url.find("api_key=")==std::string::npos&&url.find("ApiKey=")==std::string::npos&&url.find("apikey=")==std::string::npos){url+=(url.find('?')==std::string::npos?"?":"&");url+="ApiKey="+encode(g_token);}
+ if(sub>=0&&!live)choose_subtitles(i,source,source_id,sub,url);
  if(!last_static){url+=(url.find('?')==std::string::npos?"?":"&");url+="MaxWidth="+max_w+"&MaxHeight="+max_h+"&AudioSampleRate=48000&MaxAudioChannels=2";}
  if(url.rfind("http://",0)!=0&&url.rfind("https://",0)!=0){last_error="Unsupported playback URL";return false;}
  return true;

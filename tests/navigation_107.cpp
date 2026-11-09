@@ -31,7 +31,7 @@ bool sign_in(){assert(false&&"Unexpected sign-in screen");return false;}
 bool keyboard(const std::string&,std::string&,bool,KeyboardType){assert(false&&"Shoulder navigation must not open the keyboard");return false;}
 bool player_open(const std::string&){assert(false);return false;}
 std::string player_error(){return {};}
-bool player_draw(){return false;}bool player_active(){return false;}bool player_has_audio(){return false;}
+bool player_draw(){return false;}bool player_active(){return false;}bool player_has_audio(){return false;}void player_prefer_audio(int){}std::vector<PlayerAudioTrack> player_audio_tracks(){return {};}void player_select_audio(int){}bool player_audio_failed(){return false;}uint64_t player_duration_ms(){return 0;}void player_prefer_subtitle(int,const std::string&,int64_t){}std::vector<PlayerAudioTrack> player_subtitle_tracks(){return {};}void player_select_subtitle(int){}void player_subtitle_files(const std::vector<PlayerSubtitleFile>&){}
 void player_pause(bool){}void player_seek(uint64_t){}uint64_t player_time(){return 0;}void player_close(){}
 int main(int argc,char** argv){
  assert(argc==4);assert(storage_init(106));snprintf(g_server,sizeof g_server,"%s",argv[1]);assert(login(argv[2],argv[3]));Page movies;assert(fetch_page("",0,"PS4 Integration",0,movies)&&!movies.items.empty());movie_id=movies.items[0].base.id;

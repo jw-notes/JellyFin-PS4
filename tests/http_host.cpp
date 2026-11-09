@@ -8,6 +8,7 @@ int http_init(){return 0;}void http_end(){}
 // File downloads (updates, the Live TV guide) are not exercised on the host.
 int http_download_file(const char*,const char*,const std::function<bool(uint64_t,uint64_t)>&){return -1;}
 int http_download_resume(const char*,const char*,uint64_t,const std::function<bool(uint64_t,uint64_t)>&){return -1;}
+int http_download_to(const char*,DownloadSink&,uint64_t,const std::function<bool(uint64_t,uint64_t)>&){return -1;}
 int ffmpeg_download_file(const char*,const char*,const std::function<bool(uint64_t,uint64_t)>&){return -1;}
 static int perform_host(int method,const char* url,const char* body,const char* token,char* out,int cap,int* count){
  if(count)*count=0;

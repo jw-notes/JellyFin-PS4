@@ -1,17 +1,34 @@
 # Local build output, logs and development history
 build/
 logs/
+*.log
+source.corrupt-*/
+
+# Packages: only the current release is kept; dev and test builds stay local
 dist/*
-!dist/v1.09/
-!dist/v1.10/
-!dist/v1.11/
-!dist/v1.12/
 !dist/v1.13/
+!dist/v1.14/
+*.pkg
+!dist/v1.13/*.pkg
+!dist/v1.14/*.pkg
+
+# Stray build and download output
+*.o
+*.elf
+!vendor/ps3/source/spu/kernel/jf_spu_kernel.elf
+*.oelf
+*.part
+__pycache__/
+*.pyc
+
+# Editor settings
+.vscode/
+.idea/
 
 # Large third-party toolchains (re-downloadable)
 *.tar.gz
+*.deb
 tools/OpenOrbis/
 tools/pacbrew-base-107/
 tools/ps4-portlibs-107/
 tools/llvm-local/
-tools/lld.deb

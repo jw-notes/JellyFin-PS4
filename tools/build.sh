@@ -4,7 +4,8 @@ cd "$(dirname "$0")/.."
 export OO_PS4_TOOLCHAIN="$PWD/tools/OpenOrbis/PS4Toolchain"
 export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 SDK="$OO_PS4_TOOLCHAIN"
-RELEASE_DIR="dist/$(python3 -c 'import json;print(json.load(open("version.json"))["release_directory"])')"
+# JF_RELEASE_DIR: a test build's own folder, so it never replaces a release's PKG.
+RELEASE_DIR="${JF_RELEASE_DIR:-dist/$(python3 -c 'import json;print(json.load(open("version.json"))["release_directory"])')}"
 mkdir -p "$RELEASE_DIR"
 LD="$PWD/tools/llvm-local/usr/bin/ld.lld-18"
 mkdir -p build/obj build/pkg/sce_sys build/pkg/themes dist
@@ -31,8 +32,9 @@ clang-18 "${flags[@]}" -w -Ivendor/goldhen_sdk/include -c vendor/goldhen_sdk/sou
 # --wrap: MPV opens its SDL audio through music_viz.cpp, which taps the PCM for the visualizer;
 # every clock_gettime goes through platform_ps4.cpp, which fixes its clock numbers;
 # getaddrinfo goes through http_ps4.cpp, so FFmpeg resolves stream hosts with
-# the console's own resolver.
-"$LD" -m elf_x86_64 -pie --wrap=SDL_OpenAudio --wrap=clock_gettime --wrap=getaddrinfo --script "$SDK/link.x" --eh-frame-hdr -L"$PORTLIBS/lib" -L"$BASELIBS" -L"$SDK/lib" "$SDK/lib/crt1.o" "${objects[@]}" build/obj/version_summary.o build/obj/livetv_prefs.o build/obj/i18n.o build/obj/i18n_tables.o build/obj/goldhen_sdk.o build/obj/goldhen_syscall.o -lc++ --start-group -lmpv -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil -lass -lfribidi -lfreetype -lpng16 -lbz2 -lz -lmbedtls -lmbedx509 -lmbedcrypto -ldav1d -lsamplerate -lSDL2 -lc -lm -lpthread -lclang_rt.builtins-x86_64 --end-group -lkernel -lSceLibcInternal -lSceSysUtil -lScePigletv2VSH -lSceVideoOut -lScePad -lSceUserService -lSceSysmodule -lSceNet -lSceNetCtl -lSceHttp -lSceSsl -lSceAudioOut -lSceSystemService -o build/JellyFin-PS4.elf
+# the console's own resolver; sceAudioOutOpen through music_viz.cpp, which logs
+# the sound port SDL asked for.
+"$LD" -m elf_x86_64 -pie --wrap=SDL_OpenAudio --wrap=sceAudioOutOpen --wrap=clock_gettime --wrap=getaddrinfo --script "$SDK/link.x" --eh-frame-hdr -L"$PORTLIBS/lib" -L"$BASELIBS" -L"$SDK/lib" "$SDK/lib/crt1.o" "${objects[@]}" build/obj/version_summary.o build/obj/livetv_prefs.o build/obj/i18n.o build/obj/i18n_tables.o build/obj/goldhen_sdk.o build/obj/goldhen_syscall.o -lc++ --start-group -lmpv -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil -lass -lfribidi -lfreetype -lpng16 -lbz2 -lz -lmbedtls -lmbedx509 -lmbedcrypto -ldav1d -lsamplerate -lSDL2 -lc -lm -lpthread -lclang_rt.builtins-x86_64 --end-group -lkernel -lSceLibcInternal -lSceSysUtil -lScePigletv2VSH -lSceVideoOut -lScePad -lSceUserService -lSceSysmodule -lSceNet -lSceNetCtl -lSceHttp -lSceSsl -lSceAudioOut -lSceSystemService -o build/JellyFin-PS4.elf
 "$SDK/bin/linux/create-fself" -in=build/JellyFin-PS4.elf -out=build/JellyFin-PS4.oelf --eboot build/pkg/eboot.bin --paid 0x3800000000000011
 python3 tools/package.py
 cd build/pkg

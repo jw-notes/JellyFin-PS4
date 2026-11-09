@@ -186,7 +186,7 @@ void draw_library(const Page& page,const std::string& title,int start,int select
  else if(focused_tab>=0)hint_bar({{'D',"Nav"},{'X',"Select"},{'C',"Back"}});
  else if(jump&&jump->show)hint_bar({{'D',"Nav"},{'X',"Open"},{'T',"Details"},{'O',"Download"},{'C',jump->filter.empty()?"Back":"Clear letter"},{'l',""},{'r',"Tabs"}});
  else hint_bar({{'D',"Nav"},{'X',"Open"},{'T',"Details"},{'O',"Download"},{'C',"Back"},{'l',""},{'r',"Tabs"}});
- if(jump&&jump->show&&!jump->active){const char* label="Left at first column: A-Z";int x=WIDTH-64-hints_width({{'D',label}});draw_hints(x,674,{{'D',label}});}
+ if(jump&&jump->show&&!jump->active){const char* label="Left at first column: A-Z";int x=WIDTH-64-hints_width({{'<',label}});draw_hints(x,674,{{'<',label}});}
 }
 
 // ---- classic home --------------------------------------------------------
@@ -520,7 +520,7 @@ void draw_track_menu(const PlayerOsd& osd){
  for(int i=top;i<top+rows;++i){const int y=MY+64+(i-top)*ROW;const bool lit=i==sel,playing=i==now;
   if(lit)rect(MX+12,y-4,MW-24,ROW-2,g_theme.panel_hi);if(playing)rect(MX+12,y-4,4,ROW-2,g_theme.accent);
   face_text(MX+30,y+2,fit_face(names[i],MW-60,17,TextFace::Classic),lit||playing?g_theme.white:g_theme.text_dim,17,TextFace::Classic);}
- draw_hints(MX+20,MY+mh-34,{{'D',"Select"},{'X',"Play"},{'T',osd.tracks_sub?"Audio":"Subtitles"},{'C',"Close"}},16);
+ draw_hints(MX+20,MY+mh-34,{{'|',"Select"},{'X',"Play"},{'T',osd.tracks_sub?"Audio":"Subtitles"},{'C',"Close"}},16);
 }
 void draw_player_osd(const PlayerOsd& osd){
  // Bottom scrim: transparent at y=459 to black 0.90 at 62% of its height.
@@ -584,7 +584,7 @@ void draw_player_osd(const PlayerOsd& osd){
  // scrub when the bar itself is focused.
  const char* scrub_hint=osd.control==OSD_SCRUB?"Scrub":"Select";
  const char* act=osd.control==OSD_VOLUME?"Volume":osd.control==OSD_PICTURE?"Picture":osd.paused?"Play":"Pause";
- if(osd.volume_active&&!osd.live)draw_hints(57,680,{{'D',"Volume"},{'C',"Done"}});
+ if(osd.volume_active&&!osd.live)draw_hints(57,680,{{'|',"Volume"},{'C',"Done"}});
  else if(osd.live){
   if(!osd.up_next.empty()){const std::string next=std::string(T("NEXT CHANNEL"))+"  ";const std::string name=fit_face(osd.up_next,360,15,TextFace::Classic);const int w=face_text_width(next,12,TextFace::Classic),nw=face_text_width(name,15,TextFace::Classic);
    face_text(1223-nw-w,662,next,g_theme.accent_alt,12,TextFace::Classic);face_text(1223-nw,659,name,0xE0E0E0,15,TextFace::Classic);}
@@ -595,10 +595,10 @@ void draw_player_osd(const PlayerOsd& osd){
  else if(osd.has_prev||osd.has_next){
   if(!osd.up_next.empty()){const std::string next=std::string(T("UP NEXT"))+"  ";const int w=face_text_width(next,12,TextFace::Classic),nw=face_text_width(fit_face(osd.up_next,360,15,TextFace::Classic),15,TextFace::Classic);
    face_text(1223-nw-w,662,next,g_theme.accent_alt,12,TextFace::Classic);face_text(1223-nw,659,fit_face(osd.up_next,360,15,TextFace::Classic),0xE0E0E0,15,TextFace::Classic);}
-  if(osd.has_prev&&osd.has_next)draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'l',""},{'r',"Episode"},{'T',"Tracks"},{'C',"Stop"}});
-  else if(osd.has_next)draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'r',"Next episode"},{'T',"Tracks"},{'C',"Stop"}});
-  else draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'l',"Previous episode"},{'T',"Tracks"},{'C',"Stop"}});}
- else draw_hints(57,680,{{'X',act},{'D',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'T',"Audio / Subtitles"},{'C',"Stop"},{'S',"Hide"}});
+  if(osd.has_prev&&osd.has_next)draw_hints(57,680,{{'X',act},{'-',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'l',""},{'r',"Episode"},{'T',"Tracks"},{'C',"Stop"}});
+  else if(osd.has_next)draw_hints(57,680,{{'X',act},{'-',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'r',"Next episode"},{'T',"Tracks"},{'C',"Stop"}});
+  else draw_hints(57,680,{{'X',act},{'-',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'l',"Previous episode"},{'T',"Tracks"},{'C',"Stop"}});}
+ else draw_hints(57,680,{{'X',act},{'-',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'T',"Audio / Subtitles"},{'C',"Stop"},{'S',"Hide"}});
 }
 void draw_skip_button(const std::string& label,bool button){
  // Above the bar's chips, so it reads with the bar up or away.
@@ -746,7 +746,7 @@ void draw_music_screen(const PlayerOsd& osd,const float* bands,int count,const f
    if(sel)rect(QX+12,y-4,QW-24,ROW-2,g_theme.panel_hi);if(now)rect(QX+12,y-4,4,ROW-2,g_theme.accent);
    face_text(QX+28,y+2,std::to_string(i+1),now?g_theme.accent_alt:g_theme.text_faint,15,TextFace::Classic);
    face_text(QX+72,y,fit_face(osd.queue_names[i],QW-100,18,TextFace::Classic),sel||now?g_theme.white:g_theme.text_dim,18,TextFace::Classic);}
-  draw_hints(57,680,{{'D',"Select"},{'X',"Play"},{'C',"Close"}});return;}
+  draw_hints(57,680,{{'|',"Select"},{'X',"Play"},{'C',"Close"}});return;}
  if(osd.tracks>1)draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'D',"Seek / Volume"},{'l',""},{'r',"Track"},{'T',osd.shuffle?"Shuffle off":"Shuffle"},{'O',"Queue"},{'S',"Visualizer"},{'C',"Stop"}});
  else draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'D',"Seek / Volume"},{'L',""},{'R',"Skip 5 min"},{'S',"Visualizer"},{'C',"Stop"}});
 }
@@ -779,8 +779,8 @@ void draw_downloads(const std::vector<DownloadEntry>& entries,int selected,const
   if(e.item.resume&&e.item.duration)meta+="  \xC2\xB7  "+std::string(T("Resume"))+" "+clock_text(e.item.resume);
   face_text(122,y+31,fit_face(meta,820,13,TextFace::Classic),g_theme.text_faint,13,TextFace::Classic);
   const std::string where=size_text(e.bytes)+"   "+T(e.usb?"USB drive":"Console");face_text(1196-face_text_width(where,14,TextFace::Classic),y+18,where,g_theme.text_dim,14,TextFace::Classic);}
- if(status.active||status.queued)hint_bar({{'D',"Select"},{'X',"Play"},{'S',"Delete"},{'T',status.paused?"Resume":"Pause"},{'O',"Stop downloading"},{'C',"Back"}});
- else hint_bar({{'D',"Select"},{'X',"Play"},{'S',"Delete"},{'C',"Back"}});
+ if(status.active||status.queued)hint_bar({{'|',"Select"},{'X',"Play"},{'S',"Delete"},{'T',status.paused?"Resume":"Pause"},{'O',"Stop downloading"},{'C',"Back"}});
+ else hint_bar({{'|',"Select"},{'X',"Play"},{'S',"Delete"},{'C',"Back"}});
 }
 
 // ---- USB drives (PS3 Media tab) --------------------------------------------------
@@ -799,7 +799,7 @@ void draw_local_browser(const std::string& title,const std::string& where,const 
   face_text(128,y+12,fit_face(r.name,880,19,TextFace::Classic),sel?g_theme.white:g_theme.text,19,TextFace::Classic);
   if(!r.detail.empty())face_text(1196-face_text_width(r.detail,14,TextFace::Classic),y+15,r.detail,g_theme.text_dim,14,TextFace::Classic);}
  if(n>visible){const int bar=visible*ROW-6,thumb=std::max(20,bar*visible/n),off=(bar-thumb)*first/std::max(1,n-visible);rect(1224,TOP,3,bar,g_theme.track);rect(1224,TOP+off,3,thumb,g_theme.accent);}
- hint_bar({{'D',"Select"},{'X',"Open / Play"},{'C',"Back"}});
+ hint_bar({{'|',"Select"},{'X',"Open / Play"},{'C',"Back"}});
 }
 
 // ---- settings (PS3 ui_settings.cpp) ------------------------------------------------
@@ -827,7 +827,7 @@ void draw_settings_categories(const std::vector<SettingsCategoryView>& categorie
   face_text(tx,y+42,fit_face(c.summary,tw,14,TextFace::Classic),g_theme.text_faint,14,TextFace::Classic);
   face_text(SET_X+SET_W-36,y+(ROW-28)/2,"\xE2\x80\xBA",on?g_theme.accent:g_theme.text_faint,28,TextFace::Classic);}
  face_text((WIDTH-face_text_width(footer,13,TextFace::Classic))/2,618,footer,g_theme.text_faint,13,TextFace::Classic);
- hint_bar({{'D',"Select"},{'X',"Open"},{'C',"Back"},{'l',"Search"},{'r',"Home"}});
+ hint_bar({{'|',"Select"},{'X',"Open"},{'C',"Back"},{'l',"Search"},{'r',"Home"}});
 }
 void draw_settings_rows(const SettingsCategoryView& category,const std::vector<SettingsRowView>& rows,int selected){
  app_header("","Settings");
@@ -854,9 +854,9 @@ void draw_settings_rows(const SettingsCategoryView& category,const std::vector<S
   if(nl!=std::string::npos)face_text(SET_X+22,DESC_Y+42,fit_face(d.substr(nl+1),SET_W-44,16,TextFace::Classic),g_theme.text_dim,16,TextFace::Classic);}
  const bool action=selected>=0&&selected<(int)rows.size()&&rows[selected].action;
  const SettingsRowView* sel=selected>=0&&selected<(int)rows.size()?&rows[selected]:nullptr;
- if(sel&&sel->reorder&&sel->held)hint_bar({{'D',"Move"},{'X',"Put down"},{'C',"Done"}});
- else if(sel&&sel->reorder)hint_bar({{'D',"Select"},{'X',"Move"},{'T',"Default order"},{'C',"Done"}});
- else if(action)hint_bar({{'D',"Select"},{'X',"Open"},{'C',"Back"}});else hint_bar({{'D',"Select / change"},{'X',"Change"},{'C',"Back"}});
+ if(sel&&sel->reorder&&sel->held)hint_bar({{'|',"Move"},{'X',"Put down"},{'C',"Done"}});
+ else if(sel&&sel->reorder)hint_bar({{'|',"Select"},{'X',"Move"},{'T',"Default order"},{'C',"Done"}});
+ else if(action)hint_bar({{'|',"Select"},{'X',"Open"},{'C',"Back"}});else hint_bar({{'D',"Select / change"},{'X',"Change"},{'C',"Back"}});
 }
 void draw_confirm(const std::string& question,const std::string& detail,const char* yes){
  blend_rect(0,0,WIDTH,HEIGHT,0,150);constexpr int W=560,H=150,X=(WIDTH-W)/2,Y=250;
@@ -884,7 +884,7 @@ enum AboutKind { A_HEAD, A_VER, A_ITEM, A_NAME, A_TEXT, A_GAP };
 struct AboutLine { AboutKind kind; const char* a; const char* b; };
 // Updates: the PS4 releases, newest first. Add each new release at the top.
 const AboutLine about_updates[]={
- {A_VER,"1.13",nullptr},
+ {A_VER,"1.14",nullptr},
  {A_ITEM,"Music tabs (Albums, Artists, Playlists, Genres, Songs), shuffle and the queue.",nullptr},
  {A_ITEM,"Live search as on the PS3; audio and subtitles while watching.",nullptr},
  {A_ITEM,"Downloads and USB drives, played without the server.",nullptr},
@@ -960,7 +960,7 @@ const AboutLine about_licences[]={
  {A_NAME,"OpenOrbis PS4 Toolchain","GPL 3"},
  {A_GAP,nullptr,nullptr},
  {A_HEAD,"Fonts and art",nullptr},
- {A_NAME,"Noto Sans JP","SIL OFL 1.1"},
+ {A_NAME,"Noto Sans, Noto Sans JP","SIL OFL 1.1"},
  {A_NAME,"Open Sans, Roboto Condensed","Apache 2.0"},
  {A_NAME,"Satoshi","ITF Free Font License"},
  {A_NAME,"PlayStation button sprites (Kenney)","CC0"},
@@ -998,5 +998,5 @@ void draw_about(int section,int top){
  int widths[3],total=0;for(int i=0;i<3;++i){widths[i]=face_text_width(T(about_sections[i].label),18,TextFace::Classic);total+=widths[i]+(i?44:0);}
  int x=(WIDTH-total)/2;for(int i=0;i<3;++i){bool on=i==section;face_text(x,140,T(about_sections[i].label),on?g_theme.white:g_theme.text_faint,18,TextFace::Classic);if(on)rect(x,166,widths[i],3,g_theme.accent);x+=widths[i]+44;}
  background(ABOUT_BOTTOM,650);
- hint_bar({{'l',""},{'r',"Section"},{'D',"Scroll"},{'C',"Back"}});
+ hint_bar({{'l',""},{'r',"Section"},{'|',"Scroll"},{'C',"Back"}});
 }

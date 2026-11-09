@@ -18,6 +18,7 @@
 #include "updater.h"
 #include "downloads.h"
 #include "local_media.h"
+#include "subtitles.h"
 #include "../vendor/ps3/source/player/core/picture_size.h"
 #include <orbis/_types/pad.h>
 #include <pthread.h>
@@ -74,8 +75,8 @@ static bool home_dirty=false;
 static void downloads_screen();
 // What Options downloads from a library: one file, or all of an album, season or series.
 static bool downloadable(const char* t){for(const char* k:{"Movie","Episode","Video","Audio","MusicAlbum","Season","Series"})if(!strcmp(t,k))return true;return false;}
-enum SettingSection { SEC_PLAYBACK, SEC_LIVETV, SEC_DISPLAY, SEC_ACCOUNT, SEC_SYSTEM, SEC__COUNT };
-enum SettingId { SET_QUALITY, SET_HD1080, SET_RESUME, SET_SKIP_INTRO, SET_SKIP_OUTRO, SET_METHOD, SET_GUIDE_UPDATE, SET_GUIDE_AUTO, SET_GUIDE_URL, SET_ONNOW, SET_SHARE, SET_THEME, SET_LANGUAGE, SET_HOME_ORDER, SET_SAVER, SET_SAVER_DELAY, SET_SIGN_OUT, SET_DOWNLOADS, SET_DOWNLOAD_TO, SET_UPDATE, SET_ABOUT, SET_DEBUG, SET_EXIT };
+enum SettingSection { SEC_PLAYBACK, SEC_SUBTITLES, SEC_LIVETV, SEC_DISPLAY, SEC_ACCOUNT, SEC_SYSTEM, SEC__COUNT };
+enum SettingId { SET_QUALITY, SET_HD1080, SET_RESUME, SET_SKIP_INTRO, SET_SKIP_OUTRO, SET_METHOD, SET_SUB_DRAW, SET_SUB_FONT, SET_SUB_COLOUR, SET_GUIDE_UPDATE, SET_GUIDE_AUTO, SET_GUIDE_URL, SET_ONNOW, SET_SHARE, SET_THEME, SET_LANGUAGE, SET_HOME_ORDER, SET_SAVER, SET_SAVER_DELAY, SET_SIGN_OUT, SET_DOWNLOADS, SET_DOWNLOAD_TO, SET_UPDATE, SET_ABOUT, SET_DEBUG, SET_EXIT };
 struct SettingDef { SettingId id; SettingSection section; const char* label; const char* description; bool action; };
 static const SettingDef SETTING_ROWS[]={
  {SET_QUALITY,SEC_PLAYBACK,"Quality","The highest bitrate the server streams at. Lower it if playback\nstops to buffer; raise it for a sharper picture on a fast network.",false},
@@ -84,6 +85,10 @@ static const SettingDef SETTING_ROWS[]={
  {SET_SKIP_INTRO,SEC_PLAYBACK,"Skip Intros","Films and shows: Auto jumps past the intro; Button shows Skip Intro (Triangle).\nNeeds intro markers on the server (Jellyfin 10.10+, e.g. Intro Skipper).",false},
  {SET_SKIP_OUTRO,SEC_PLAYBACK,"Skip Credits","Shows: at the credits, Auto goes on to the next episode; Button shows\nSkip to Next Episode (Triangle). Needs credits markers on the server.",false},
  {SET_METHOD,SEC_PLAYBACK,"Playback method","Auto plays files the PS4 can decode straight from the server, and has the\nserver convert the rest. Always transcode converts everything (slower to start).",false},
+ // The PS3's Subtitles section; its font and colour rows keep its words.
+ {SET_SUB_DRAW,SEC_SUBTITLES,"Draw Subtitles","Console draws subtitles over the original file, so a film with them still plays\ndirectly. Server burns them into the picture, which means converting the video.",false},
+ {SET_SUB_FONT,SEC_SUBTITLES,"Subtitle Font","The typeface subtitles are drawn in.\nLeft and Right step through the choices.",false},
+ {SET_SUB_COLOUR,SEC_SUBTITLES,"Subtitle Colour","The colour subtitles are drawn in.\nWhite is the broadcast default; the others are softer.",false},
  {SET_ONNOW,SEC_LIVETV,"On Now on Home","A Home row of what's on Live TV now: the show, its episode and times.\nUses the server's guide, else the one downloaded here.",false},
  {SET_GUIDE_UPDATE,SEC_LIVETV,"Update Guide","",true},
  {SET_GUIDE_AUTO,SEC_LIVETV,"Auto-Update Guide","At launch, update the guide in the background when it is over 12 hours old.\nOff: only Update Guide does.",false},
@@ -102,7 +107,7 @@ static const SettingDef SETTING_ROWS[]={
  {SET_DEBUG,SEC_SYSTEM,"Debug Logging","Write a diagnostic log to /data/JellyFin-PS4-logs (never passwords\nor tokens). Turn it on when reporting a problem.",false},
  {SET_EXIT,SEC_SYSTEM,"Exit application","Close Jellyfin [PS] and return to the PS4 home screen.",true},
 };
-static const struct { const char* label; SettingsIcon icon; } SETTING_SECTIONS[SEC__COUNT]={{"Playback",SICON_PLAYBACK},{"Live TV",SICON_PLAYBACK},{"Display",SICON_DISPLAY},{"Account",SICON_ACCOUNT},{"System",SICON_SYSTEM}};
+static const struct { const char* label; SettingsIcon icon; } SETTING_SECTIONS[SEC__COUNT]={{"Playback",SICON_PLAYBACK},{"Subtitles",SICON_PLAYBACK},{"Live TV",SICON_PLAYBACK},{"Display",SICON_DISPLAY},{"Account",SICON_ACCOUNT},{"System",SICON_SYSTEM}};
 static std::vector<const SettingDef*> section_rows(int section){std::vector<const SettingDef*> rows;for(const auto& r:SETTING_ROWS)if(r.section==section)rows.push_back(&r);return rows;}
 static SettingsCategoryView section_view(int section){
  SettingsCategoryView v;v.label=T(SETTING_SECTIONS[section].label);v.icon=SETTING_SECTIONS[section].icon;
@@ -133,6 +138,10 @@ static SettingsRowView setting_view(const SettingDef& r){
   const int s=r.id==SET_SKIP_INTRO?settings.skip_intro:settings.skip_outro;v.value=T(s==SKIP_AUTO?"Auto":s==SKIP_BUTTON?"Button":"Off");v.lit=s==SKIP_AUTO;
   if(segments_supported()==0)v.description=T("No intro skipping plugin was found on your server, so only chapters named Intro\nor Credits are skipped. Install Intro Skipper (and scan) for every episode.");
   break;}
+ case SET_SUB_DRAW:v.value=T(settings.sub_console?"Console":"Server");v.lit=settings.sub_console;break;
+ // The face and look apply to what the console draws.
+ case SET_SUB_FONT:v.value=subtitle_font_label(settings.sub_font);v.lit=settings.sub_font!=0;v.dim=!settings.sub_console;break;
+ case SET_SUB_COLOUR:v.value=T(subtitle_colour_label(settings.sub_colour));v.lit=settings.sub_colour!=0;v.dim=!settings.sub_console;break;
  case SET_METHOD:v.value=T(settings.method==PLAY_DIRECT_FILE?"Direct file":settings.method==PLAY_TRANSCODE?"Always transcode":"Auto");break;
  case SET_THEME:v.value=theme_current_name();break;
  case SET_LANGUAGE:v.value=language_label();break;
@@ -159,6 +168,9 @@ static bool setting_step(SettingId id,int dir){
  case SET_SKIP_INTRO:settings.skip_intro=(settings.skip_intro+dir+3)%3;break;
  case SET_SKIP_OUTRO:settings.skip_outro=(settings.skip_outro+dir+3)%3;break;
  case SET_METHOD:settings.method=(settings.method+dir+3)%3;break;
+ case SET_SUB_DRAW:settings.sub_console=!settings.sub_console;break;
+ case SET_SUB_FONT:if(!settings.sub_console)return false;settings.sub_font=(settings.sub_font+dir+SUBFONT_COUNT)%SUBFONT_COUNT;break;
+ case SET_SUB_COLOUR:if(!settings.sub_console)return false;settings.sub_colour=(settings.sub_colour+dir+SUBCOLOUR_COUNT)%SUBCOLOUR_COUNT;break;
  case SET_THEME:theme_step(dir);return true;   // the theme keeps its own file
  case SET_LANGUAGE:language_step(dir);break;
  case SET_SAVER:settings.saver=!settings.saver;break;
@@ -283,6 +295,7 @@ static bool play_resume_once=false;
 static std::string audio_chip(const std::string& label);
 static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,const std::string& audio_label="",const std::string& subtitle_label="",PlayQueue* queue=nullptr){
  const bool resume_on=settings.resume||play_resume_once;play_resume_once=false;
+ struct UsbPollHold{UsbPollHold(){usb_poll_hold(true);}~UsbPollHold(){usb_poll_hold(false);}} usb_poll_held;
  UiInputScope input_scope;ScreensaverInhibit no_saver;++play_generation;page_cache_clear();std::string url,session,source_id;
  const bool live=!strcmp(item.base.type,"TvChannel"),audio_only=!strcmp(item.base.type,"Audio");
  // The PS3 player HUD: title, play state, progress and times. Left/Right move
@@ -310,13 +323,22 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
  const uint64_t play_pressed=mono_ms();bool prepared=false;std::vector<MediaSegment> segments;std::vector<bool> segment_done;
  // A download plays from its file: no server, no progress reports.
  const bool offline=!item.local.empty();
- buffering_run([&]{if(offline){url=item.local;prepared=true;return;}prepared=playback_url(item,audio,subtitle,source,url,session,source_id);
+ std::vector<PlayerSubtitleFile> side_subs;
+ buffering_run([&]{if(offline){url=item.local;for(const auto& f:local_subtitle_files(item.local))side_subs.push_back({f.url,f.label,f.lang});prepared=true;return;}prepared=playback_url(item,audio,subtitle,source,url,session,source_id);
   if(prepared&&!live&&!audio_only&&(settings.skip_intro||settings.skip_outro))segments=fetch_segments(item.base.id);});
  segment_done.assign(segments.size(),false);
  if(!segments.empty())plog(("Playback: "+std::to_string(segments.size())+" intro / credits markers").c_str());
  plog(("Playback: PlaybackInfo took "+std::to_string(mono_ms()-play_pressed)+" ms"+(settings.hd1080?" (1080p)":"")).c_str());
  if(!prepared){buffering_finish(false);end_playback(session);error_screen();return PLAY_STOPPED;}
  buffering_step(T("CONNECTING"),false,T("Cancel"));
+ player_prefer_audio(offline?0:playback_audio_track());
+ // A file with no server shows what it flags; from the server, the chosen track
+ // or none. A transcode that starts part way in has its subtitle file's times
+ // from the start of the film, the stream's from where it started.
+ {const bool from_start=offline||playback_is_static();const uint64_t start=resume_on&&!from_start&&!live?item.resume:0;
+  player_prefer_subtitle(offline?-1:playback_subtitle_track(),offline?std::string():playback_subtitle_url(),-(int64_t)start);
+  player_subtitle_files(side_subs);
+  if(!side_subs.empty())plog(("Playback: "+std::to_string(side_subs.size())+" subtitle file(s) beside it").c_str());}
  if(!player_open(url)){buffering_finish(false);end_playback(session);error_screen();return PLAY_STOPPED;}
  // A channel played directly gets 15 seconds before it falls back to the server.
  const bool remote=!offline&&playback_is_remote();const int start_limit=remote?15:45;
@@ -327,7 +349,15 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
  // Audio and subtitles in the player (PS3 Triangle): the item's tracks, asked
  // for when the menu opens; picking one restarts the stream with it.
  static JFMediaSources track_sources;int track_source=0;bool restart=false;
- auto open_tracks=[&]{Item fresh;if(!fetch_detail(item,fresh))return false;memset(&track_sources,0,sizeof track_sources);jellyfin_parse_media_sources(responseBuffer,&track_sources);
+ // A file on a USB drive or a download has no server to ask: the player knows
+ // its tracks, and switches among them in place.
+ std::vector<PlayerAudioTrack> local_tracks,local_subs;
+ bool audio_checked=false,audio_fallback=false;
+ auto open_local_tracks=[&]{local_tracks=player_audio_tracks();local_subs=player_subtitle_tracks();if(local_tracks.size()<2&&local_subs.empty())return false;
+  osd.audio_names.clear();osd.audio_now=0;for(size_t i=0;i<local_tracks.size();++i){osd.audio_names.push_back(local_tracks[i].label);if(local_tracks[i].selected)osd.audio_now=(int)i;}
+  osd.sub_names={T("Off")};osd.sub_now=0;for(size_t i=0;i<local_subs.size();++i){osd.sub_names.push_back(local_subs[i].label);if(local_subs[i].selected)osd.sub_now=(int)i+1;}
+  osd.sub_sel=osd.sub_now;osd.audio_sel=osd.audio_now;osd.tracks_sub=local_tracks.size()<2;osd.tracks_open=true;return true;};
+ auto open_tracks=[&]{if(offline)return open_local_tracks();Item fresh;if(!fetch_detail(item,fresh))return false;memset(&track_sources,0,sizeof track_sources);jellyfin_parse_media_sources(responseBuffer,&track_sources);
   if(!track_sources.n_sources)return false;track_source=0;for(int i=0;i<track_sources.n_sources;++i)if(source==track_sources.source[i].id||source_id==track_sources.source[i].id)track_source=i;
   const JFTracks& t=track_sources.source[track_source].tracks;
   osd.audio_names.clear();for(int i=0;i<t.n_audio;++i)osd.audio_names.push_back(t.audio[i].label);
@@ -357,6 +387,16 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
   }
   if(started&&direct_resume_pending){player_seek(item.resume);direct_resume_pending=false;}
   const uint64_t now=now_ms();uint64_t pos=base+player_time(),shown=pos;
+  // A file on a USB drive has no server to say how long it is. Without a length
+  // the bar stays empty and a seek can land past the end, which ends playback.
+  if(offline&&!item.duration){const uint64_t length=player_duration_ms();if(length){item.duration=length;osd.duration=length;}}
+  // A file whose sound the player cannot decode plays silently: the server can
+  // convert the sound, so go back to it from here. A USB file has only this
+  // player, so it says why there is no sound and goes on with the picture.
+  if(started&&!audio_checked&&!live&&player_audio_failed()){audio_checked=true;
+   plog("Playback: the audio track could not be decoded or output");
+   if(is_static&&!offline){audio_fallback=true;break;}
+   skip_toast=T("This audio format can't be played");skip_toast_until=now+6000;}
   // While an asynchronous seek lands, keep showing where it is going.
   if(hold_until&&now<hold_until&&(pos+3000<target||pos>target+3000))shown=target;else hold_until=0;
   osd.position=shown;osd.target=target;osd.paused=paused;osd.started=started;osd.scrubbing=scrubbing;
@@ -428,11 +468,15 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
    if(n&&(b&ORBIS_PAD_BUTTON_UP))sel=(sel+n-1)%n;
    else if(n&&(b&ORBIS_PAD_BUTTON_DOWN))sel=(sel+1)%n;
    else if((b&(ORBIS_PAD_BUTTON_LEFT|ORBIS_PAD_BUTTON_RIGHT|ORBIS_PAD_BUTTON_TRIANGLE))&&!osd.audio_names.empty())osd.tracks_sub=!osd.tracks_sub;
+   else if((b&ORBIS_PAD_BUTTON_CROSS)&&offline){
+    if(osd.audio_sel!=osd.audio_now&&osd.audio_sel<(int)local_tracks.size()){player_select_audio(local_tracks[osd.audio_sel].id);osd.audio=audio_chip(osd.audio_names[osd.audio_sel]);audio_checked=false;}
+    if(osd.sub_sel!=osd.sub_now&&osd.sub_sel<=(int)local_subs.size()){player_select_subtitle(osd.sub_sel?local_subs[osd.sub_sel-1].id:0);osd.subtitles=osd.sub_sel?osd.sub_names[osd.sub_sel]:"";}
+    osd.tracks_open=false;}
    else if(b&ORBIS_PAD_BUTTON_CROSS){if(osd.audio_sel!=osd.audio_now||osd.sub_sel!=osd.sub_now){restart=true;break;}osd.tracks_open=false;}
    else if(b&ORBIS_PAD_BUTTON_CIRCLE)osd.tracks_open=false;
    osd_until=now+5000;b=0;
   }
-  else if(!audio_only&&!live&&!offline&&started&&!picture&&!volume_active&&(b&ORBIS_PAD_BUTTON_TRIANGLE)){
+  else if(!audio_only&&!live&&started&&!picture&&!volume_active&&(b&ORBIS_PAD_BUTTON_TRIANGLE)){
    if(!open_tracks()){skip_toast=T("No other tracks");skip_toast_until=now+2000;}
    osd_until=now+5000;b=0;
   }
@@ -566,6 +610,12 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
   return play(item,new_audio,new_sub,source.empty()?std::string(s.id):source,new_audio_label.empty()?std::string(t.audio[osd.audio_sel].label):new_audio_label,new_sub_label,queue);}
  // A channel's own stream would not play: try it once more through the server.
  if(remote&&!started&&!cancelled){plog(("Live TV: direct stream did not start ("+last_error+"); through the server").c_str());playback_force_server_once();return play(item,audio,subtitle,source,audio_label,subtitle_label,queue);}
+ // The original file would not decode: once more as the server's H264/AAC
+ // transcode, from here. That is not an original file, so this cannot repeat.
+ if(!live&&!offline&&is_static&&!cancelled&&(audio_fallback||play_failed||!started)){
+  plog(("Playback: fallback to a server transcode ("+(audio_fallback?std::string("the sound could not be decoded"):last_error)+")").c_str());
+  if(started)item.resume=pos;play_resume_once=started||resume_on;last_error.clear();playback_force_transcode_once();wait_release();
+  return play(item,audio,subtitle,source,audio_label,subtitle_label,queue);}
  if((!started&&!cancelled)||play_failed)error_screen();wait_release();
  if(play_failed)return PLAY_STOPPED;return skip!=PLAY_STOPPED?skip:finished?PLAY_ENDED:PLAY_STOPPED;}
 // Music plays through a queue -- an album, a playlist, the Songs tab from the

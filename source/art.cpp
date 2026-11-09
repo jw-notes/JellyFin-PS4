@@ -162,31 +162,33 @@ void draw_brand_mark(int x,int y,int size,int alpha){
  draw_image(mark,x,y,size,size,false,false,true,alpha);
 }
 
-// The PS4 Options button has no image in the PS3 prompt sheet: draw its
-// three-line glyph in a rounded badge, sized like the other prompts.
-static int options_icon(int x,int y,int height){
- int w=height*3/2,r=height/3;uint32_t edge=g_theme.text_dim;
- for(int row=0;row<height;++row){int inset=0;if(row<r)inset=r-(int)sqrtf((float)(r*r-(r-row)*(r-row)));else if(row>=height-r){int d=row-(height-r-1);inset=r-(int)sqrtf((float)std::max(0,r*r-d*d));}
-  bool border=row==0||row==height-1;if(border)rect(x+inset,y+row,w-2*inset,1,edge);else{rect(x+inset,y+row,1,1,edge);rect(x+w-inset-1,y+row,1,1,edge);}}
- int lw=w/2,lx=x+(w-lw)/2;for(int k=0;k<3;++k)rect(lx,y+height*(3+k*2)/10+1,lw,std::max(1,height/12),edge);
- return w;
+// Controller prompts, all from the PS3's Kenney sheet (tools/prepare_prompts.py):
+// the PS4's Options and touchpad too, and the d-pad with only the directions a
+// screen uses lit. The sheet lights them red; they are drawn in the theme's accent.
+// The sheet's red (about 232, 51, 72), against its white.
+static bool red(const uint8_t* rgba){return rgba[3]&&rgba[0]>150&&rgba[0]>rgba[1]+60&&rgba[0]>rgba[2]+50;}
+struct Prompt{Art art,tinted;uint32_t tint=0xFFFFFFFF;bool lit=false;};
+static const Art* prompt_image(char glyph){
+ const char* name=glyph=='X'?"cross":glyph=='C'?"circle":glyph=='S'?"square":glyph=='T'?"triangle":glyph=='D'?"dpad":glyph=='|'?"dpad_updown":glyph=='-'?"dpad_leftright":glyph=='<'?"dpad_left":glyph=='>'?"dpad_right":glyph=='^'?"dpad_up":glyph=='v'?"dpad_down":
+  glyph=='l'?"l1":glyph=='r'?"r1":glyph=='L'?"l2":glyph=='R'?"r2":glyph=='O'?"options":glyph=='P'?"touchpad":nullptr;
+ if(!name)return nullptr;
+ static std::map<char,Prompt> prompts;auto found=prompts.find(glyph);
+ if(found==prompts.end()){Prompt prompt;Art& art=prompt.art;int channels;std::string path=std::string("/app0/assets/prompts/")+name+".png";auto data=stbi_load(path.c_str(),&art.width,&art.height,&channels,4);if(!data){path=std::string("assets/prompts/")+name+".png";data=stbi_load(path.c_str(),&art.width,&art.height,&channels,4);}if(data){art.pixels.assign(data,data+art.width*art.height*4);stbi_image_free(data);}
+  for(size_t i=0;i+3<art.pixels.size();i+=4)if(red(&art.pixels[i]))prompt.lit=true;
+  found=prompts.emplace(glyph,std::move(prompt)).first;}
+ Prompt& p=found->second;if(p.art.pixels.empty())return nullptr;
+ if(!p.lit)return &p.art;
+ // Recoloured once for each theme, keeping each pixel's edge (alpha).
+ const uint32_t accent=g_theme.accent&0xFFFFFF;
+ if(p.tint!=accent){p.tinted=Art();p.tinted.width=p.art.width;p.tinted.height=p.art.height;p.tinted.pixels=p.art.pixels;
+  for(size_t i=0;i+3<p.tinted.pixels.size();i+=4)if(red(&p.tinted.pixels[i])){p.tinted.pixels[i]=(uint8_t)(accent>>16);p.tinted.pixels[i+1]=(uint8_t)(accent>>8);p.tinted.pixels[i+2]=(uint8_t)accent;}
+  p.tint=accent;}
+ return &p.tinted;
 }
-// The touchpad: a wide rounded pad with its click line.
-static int touchpad_icon(int x,int y,int height){
- int w=height*2,r=height/4;uint32_t edge=g_theme.text_dim;
- for(int row=0;row<height;++row){int inset=0;if(row<r)inset=r-(int)sqrtf((float)(r*r-(r-row)*(r-row)));else if(row>=height-r){int d=row-(height-r-1);inset=r-(int)sqrtf((float)std::max(0,r*r-d*d));}
-  if(row==0||row==height-1)rect(x+inset,y+row,w-2*inset,1,edge);else{rect(x+inset,y+row,1,1,edge);rect(x+w-inset-1,y+row,1,1,edge);}}
- rect(x+w/2,y+2,1,height-4,edge);return w;
-}
+static int prompt_width(char glyph,int height){const Art* art=prompt_image(glyph);return art?art->width*height/art->height:0;}
 int draw_button_icon(char glyph,int x,int y,int height){
- if(glyph=='O')return options_icon(x,y,height);
- if(glyph=='P')return touchpad_icon(x,y,height);
- static std::map<char,Art> prompts;
- const char* name=glyph=='X'?"cross":glyph=='C'?"circle":glyph=='S'?"square":glyph=='T'?"triangle":glyph=='D'?"dpad":glyph=='l'?"l1":glyph=='r'?"r1":glyph=='L'?"l2":glyph=='R'?"r2":nullptr;
- if(!name)return 0;
- auto found=prompts.find(glyph);
- if(found==prompts.end()){Art art;int channels;std::string path=std::string("/app0/assets/prompts/")+name+".png";auto data=stbi_load(path.c_str(),&art.width,&art.height,&channels,4);if(!data){path=std::string("assets/prompts/")+name+".png";data=stbi_load(path.c_str(),&art.width,&art.height,&channels,4);}if(data){art.pixels.assign(data,data+art.width*art.height*4);stbi_image_free(data);}found=prompts.emplace(glyph,std::move(art)).first;}
- const auto& art=found->second;if(art.pixels.empty())return 0;int width=art.width*height/art.height;draw_image(art,x,y,width,height,false);return width;
+ const Art* art=prompt_image(glyph);if(!art)return 0;
+ const int width=art->width*height/art->height;draw_image(*art,x,y,width,height,false);return width;
 }
 int draw_hints(int x,int y,std::initializer_list<Hint> hints,int size){
  for(const auto& hint:hints){int icon=draw_button_icon(hint.glyph,x,y+(size>=20?0:1),size+2);if(icon)x+=icon+(hint.label&&*hint.label?7:3);
@@ -195,7 +197,7 @@ int draw_hints(int x,int y,std::initializer_list<Hint> hints,int size){
  return x;
 }
 int hints_width(std::initializer_list<Hint> hints,int size){
- int x=0;for(const auto& hint:hints){x+=(hint.glyph=='O'?(size+2)*3/2:hint.glyph=='P'?(size+2)*2:size+2)+(hint.label&&*hint.label?7:3);if(hint.label&&*hint.label)x+=face_text_width(T(hint.label),size-2,TextFace::Classic)+22;}return x;
+ int x=0;for(const auto& hint:hints){const int icon=prompt_width(hint.glyph,size+2);if(icon)x+=icon+(hint.label&&*hint.label?7:3);if(hint.label&&*hint.label)x+=face_text_width(T(hint.label),size-2,TextFace::Classic)+22;}return x;
 }
 #ifdef HOST_TEST
 // Host previews and benchmarks: put a decoded image in the cache.

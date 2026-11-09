@@ -21,6 +21,7 @@
 extern "C" {
 #include "../vendor/goldhen_sdk/include/GoldHEN.h"
 int orbis_syscall(int num, ...);  // vendor/goldhen_sdk/source/Syscall.c
+int* __error(void);               // libkernel
 }
 
 namespace {
@@ -90,12 +91,14 @@ bool leave() {
     int err;
     {
         IgnoreSigSys guard;
-        errno = 0;
+        // orbis_syscall leaves its error in libkernel's __error(), not in the
+        // toolchain's errno (which read a meaningless 256 here).
+        *__error() = 0;
         version = sys_sdk_version();
-        err = errno;
+        err = *__error();
     }
     if (version == 0 || version == 0xFFFFFFFFu) {
-        snprintf(line, sizeof line, "USB: GoldHEN's SDK does not answer (syscall 500, errno %d): GoldHEN 2.3 or later is needed for USB drives", err);
+        snprintf(line, sizeof line, "USB: GoldHEN's SDK does not answer (syscall 500 returned 0x%08x, kernel error %d); the sandbox stays on", (unsigned)version, err);
         plog(line);
         return false;
     }

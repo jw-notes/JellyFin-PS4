@@ -1,6 +1,8 @@
 #include "music_viz.h"
 #include "mono_clock.h"
+#include "audio_limiter.h"
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
@@ -110,6 +112,7 @@ struct SDL_AudioSpec{int freq;SDL_AudioFormat format;uint8_t channels,silence;ui
 #define SDL_AUDIO_BITSIZE(x) ((x)&0xFF)
 #define SDL_AUDIO_ISFLOAT(x) ((x)&(1<<8))
 typedef uint8_t Uint8;
+void plog(const char*);
 extern "C" int __real_SDL_OpenAudio(SDL_AudioSpec* desired,SDL_AudioSpec* obtained);
 static SDL_AudioCallback mpv_callback=nullptr;
 static void* mpv_userdata=nullptr;
@@ -117,12 +120,38 @@ static SDL_AudioFormat tap_format=0x8010;  // AUDIO_S16LSB
 static int tap_channels=2;
 static std::atomic<uint64_t> last_sound_ms{0};
 uint64_t audio_last_sound_ms(){return last_sound_ms;}
+static StereoLimiter limiter;
+static std::atomic<bool> limiter_on{false};
+static float stats_peak=0;static double stats_sum=0;static uint64_t stats_frames=0;
+static std::atomic<int> audio_port{-1};
+void audio_limiter_enable(bool on){limiter_on=on;}
+void audio_stats_reset(){
+ pthread_mutex_lock(&tap_lock);limiter.reset();stats_peak=0;stats_sum=0;stats_frames=0;pthread_mutex_unlock(&tap_lock);limiter_on=false;
+}
+static double to_db(double level){return level>0?20.0*log10(level):-120.0;}
+std::string audio_stats_report(){
+ pthread_mutex_lock(&tap_lock);
+ const double rms=stats_frames?sqrt(stats_sum/(double)(stats_frames*2)):0;
+ char line[220];snprintf(line,sizeof line,"Audio: output level peak %.1f dBFS, RMS %.1f dBFS over %.1f s; limiter %s, input peak %.1f dBFS, %llu frames limited",
+  to_db(stats_peak),to_db(rms),stats_frames/48000.0,limiter_on?"on":"off",to_db(limiter.peak_in),(unsigned long long)limiter.limited_frames);
+ pthread_mutex_unlock(&tap_lock);return line;
+}
+// The raw fields as the firmware reports them (layout as documented by shadPS4:
+// output, channel, volume). A larger buffer than the struct: only for the log.
+extern "C" int32_t sceAudioOutGetPortState(int32_t,void*);
+std::string audio_port_report(){
+ const int port=audio_port;if(port<0)return "Audio: no sound port is open";
+ uint8_t state[64]={};const int rc=sceAudioOutGetPortState(port,state);uint16_t output=0;int16_t volume=0;memcpy(&output,state,2);memcpy(&volume,state+4,2);
+ char line[140];snprintf(line,sizeof line,"Audio: port state rc=0x%08x output=0x%x channel=%u volume=%d",(unsigned)rc,output,state[2],volume);return line;
+}
 static void tap_callback(void* userdata,Uint8* stream,int len){
  (void)userdata;if(mpv_callback)mpv_callback(mpv_userdata,stream,len);else memset(stream,0,len);
  // MPV fills an underrun with zeros: any other byte is sound.
  for(int i=0;i<len;i+=16)if(stream[i]){last_sound_ms=mono_ms();break;}
  const int bytes=SDL_AUDIO_BITSIZE(tap_format)/8,frame=bytes*tap_channels;if(frame<=0)return;
- float lr[512*2];int frames=len/frame,done=0;
+ // A multichannel source mixed down: keep its loud passages from clipping.
+ if(limiter_on&&SDL_AUDIO_ISFLOAT(tap_format)&&bytes==4&&tap_channels==2){pthread_mutex_lock(&tap_lock);limiter.process(reinterpret_cast<float*>(stream),len/frame);pthread_mutex_unlock(&tap_lock);}
+ float lr[512*2];int frames=len/frame,done=0;float peak=0;double sum=0;
  while(done<frames){
   const int n=frames-done<512?frames-done:512;
   for(int i=0;i<n;++i)for(int c=0;c<2;++c){
@@ -131,8 +160,19 @@ static void tap_callback(void* userdata,Uint8* stream,int len){
    else if(bytes==4){int32_t s;memcpy(&s,p,4);v=s/2147483648.0f;}
    else if(bytes==2){int16_t s;memcpy(&s,p,2);v=s/32768.0f;}
    else v=((int)*p-128)/128.0f;
-   lr[i*2+c]=v;}
+   lr[i*2+c]=v;const float a=fabsf(v);if(a>peak)peak=a;sum+=(double)v*v;}
   music_viz_push(lr,n);done+=n;}
+ pthread_mutex_lock(&tap_lock);if(peak>stats_peak)stats_peak=peak;stats_sum+=sum;stats_frames+=(uint64_t)frames;pthread_mutex_unlock(&tap_lock);
+}
+// --wrap=sceAudioOutOpen: what SDL actually asks the console for (the sound
+// path's real format), and the port the state report above reads.
+extern "C" int32_t __real_sceAudioOutOpen(int32_t,int32_t,int32_t,uint32_t,uint32_t,uint32_t);
+extern "C" int32_t __wrap_sceAudioOutOpen(int32_t user,int32_t type,int32_t index,uint32_t length,uint32_t rate,uint32_t param){
+ const int32_t port=__real_sceAudioOutOpen(user,type,index,length,rate,param);audio_port=port;
+ static const char* formats[]={"S16 mono","S16 stereo","S16 8ch","float mono","float stereo","float 8ch","S16 8ch std","float 8ch std"};
+ const uint32_t format=param&0xff;
+ char line[160];snprintf(line,sizeof line,"Audio: sceAudioOutOpen port type %d, %u samples, %u Hz, %s -> 0x%08x",(int)type,length,rate,format<8?formats[format]:"unknown",(unsigned)port);plog(line);
+ return port;
 }
 extern "C" int __wrap_SDL_OpenAudio(SDL_AudioSpec* desired,SDL_AudioSpec* obtained){
  if(!desired)return __real_SDL_OpenAudio(desired,obtained);
