@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 // The PS4's own strings for language.cpp: {"English", {ja, pt-BR, de, fr, es}}.
 // Everything the PS3 catalog (vendor/ps3/source/i18n) already has is looked
 // up there first; add a row here only for text the PS3 client never had.

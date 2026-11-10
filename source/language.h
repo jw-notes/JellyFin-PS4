@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #pragma once
 // The interface language, as on the PS3 (vendor/ps3/source/i18n): every
 // string the app writes is English at its use and looked up by that text.

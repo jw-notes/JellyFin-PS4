@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 // Audio: the production playback_url() and player_mpv.cpp against a real server
 // and real files, on the host's libmpv writing what it would play to a PCM file.
 //   audio-114 <server> <user> <password> <media dir> <idmap: "file id" lines>

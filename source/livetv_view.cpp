@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 // The Live TV page in the Classic layout, ported from the PS3's
 // vendor/ps3/source/ui/xmb/ui_livetv.cpp. The requests, parsing, sorting,
 // categories and the viewer's page preferences are the PS3's own files
@@ -272,7 +274,7 @@ void draw_screen(int header_focus){
    if(!k)face_text(guide_cells_x()+10,y+(GUIDE_ROW_H-14)/2-1,T("No guide information"),g_theme.text_faint,14,TextFace::Classic);
   }
  }
- if(header_focus>=0)hint_bar({{'D',"Nav"},{'X',"Select"},{'C',"Back"}});
+ if(header_focus>=0)hint_bar({{'-',"Tabs"},{'X',"Select"},{'C',"Back"}});
  else if(guide)hint_bar({{'X',"Watch / details"},{'D',"Move"},{'C',"List"}});
  else if(search_on)hint_bar({{'X',"Watch"},{'T',"Favourite"},{'S',"Guide"},{'P',"Search"},{'C',"Back"}});
  else if(paging())hint_bar({{'X',"Watch"},{'T',"Favourite"},{'S',"Guide"},{'L',""},{'R',"Category"},{'P',"Search"},{'C',"Back"}});

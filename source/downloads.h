@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #pragma once
 // Downloads (PS3 offline downloads): a film, an episode, a whole season or an
 // album saved to the console or a USB drive and played without streaming.

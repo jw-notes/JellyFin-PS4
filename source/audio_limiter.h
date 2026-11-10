@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #pragma once
 // A safety limiter for 5.1 and 7.1 sources mixed down to stereo.
 //

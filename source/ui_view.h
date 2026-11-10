@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #pragma once
 #include "app.h"
 #include "art.h"
@@ -62,7 +64,19 @@ struct PlayerOsd { std::string title,subtitle,audio,subtitles,album,art,up_next,
  bool shuffle=false,queue_open=false; std::vector<std::string> upcoming,queue_names; int queue_sel=0;
  // Video: the audio / subtitle menu (Triangle), PS3 style -- one list at a
  // time, Left / Right switch. tracks_open: shown; tracks_sub: the subtitle list.
- bool tracks_open=false,tracks_sub=false; std::vector<std::string> audio_names,sub_names; int audio_sel=0,sub_sel=0,audio_now=0,sub_now=0; };
+ bool tracks_open=false,tracks_sub=false; std::vector<std::string> audio_names,sub_names; int audio_sel=0,sub_sel=0,audio_now=0,sub_now=0;
+ // Chapters: marks on the bar, the one at the scrub target named beside its
+ // time, and the Chapters menu (Options) with a picture of the highlighted one.
+ std::vector<PlayerChapter> chapters; bool chapters_open=false; int chapter_sel=0,chapter_now=0; std::string item_id;
+ // Options while watching: Chapters, Audio / Subtitles, Picture, Playback
+ // Statistics -- each a name and its value now ("On", "12 chapters"; may be empty).
+ bool options_open=false; int options_sel=0; std::vector<std::pair<std::string,std::string>> options; };
+// The Options menu over the player.
+void draw_options_menu(const PlayerOsd& osd);
+// The chapter `ms` falls in (-1: before the first, or none).
+int chapter_at(const std::vector<PlayerChapter>& chapters,uint64_t ms);
+// The Chapters menu over the player.
+void draw_chapter_menu(const PlayerOsd& osd);
 void draw_player_osd(const PlayerOsd& osd);
 // The audio / subtitle menu over the picture (osd.tracks_open).
 void draw_track_menu(const PlayerOsd& osd);
@@ -73,6 +87,8 @@ void draw_picture_banner(const std::string& state,bool moving);
 void draw_skip_button(const std::string& label,bool button);
 // Music's volume popup: the level as a bar, shown a moment after Up / Down.
 void draw_volume_banner(int volume);
+// The playback statistics panel (R3), top left over the picture.
+void draw_stats_panel(const std::vector<PlayerStatLine>& lines);
 // Now Playing for music: the cover, a visualizer, the artist and album, and
 // the progress bar. `bands` are 0..1 levels; `wave` the newest sound (-1..1).
 // The visualizer is osd.viz (Square cycles them); osd.viz_toast names it.

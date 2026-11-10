@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 // Subtitles drawn by the console: the production playback_url() and
 // player_mpv.cpp against a real Jellyfin and real files, with what the app
 // draws counted in its own framebuffer.

@@ -1,0 +1,49 @@
+#EXTM3U
+#EXTINF:-1 group-title="News",Harbour News 24
+http://example.invalid/1.m3u8
+#EXTINF:-1 group-title="Kids",Little Comets
+http://example.invalid/2.m3u8
+#EXTINF:-1 group-title="Movies",Silver Screen Classics
+http://example.invalid/3.m3u8
+#EXTINF:-1 group-title="Sports",Fieldside Sports
+http://example.invalid/4.m3u8
+#EXTINF:-1 group-title="Music",Vinyl Hour
+http://example.invalid/5.m3u8
+#EXTINF:-1 group-title="Documentary",Wild Planet HD
+http://example.invalid/6.m3u8
+#EXTINF:-1 group-title="Entertainment",Giggle Box
+http://example.invalid/7.m3u8
+#EXTINF:-1 group-title="General",Riverside One
+http://example.invalid/8.m3u8
+#EXTINF:-1 group-title="Kids",Paper Boat TV
+http://example.invalid/9.m3u8
+#EXTINF:-1 group-title="News",Metro Morning
+http://example.invalid/10.m3u8
+#EXTINF:-1 group-title="Movies",Late Show Cinema
+http://example.invalid/11.m3u8
+#EXTINF:-1 group-title="Sports",Racing Line
+http://example.invalid/12.m3u8
+#EXTINF:-1 group-title="Music",Echo Live
+http://example.invalid/13.m3u8
+#EXTINF:-1 group-title="Documentary",Deep Time
+http://example.invalid/14.m3u8
+#EXTINF:-1 group-title="Entertainment",Quiz Night
+http://example.invalid/15.m3u8
+#EXTINF:-1 group-title="General",Northern Lights TV
+http://example.invalid/16.m3u8
+#EXTINF:-1 group-title="Kids",Cartoon Attic
+http://example.invalid/17.m3u8
+#EXTINF:-1 group-title="Movies",Westward Cinema
+http://example.invalid/18.m3u8
+#EXTINF:-1 group-title="Documentary",Ocean Atlas
+http://example.invalid/19.m3u8
+#EXTINF:-1 group-title="News",Capital Report
+http://example.invalid/20.m3u8
+#EXTINF:-1 group-title="Entertainment",Studio Seven
+http://example.invalid/21.m3u8
+#EXTINF:-1 group-title="Music",Jazz Corner
+http://example.invalid/22.m3u8
+#EXTINF:-1 group-title="Sports",Golden Goal
+http://example.invalid/23.m3u8
+#EXTINF:-1 group-title="General",Coastline TV
+http://example.invalid/24.m3u8

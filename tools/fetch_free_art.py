@@ -1,3 +1,5 @@
+# JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+# GPL-3.0-or-later, with the attribution terms in NOTICE.
 """Fetch freely licensed artwork for the README screenshots from Wikimedia Commons.
 
 Each key below has search queries; the first result whose licence is public
@@ -50,6 +52,9 @@ WANTED = {
     'e1': (640, ['Bonanza cast 1959', 'Bonanza Cartwrights publicity']),
     'e2': (640, ['Beverly Hillbillies cast Buddy Ebsen Irene Ryan', 'Beverly Hillbillies main cast 1962', 'Buddy Ebsen Beverly Hillbillies']),
     'e3': (640, ['Lucille Ball 1960s publicity Lucy Show', 'The Lucy Show publicity']),
+    'e7': (640, ['Dick Van Dyke Show cast', 'Dick Van Dyke Mary Tyler Moore 1960s']),
+    'e8': (640, ["Bob Denver Alan Hale Gilligan's Island", "Bob Denver Gilligan's Island 1965", "Gilligan's Island cast photo"]),
+    'e9': (640, ['Andy Griffith Show cast', 'Andy Griffith Don Knotts 1960s']),
     # Music: classical works, public-domain composer portraits as covers.
     'a1': (600, ['Claude Debussy photograph 1908', 'Claude Debussy Nadar']),
     'a2': (600, ['Beethoven Stieler portrait', 'Joseph Karl Stieler Beethoven']),

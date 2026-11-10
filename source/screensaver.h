@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #pragma once
 // The PS3 Artwork screensaver (vendor/ps3/source/ui/xmb/ui_ambient.cpp,
 // Artwork mode only): after the idle delay the screen dims away and Home's

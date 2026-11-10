@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+# GPL-3.0-or-later, with the attribution terms in NOTICE.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 flags=(-DHOST_TEST -Isource -Isource/compat -Ivendor/ps3/source/api -Ivendor/ps3/source/net -Ivendor/ps3/source/ui -Ivendor/ps3/source/util)

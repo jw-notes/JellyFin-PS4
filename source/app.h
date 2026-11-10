@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
@@ -5,6 +7,7 @@
 #include "jellyfin_api.h"
 #include "json_lite.h"
 #include "theme.h"
+#include "platform.h"
 #include <string>
 #include <vector>
 struct Person { std::string id,name,role; bool image=false; };
@@ -20,6 +23,8 @@ enum PlayMethod { PLAY_AUTO, PLAY_DIRECT_FILE, PLAY_TRANSCODE };
 struct Settings { int bitrate=20000000; bool resume=true; int method=PLAY_AUTO; bool saver=true; int saver_delay=180; std::string language="auto"; bool hd1080=true;
  // debug_log: write the diagnostic log. pic_*: the L1 picture mode (picture_size.h).
  bool debug_log=false; int pic_aspect=0,pic_w=100,pic_h=100,pic_x=0,pic_y=0;
+ // stats: the playback statistics panel over the player (R3 while playing).
+ bool stats=false;
  // viz: the music visualizer (MusicViz in ui_view.h; Square cycles it).
  int viz=0;
  // volume: the player's, 0..100 in steps of 5 (the bar's Volume chip; music: Up / Down).
@@ -43,6 +48,15 @@ struct Settings { int bitrate=20000000; bool resume=true; int method=PLAY_AUTO; 
 enum { SKIP_OFF, SKIP_BUTTON, SKIP_AUTO };
 // An intro or the credits, as the server marks them, in ms from the start.
 struct MediaSegment { bool outro=false; uint64_t start=0,end=0; };
+// The item's chapters on the server, in order, each with its chapter image's
+// path when the server has made one; empty when it has none.
+std::vector<PlayerChapter> fetch_chapters(const std::string& item_id);
+// Jellyfin's trickplay (10.9+): seek thumbnails width x height, laid out in
+// JPEG sheets of tile_w x tile_h, one every interval_ms; count in all.
+struct TrickplayInfo { std::string item,source; int width=0,height=0,tile_w=0,tile_h=0,count=0; uint64_t interval_ms=0; };
+// The item's trickplay for this media source (or its first), at the width
+// nearest 320; false when the server has made none.
+bool fetch_trickplay(const std::string& item_id,const std::string& source_id,TrickplayInfo& out);
 // The item's intro and credits markers (Jellyfin 10.10+ with a segment
 // provider such as the Intro Skipper plugin); empty when it has none.
 std::vector<MediaSegment> fetch_segments(const std::string& item_id);
@@ -133,6 +147,11 @@ bool playback_url(const Item&, int audio, int sub, const std::string& selected_s
 // Whether the last playback_url() is the original file (the server sends it
 // as it is: positions are absolute) rather than a transcode from the resume point.
 bool playback_is_static();
+// How the last playback_url() reaches the player, for the statistics panel:
+// "Direct play", "Direct stream", "Transcode" and the like, and the server's
+// reasons for converting it ("Audio Codec Not Supported"), if any.
+std::string playback_method();
+std::string playback_reasons();
 // Whether the last playback_url() is a Live TV channel's own stream, played
 // straight from its provider rather than through the server.
 bool playback_is_remote();

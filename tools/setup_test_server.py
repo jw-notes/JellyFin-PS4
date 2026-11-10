@@ -1,3 +1,5 @@
+# JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+# GPL-3.0-or-later, with the attribution terms in NOTICE.
 import json,time,urllib.request,urllib.error,pathlib
 root=pathlib.Path(__file__).resolve().parent.parent
 base='http://127.0.0.1:18096'

@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 // Host-only test transport. Runs the real curl client without a shell.
 #include "app.h"
 #include <unistd.h>

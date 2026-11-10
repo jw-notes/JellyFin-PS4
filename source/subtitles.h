@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #pragma once
 // Subtitles drawn by the console (PS3 Settings > Subtitles). MPV's libass draws
 // text subtitles (SubRip, WebVTT, ASS) in one of three bundled bold faces and

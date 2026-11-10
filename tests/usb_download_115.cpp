@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 // Downloads to a USB drive the app can only reach through GoldHEN's FTP server:
 // the production downloads.cpp, local_media.cpp and player_mpv.cpp against
 // tests/fake_goldhen_ftp.py, which behaves as the console's server was measured

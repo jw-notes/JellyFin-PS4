@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 // Leaving the sandbox with GoldHEN's own escape.
 //
 // GoldHEN 2.3 and later answer syscall 500 ("SDK commands", the interface of

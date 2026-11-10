@@ -1,4 +1,7 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #include "boot_anim.h"
+#include "lockup.h"
 #include "thread_priority.h"
 #include "mono_clock.h"
 #include "app.h"
@@ -17,13 +20,10 @@
 #include "../vendor/ps3/source/ui/render/boot_seq.h"
 #include "../vendor/ps3/source/gfx/jfmark_hd_png.h"
 
-// The mark raster: 88 viewBox units across, of which the bell is 72.
-constexpr float MARK_SPAN_U=88,MARK_BELL_U=72;
+// The mark raster's geometry (MARK_SPAN_U, MARK_BELL_U) and the header's lockup: lockup.h.
 // The centred mark, as fractions of the screen height (PS3 boot_anim.cpp).
 constexpr float CENTRE_BELL_H=0.17f,CENTRE_Y_H=0.47f,HALO_RADIUS=1.55f,STATUS_GAP_H=0.045f;
 constexpr float SPARK_APEX_Y=-0.47f,SPARK_SIZE=0.38f;
-// Where the header draws the brand mark (ui_view.cpp header_chrome).
-constexpr float LOCKUP_X=48,LOCKUP_Y=12,LOCKUP_BOX=36;
 
 static bool on=false;
 static BootSeq seq;
@@ -41,9 +41,13 @@ static std::vector<Level> levels;
 
 static uint64_t now_us(){return mono_us();}
 static bool gate_on(){FILE* f=fopen(jf_data_path("bootanim.txt"),"r");if(!f)return true;int v=1;if(fscanf(f,"%d",&v)!=1)v=1;fclose(f);return v!=0;}
+// In the theme's colours, as the header's (lockup.cpp): the gold raster for
+// Golden Age, else the cool one, recoloured for a theme of its own.
 static bool load_mark(){
- int w,h,comp;unsigned char* img=stbi_load_from_memory(jfmark_hd_cool_png,(int)jfmark_hd_cool_png_len,&w,&h,&comp,4);
+ const MarkVariant v=mark_variant();int w,h,comp;
+ unsigned char* img=v==MARK_GOLD?stbi_load_from_memory(jfmark_hd_gold_png,(int)jfmark_hd_gold_png_len,&w,&h,&comp,4):stbi_load_from_memory(jfmark_hd_cool_png,(int)jfmark_hd_cool_png_len,&w,&h,&comp,4);
  if(!img)return false;if(w!=JFMARK_HD_MASTER||h!=JFMARK_HD_MASTER){stbi_image_free(img);return false;}
+ if(v==MARK_TINT)mark_tint(img,w*h);
  Level base{w,std::vector<uint32_t>((size_t)w*h)};
  for(int i=0;i<w*h;++i){uint32_t a=img[i*4+3];base.rgba[i]=(a<<24)|((img[i*4]*a/255)<<16)|((img[i*4+1]*a/255)<<8)|(img[i*4+2]*a/255);}
  stbi_image_free(img);levels.clear();levels.push_back(std::move(base));
@@ -121,10 +125,11 @@ static void layout(){
  const float bell0=CENTRE_BELL_H*HEIGHT,cx0=0.5f*WIDTH,cy0=CENTRE_Y_H*HEIGHT;pose_live=false;
  if(frame.done)return;
  if(!frame.xmb_visible){mark_cx=cx0;mark_cy=cy0;mark_bell=bell0*frame.mark_scale;return;}
- const float bell1=LOCKUP_BOX*MARK_BELL_U/MARK_SPAN_U;
+ // Docks onto the header's mark exactly: the same bell, the same centre.
+ const float bell1=(float)LOCKUP_BELL;
  mark_bell=boot_dock_size_px(bell0,bell1,frame.dock_size);
- boot_dock_point(cx0,cy0,LOCKUP_X+LOCKUP_BOX/2,LOCKUP_Y+LOCKUP_BOX/2,frame.dock_pos,&mark_cx,&mark_cy);
- pose_live=true;pose.show_mark=frame.dock_pos>=1&&frame.dock_size>=1;pose.slide_px=BOOT_WORD_SLIDE_EM*20;
+ boot_dock_point(cx0,cy0,LOCKUP_BELL_X+LOCKUP_BELL/2.0f,(float)LOCKUP_CY,frame.dock_pos,&mark_cx,&mark_cy);
+ pose_live=true;pose.show_mark=frame.dock_pos>=1&&frame.dock_size>=1;pose.slide_px=BOOT_WORD_SLIDE_EM*LOCKUP_WORD_PX;
  for(int i=0;i<8;++i){pose.word_reveal[i]=frame.word_reveal[i];pose.word_alpha[i]=frame.word_alpha[i];}
 }
 // Drawing time alone (not waiting for the display), for the mark over black

@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 // Downloads: see downloads.h. Files are written as <name>.part and renamed
 // when complete, so a half-downloaded file is never listed or played; the
 // item's JSON is written beside it last. A paused, stopped or interrupted

@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #include "auth.h"
 #include "mono_clock.h"
 #include "platform.h"
@@ -44,7 +46,7 @@ static bool server_screen(std::string& server, const std::function<void()>& offl
         for (int i = 0; i < 4; ++i) row(170 + i * 80, labels[i], i == selected);
         text(60, 515, TF("Example: %s", "http://192.168.1.100:8096"), g_theme.text_dim);
         text(60, 555, T("Keep any Jellyfin base path after the port, if your server uses one."), g_theme.text_dim);
-        hint_bar({{'D', "Select"}, {'X', "Edit / connect"}, {'O', "Done (in keyboard)"}});
+        hint_bar({{'|', "Select"}, {'X', "Edit / connect"}, {'O', "Done (in keyboard)"}});
         present();
         const auto b = pressed();
         if (b & ORBIS_PAD_BUTTON_UP) selected = (selected + 3) % 4;
@@ -72,7 +74,7 @@ static bool password_screen() {
         login_header("Username and password"); text(60, 116, g_server, g_theme.text_dim);
         const std::string labels[] = {TF("Username: %s", username.c_str()), TF("Password: %s", std::string(password.size(), '*').c_str()), "Sign in", "Back"};
         for (int i = 0; i < 4; ++i) row(170 + i * 85, labels[i], i == selected);
-        hint_bar({{'D', "Select"}, {'X', "Edit / sign in"}, {'C', "Sign-in choices"}});
+        hint_bar({{'|', "Select"}, {'X', "Edit / sign in"}, {'C', "Sign-in choices"}});
         present(); const auto b = pressed();
         if (b & ORBIS_PAD_BUTTON_UP) selected = (selected + 3) % 4;
         if (b & ORBIS_PAD_BUTTON_DOWN) selected = (selected + 1) % 4;
@@ -175,7 +177,7 @@ bool sign_in(const std::function<void()>& offline) {
             login_header("Sign in");
             row(195, std::string(T("Use the shared sign-in")) + " (" + shared + ")", selected == 0);
             row(300, "Sign in with my own account", selected == 1);
-            hint_bar({{'D', "Select"}, {'X', "Continue"}});
+            hint_bar({{'|', "Select"}, {'X', "Continue"}});
             present(); const auto b = pressed();
             if (b & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN)) selected = 1 - selected;
             if (b & ORBIS_PAD_BUTTON_CROSS) { release_buttons(); if (selected == 0 && share_use()) return true; break; }
@@ -193,7 +195,7 @@ bool sign_in(const std::function<void()>& offline) {
             row(195, "Quick Connect - approve this PS4 from another device", selected == 0);
             row(300, "Username and password", selected == 1);
             row(405, "Change server", selected == 2);
-            hint_bar({{'D', "Select"}, {'X', "Continue"}, {'S', "Password"}, {'C', "Change server"}});
+            hint_bar({{'|', "Select"}, {'X', "Continue"}, {'S', "Password"}, {'C', "Change server"}});
             present(); const auto b = pressed();
             if (b & ORBIS_PAD_BUTTON_UP) selected = (selected + 2) % 3;
             if (b & ORBIS_PAD_BUTTON_DOWN) selected = (selected + 1) % 3;

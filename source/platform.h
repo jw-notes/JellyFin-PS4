@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #pragma once
 #include <stdint.h>
 #include <string>
@@ -16,8 +18,11 @@ void rect(int x,int y,int w,int h,uint32_t color);
 // Straight alpha over the current frame (0 transparent .. 255 opaque).
 void blend_rect(int x,int y,int w,int h,uint32_t color,int alpha);
 int text_width(const std::string&,int size=24);
-enum class TextFace { Default, Classic, Poster };
+// Lockup: Archivo Expanded ExtraBold, for the "JELLYFIN" wordmark only (lockup.cpp).
+enum class TextFace { Default, Classic, Poster, Lockup };
 int face_text_width(const std::string&,int size,TextFace face);
+// Where face_text's ink is vertically centred, below its y: to centre a word on a line.
+int face_ink_middle(const std::string&,int size,TextFace face);
 void face_text(int x,int y,const std::string&,uint32_t color,int size,TextFace face,int maxwidth=1180);
 void text(int x,int y,const std::string&,uint32_t color,int size=24,int maxwidth=1180);
 void wrapped(int x,int y,const std::string&,uint32_t color,int lines=5);
@@ -62,6 +67,16 @@ double player_cache_seconds();
 void player_picture(int aspect,int w,int h,int x,int y);
 // The volume, 0..100.
 void player_volume(int volume);
+// A chapter: where it starts (ms into the film), its name, and the server's
+// picture of it (an image path; empty for a file's own chapters).
+struct PlayerChapter { uint64_t start=0; std::string name,image; };
+// The chapters the file itself carries (MKV, MP4), as the player reads them.
+std::vector<PlayerChapter> player_chapters();
+// The playback statistics panel's lines, as the player sees the stream now:
+// container, codecs, resolution, frame rates, dropped frames, bitrates, audio
+// in and out, subtitles, buffer, network speed and A/V sync.
+struct PlayerStatLine { std::string label,value; bool head=false; };
+std::vector<PlayerStatLine> player_stats();
 std::string player_error();
 void player_pause(bool);
 void player_seek(uint64_t ms);

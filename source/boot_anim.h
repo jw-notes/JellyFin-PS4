@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #pragma once
 // The PS3 cold-boot animation on the PS4's software renderer. The timeline is
 // the PS3's own vendor/ps3/source/ui/render/boot_seq.h, unchanged; this module

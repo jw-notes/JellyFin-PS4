@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #include "ui_view.h"
 #include "mono_clock.h"
 #include "platform.h"
@@ -11,6 +13,8 @@
 #include <unistd.h>
 #include "../vendor/ps3/source/ui/render/peek.h"
 #include "downloads.h"
+#include "trickplay.h"
+#include "lockup.h"
 #include "../vendor/ps3/source/ui/render/clock_fmt.h"
 #ifndef HOST_TEST
 #include <orbis/SystemService.h>
@@ -93,14 +97,9 @@ static void background(int y0,int y1){
 }
 static const char* const header_tabs[]={"Home","Search","Settings"};
 static void header_chrome(const std::string& tab,int focused_tab){
- if(const auto* pose=boot_header_pose()){
-  // The boot animation docks the mark here, then unfolds the word out of it.
-  if(pose->show_mark)draw_brand_mark(48,12,36);
-  const char* word="Jellyfin";int x=96;
-  for(int i=0;i<8;++i){std::string letter(1,word[i]);int a=(int)(255*std::max(0.0f,std::min(1.0f,pose->word_alpha[i])));if(a>0)face_text(x-(int)((1-pose->word_reveal[i])*pose->slide_px),17,letter,mix(g_theme.bg_top,g_theme.text,a),20,TextFace::Classic);x+=face_text_width(letter,20,TextFace::Classic);}
-  int a=(int)(255*std::max(0.0f,std::min(1.0f,pose->word_alpha[7])));if(a>0){face_text(x,17," [PS]",mix(g_theme.bg_top,g_theme.text,a),20,TextFace::Classic);face_text(240,20,"PS4",mix(g_theme.bg_top,g_theme.accent,a),15,TextFace::Classic);}
- }
- else{draw_brand_mark(48,12,36);face_text(96,17,"Jellyfin [PS]",g_theme.text,20,TextFace::Classic);face_text(240,20,"PS4",g_theme.accent,15,TextFace::Classic);}
+ // The PS3's lockup: the mark and "JELLYFIN" in the theme's colours (lockup.cpp).
+ // The boot animation docks the mark here, then unfolds the word out of it.
+ draw_lockup(boot_header_pose());
  // Right of the tabs, as on the PS3: the date, the clock and who is signed in.
  {const int d=34,ax=WIDTH-48-d,ay=14;int right=WIDTH-48;
   if(g_userid[0]&&!boot_header_pose()){
@@ -182,8 +181,8 @@ void draw_library(const Page& page,const std::string& title,int start,int select
  if(!home&&jump&&jump->show){int current=jump->active?jump->sel:!jump->filter.empty()?jump_entry(jump->filter=="#"?"":jump->filter):page.items.empty()?1:jump_entry(page.items[std::min(selected,(int)page.items.size()-1)].base.name);draw_jump_bar(*jump,std::max(8,g.x0-46),top,640,current);}
  if(home&&!page.items.empty()){const auto& item=page.items[selected];text(48,430,fit_text(item.base.name,1130,32),g_theme.text,32);paragraph(48,478,item.overview.empty()?(is_container(item.base.type)?T("Open this library to browse your media."):T("Open for details, versions and playback options.")):item.overview,1150,4,g_theme.text_dim);}
  if(!home&&page.total>visible){int bar_h=(g.rows-1)*g.stride+g.card_h,thumb=std::max(24,bar_h*visible/page.total),offset=(bar_h-thumb)*(start+first)/std::max(1,page.total-visible);rect(g.x0+g.grid_w+14,top,3,bar_h,g_theme.track);rect(g.x0+g.grid_w+14,top+std::min(bar_h-thumb,offset),3,thumb,g_theme.accent);}
- if(jump&&jump->active)hint_bar({{'D',"Letter"},{'X',"Jump"},{'C',"Cancel"}});
- else if(focused_tab>=0)hint_bar({{'D',"Nav"},{'X',"Select"},{'C',"Back"}});
+ if(jump&&jump->active)hint_bar({{'|',"Letter"},{'X',"Jump"},{'C',"Cancel"}});
+ else if(focused_tab>=0)hint_bar({{'-',"Tabs"},{'X',"Select"},{'C',"Back"}});
  else if(jump&&jump->show)hint_bar({{'D',"Nav"},{'X',"Open"},{'T',"Details"},{'O',"Download"},{'C',jump->filter.empty()?"Back":"Clear letter"},{'l',""},{'r',"Tabs"}});
  else hint_bar({{'D',"Nav"},{'X',"Open"},{'T',"Details"},{'O',"Download"},{'C',"Back"},{'l',""},{'r',"Tabs"}});
  if(jump&&jump->show&&!jump->active){const char* label="Left at first column: A-Z";int x=WIDTH-64-hints_width({{'<',label}});draw_hints(x,674,{{'<',label}});}
@@ -270,7 +269,7 @@ void draw_home(const HomeView& home,int header_focus){
  // Content scrolls under the header: repaint the band it passes beneath.
  background(0,HOME_CLIP);header_chrome("Home",header_focus);
  if(home.rows.empty())face_text(HOME_X0,HOME_TOP+36,home.loaded?T("Nothing to show yet. Add a library on your Jellyfin server."):T("Loading..."),g_theme.text_dim,18,TextFace::Classic);
- if(header_focus>=0)hint_bar({{'D',"Nav"},{'X',"Select"},{'l',""},{'r',"Tabs"}});
+ if(header_focus>=0)hint_bar({{'-',"Tabs"},{'X',"Select"}});
  else if(home.focus>=0&&home.focus<(int)home.rows.size()&&home.rows[home.focus].shape==SHAPE_LIBRARY)hint_bar({{'D',"Nav"},{'X',"Open"},{'S',"Favourites"},{'l',""},{'r',"Tabs"}});
  else hint_bar({{'D',"Nav"},{'X',"Open"},{'T',"Details"},{'S',"Favourites"},{'l',""},{'r',"Tabs"}});
 }
@@ -343,7 +342,7 @@ void draw_search_page(const SearchView& view){
     if(item.year)face_text(tx,by+104,std::to_string(item.year),g_theme.text_dim,13,TextFace::Classic);}
    if(!item.overview.empty())paragraph(bx+12,by+14+ph+12,item.overview,bw-24,std::max(1,(bh-ph-40)/19),g_theme.text_dim,14,19);}}
  if(view.keys)hint_bar({{'X',"Type"},{'S',"Delete"},{'T',"Caps"},{'L',""},{'R',"Cursor"},{'O',"Results"},{'C',typed?"Clear":"Back"},{'l',""},{'r',"Tabs"}});
- else if(recent)hint_bar({{'D',"Select"},{'X',"Search"},{'S',"Remove"},{'C',"Keyboard"},{'l',""},{'r',"Tabs"}});
+ else if(recent)hint_bar({{'|',"Select"},{'X',"Search"},{'S',"Remove"},{'C',"Keyboard"},{'l',""},{'r',"Tabs"}});
  else hint_bar({{'X',"Open"},{'T',"Details"},{'L',""},{'R',"Filter"},{'C',"Keyboard"},{'l',""},{'r',"Tabs"}});
 }
 
@@ -508,6 +507,59 @@ void draw_detail(const Item& item,const DetailView& view){
 // ---- player OSD ------------------------------------------------------------------
 // The player's track menu (PS3 Triangle): Audio and Subtitles as two tabs,
 // one list shown, the track playing marked and the highlighted one lit.
+// Options while watching (the PS4's own player has one): a short list at the
+// right, each entry with what it is set to now.
+void draw_options_menu(const PlayerOsd& osd){
+ constexpr int MX=812,MY=96,MW=420,ROW=44;
+ const int n=(int)osd.options.size(),mh=72+n*ROW+44;
+ round_rect(MX,MY,MW,mh,12,0x0A0C18,235,g_theme.hairline,160);
+ face_text(MX+24,MY+18,T("Options"),g_theme.white,18,TextFace::Classic);rect(MX+24,MY+44,face_text_width(T("Options"),18,TextFace::Classic),3,g_theme.accent);
+ for(int i=0;i<n;++i){const int y=MY+64+i*ROW;const bool lit=i==osd.options_sel;
+  if(lit)rect(MX+12,y-6,MW-24,ROW-4,g_theme.panel_hi);if(lit)rect(MX+12,y-6,4,ROW-4,g_theme.accent);
+  face_text(MX+30,y+3,T(osd.options[i].first.c_str()),lit?g_theme.white:g_theme.text,18,TextFace::Classic);
+  const std::string& v=osd.options[i].second;
+  if(!v.empty()){const std::string shown=fit_face(v,170,15,TextFace::Classic);face_text(MX+MW-30-face_text_width(shown,15,TextFace::Classic),y+6,shown,lit?g_theme.accent_alt:g_theme.text_dim,15,TextFace::Classic);}}
+ draw_hints(MX+20,MY+mh-34,{{'|',"Select"},{'X',"Open"},{'C',"Close"}},16);
+}
+int chapter_at(const std::vector<PlayerChapter>& chapters,uint64_t ms){
+ int at=-1;for(size_t i=0;i<chapters.size();++i){if(chapters[i].start<=ms)at=(int)i;else break;}return at;
+}
+// The Chapters menu (Options): the list on the left, the highlighted chapter's
+// picture on the right -- the server's chapter image, else a frame from the
+// file (trickplay.h) -- with its name and time under it. X goes there.
+void draw_chapter_menu(const PlayerOsd& osd){
+ constexpr int MX=430,MY=80,MW=802,ROW=36,LW=440,PW=304,PH=171;
+ const int n=(int)osd.chapters.size(),rows=std::min(n,10),mh=std::max(72+rows*ROW+44,72+PH+90);
+ round_rect(MX,MY,MW,mh,12,0x0A0C18,235,g_theme.hairline,160);
+ face_text(MX+24,MY+18,T("Chapters"),g_theme.white,18,TextFace::Classic);rect(MX+24,MY+44,face_text_width(T("Chapters"),18,TextFace::Classic),3,g_theme.accent);
+ const std::string count=TF("%d of %d",osd.chapter_sel+1,n);face_text(MX+LW-face_text_width(count,14,TextFace::Classic)-8,MY+22,count,g_theme.text_dim,14,TextFace::Classic);
+ const int top=std::max(0,std::min(n-rows,osd.chapter_sel-rows/2));
+ auto name_of=[&](int i){return osd.chapters[i].name.empty()?TF("Chapter %d",i+1):osd.chapters[i].name;};
+ for(int i=top;i<top+rows;++i){const int y=MY+64+(i-top)*ROW;const bool lit=i==osd.chapter_sel,playing=i==osd.chapter_now;
+  if(lit)rect(MX+12,y-4,LW-12,ROW-2,g_theme.panel_hi);if(playing)rect(MX+12,y-4,4,ROW-2,g_theme.accent);
+  const std::string num=std::to_string(i+1),time=clock_text(osd.chapters[i].start);
+  face_text(MX+30,y+3,num,g_theme.text_dim,15,TextFace::Classic);
+  const int tw=face_text_width(time,15,TextFace::Classic);face_text(MX+LW-tw-8,y+3,time,g_theme.text_dim,15,TextFace::Classic);
+  face_text(MX+66,y+2,fit_face(name_of(i),LW-66-tw-24,17,TextFace::Classic),lit||playing?g_theme.white:g_theme.text_dim,17,TextFace::Classic);}
+ // The picture of the highlighted chapter.
+ const int sel=std::max(0,std::min(n-1,osd.chapter_sel));const int PX=MX+LW+(MW-LW-PW)/2,PY=MY+64;
+ rect(PX,PY,PW,PH,0x05060C);
+ bool shown=false;const PlayerChapter& c=osd.chapters[sel];
+ if(!c.image.empty()){const std::string key="chapter:"+osd.item_id+":"+std::to_string(sel);
+  if(art_state(key)==0)load_image(key,c.image);if(art_state(key)>0)shown=draw_art_cover(key,PX,PY,PW,PH);}
+ if(!shown){static std::vector<uint32_t> thumb;int tw=0,th=0;
+  // Nudged past the chapter's first frame, which is often black.
+  if(trickplay_thumb(c.start+2000,thumb,tw,th)&&tw>0&&th>0){
+   // Scaled to the frame, nearest-neighbour: a 224 px thumbnail at 304.
+   const int dh=std::min(PH,PW*th/tw),dy=PY+(PH-dh)/2;uint32_t* fb=framebuffer();
+   for(int y=0;y<dh;++y){const uint32_t* srow=thumb.data()+(size_t)(y*th/dh)*tw;uint32_t* drow=fb+(dy+y)*WIDTH+PX;for(int x=0;x<PW;++x)drow[x]=srow[x*tw/PW];}
+   shown=true;}}
+ if(!shown)draw_brand_mark(PX+(PW-64)/2,PY+(PH-64)/2,64);
+ outline(PX,PY,PW,PH,g_theme.hairline,1);
+ face_text(PX,PY+PH+14,fit_face(name_of(sel),PW,18,TextFace::Classic),g_theme.white,18,TextFace::Classic);
+ face_text(PX,PY+PH+40,clock_text(c.start),g_theme.accent_alt,15,TextFace::Classic);
+ draw_hints(MX+20,MY+mh-34,{{'|',"Select"},{'X',"Play from here"},{'C',"Back"}},16);
+}
 void draw_track_menu(const PlayerOsd& osd){
  constexpr int MX=740,MY=96,MW=492,ROW=36;
  const auto& names=osd.tracks_sub?osd.sub_names:osd.audio_names;const int now=osd.tracks_sub?osd.sub_now:osd.audio_now,sel=osd.tracks_sub?osd.sub_sel:osd.audio_sel;
@@ -520,7 +572,8 @@ void draw_track_menu(const PlayerOsd& osd){
  for(int i=top;i<top+rows;++i){const int y=MY+64+(i-top)*ROW;const bool lit=i==sel,playing=i==now;
   if(lit)rect(MX+12,y-4,MW-24,ROW-2,g_theme.panel_hi);if(playing)rect(MX+12,y-4,4,ROW-2,g_theme.accent);
   face_text(MX+30,y+2,fit_face(names[i],MW-60,17,TextFace::Classic),lit||playing?g_theme.white:g_theme.text_dim,17,TextFace::Classic);}
- draw_hints(MX+20,MY+mh-34,{{'|',"Select"},{'X',"Play"},{'T',osd.tracks_sub?"Audio":"Subtitles"},{'C',"Close"}},16);
+ // Left / Right (or Triangle) switch between the audio and subtitle lists.
+ draw_hints(MX+20,MY+mh-34,{{'|',"Select"},{'-',osd.tracks_sub?"Audio":"Subtitles"},{'X',"Play"},{'C',"Close"}},16);
 }
 void draw_player_osd(const PlayerOsd& osd){
  // Bottom scrim: transparent at y=459 to black 0.90 at 62% of its height.
@@ -574,31 +627,46 @@ void draw_player_osd(const PlayerOsd& osd){
  const uint64_t shown=osd.scrubbing?osd.target:osd.position;int fill=0;
  if(!osd.live&&osd.duration)fill=(int)(pw*std::min(1.0,(double)shown/osd.duration));
  if(fill>0)round_rect(px,py,fill,ph,3,g_theme.accent,255);
+ // Chapters: a small gap in the bar where each one starts (not the first, at 0).
+ if(!osd.live&&osd.duration)for(const auto& c:osd.chapters)if(c.start>0&&c.start<osd.duration){const int cx=px+(int)((double)pw*c.start/osd.duration);blend_rect(cx-1,py,2,ph,0x0A0C18,230);}
  // Focused: the knob on the playhead in a soft accent halo (Left / Right scrub).
  if(osd.control==OSD_SCRUB&&!osd.live&&!osd.scrubbing){circle(px+fill,py+ph/2,13,g_theme.accent,70);circle(px+fill,py+ph/2,7,g_theme.white,255);}
- if(osd.scrubbing&&!osd.live){circle(px+fill,py+ph/2,7,g_theme.white,255);std::string at=clock_text(osd.target);int w=face_text_width(at,16,TextFace::Classic)+20,lx=std::max(px,std::min(px+pw-w,px+fill-w/2));round_rect(lx,py-38,w,26,6,0x0A0C18,210,g_theme.accent_alt,200);face_text(lx+10,py-34,at,g_theme.white,16,TextFace::Classic);}
+ // Seek preview (trickplay): the frame at the target, above its time, while scrubbing.
+ if(osd.scrubbing&&!osd.live){static std::vector<uint32_t> thumb;int tw=0,th=0;
+  if(trickplay_thumb(osd.target,thumb,tw,th)){
+   const int tx=std::max(px,std::min(px+pw-tw,px+fill-tw/2)),ty=py-46-th;
+   round_rect(tx-4,ty-4,tw+8,th+8,8,0x0A0C18,230,g_theme.accent_alt,220);
+   uint32_t* fb=framebuffer();
+   for(int y=0;y<th;++y){const int sy=ty+y;if(sy<0||sy>=HEIGHT)continue;memcpy(fb+sy*WIDTH+tx,thumb.data()+(size_t)y*tw,(size_t)tw*4);}}}
+ if(osd.scrubbing&&!osd.live){circle(px+fill,py+ph/2,7,g_theme.white,255);std::string at=clock_text(osd.target);
+  // Beside the time, the chapter the target is in.
+  {const int k=chapter_at(osd.chapters,osd.target);if(k>=0){std::string name=osd.chapters[k].name.empty()?TF("Chapter %d",k+1):osd.chapters[k].name;at+="  \xC2\xB7  "+fit_face(name,320,16,TextFace::Classic);}}int w=face_text_width(at,16,TextFace::Classic)+20,lx=std::max(px,std::min(px+pw-w,px+fill-w/2));round_rect(lx,py-38,w,26,6,0x0A0C18,210,g_theme.accent_alt,200);face_text(lx+10,py-34,at,g_theme.white,16,TextFace::Classic);}
  if(osd.live){int w=face_text_width(T("LIVE"),12,TextFace::Classic)+16;round_rect(px,644,w,18,9,0xD8344A,235);face_text(px+8,646,T("LIVE"),g_theme.white,12,TextFace::Classic);}
  else{face_text(px,644,clock_text(shown),0xE0E0E0,15,TextFace::Classic);if(osd.duration){const uint64_t left=osd.duration>shown?osd.duration-shown:0;std::string rem="-"+clock_text(left),end=ends_at(left);const int rw=face_text_width(rem,15,TextFace::Classic);face_text(px+pw-rw,644,rem,0xE0E0E0,15,TextFace::Classic);face_text(px+pw-rw-20-face_text_width(end,15,TextFace::Classic),644,end,0x9A9EB4,15,TextFace::Classic);}}
  // Hints: what X does, seeking, stop and hide.
  // X does what the focused control does; Left / Right move the focus, or
  // scrub when the bar itself is focused.
  const char* scrub_hint=osd.control==OSD_SCRUB?"Scrub":"Select";
+ // With chapters, L2 / R2 step through them. Options: the menu (Chapters,
+ // Audio / Subtitles, Picture, Playback Statistics).
+ const bool has_chapters=!osd.chapters.empty();
+ const char* skip=has_chapters?"Chapter":"Skip 5 min";const char chap='O';const char* chap_label="Options";
  const char* act=osd.control==OSD_VOLUME?"Volume":osd.control==OSD_PICTURE?"Picture":osd.paused?"Play":"Pause";
  if(osd.volume_active&&!osd.live)draw_hints(57,680,{{'|',"Volume"},{'C',"Done"}});
  else if(osd.live){
   if(!osd.up_next.empty()){const std::string next=std::string(T("NEXT CHANNEL"))+"  ";const std::string name=fit_face(osd.up_next,360,15,TextFace::Classic);const int w=face_text_width(next,12,TextFace::Classic),nw=face_text_width(name,15,TextFace::Classic);
    face_text(1223-nw-w,662,next,g_theme.accent_alt,12,TextFace::Classic);face_text(1223-nw,659,name,0xE0E0E0,15,TextFace::Classic);}
   // Nothing to pause or seek: Up / Down are the volume, X opens Picture.
-  if(osd.has_prev||osd.has_next)draw_hints(57,680,{{'D',"Volume"},{'X',"Picture"},{'l',""},{'r',"Channel"},{'C',"Stop"},{'S',"Hide"}});
-  else draw_hints(57,680,{{'D',"Volume"},{'X',"Picture"},{'C',"Stop"},{'S',"Hide"}});}
+  if(osd.has_prev||osd.has_next)draw_hints(57,680,{{'|',"Volume"},{'X',"Picture"},{'l',""},{'r',"Channel"},{'O',"Options"},{'C',"Stop"},{'S',"Hide"}});
+  else draw_hints(57,680,{{'|',"Volume"},{'X',"Picture"},{'O',"Options"},{'C',"Stop"},{'S',"Hide"}});}
  // A series: L1 / R1 are the previous and next episodes.
  else if(osd.has_prev||osd.has_next){
   if(!osd.up_next.empty()){const std::string next=std::string(T("UP NEXT"))+"  ";const int w=face_text_width(next,12,TextFace::Classic),nw=face_text_width(fit_face(osd.up_next,360,15,TextFace::Classic),15,TextFace::Classic);
    face_text(1223-nw-w,662,next,g_theme.accent_alt,12,TextFace::Classic);face_text(1223-nw,659,fit_face(osd.up_next,360,15,TextFace::Classic),0xE0E0E0,15,TextFace::Classic);}
-  if(osd.has_prev&&osd.has_next)draw_hints(57,680,{{'X',act},{'-',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'l',""},{'r',"Episode"},{'T',"Tracks"},{'C',"Stop"}});
-  else if(osd.has_next)draw_hints(57,680,{{'X',act},{'-',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'r',"Next episode"},{'T',"Tracks"},{'C',"Stop"}});
-  else draw_hints(57,680,{{'X',act},{'-',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'l',"Previous episode"},{'T',"Tracks"},{'C',"Stop"}});}
- else draw_hints(57,680,{{'X',act},{'-',scrub_hint},{'L',""},{'R',"Skip 5 min"},{'T',"Audio / Subtitles"},{'C',"Stop"},{'S',"Hide"}});
+  if(osd.has_prev&&osd.has_next)draw_hints(57,680,{{'X',act},{'-',scrub_hint},{'L',""},{'R',skip},{'l',""},{'r',"Episode"},{'T',"Tracks"},{chap,chap_label},{'C',"Stop"}});
+  else if(osd.has_next)draw_hints(57,680,{{'X',act},{'-',scrub_hint},{'L',""},{'R',skip},{'r',"Next episode"},{'T',"Tracks"},{chap,chap_label},{'C',"Stop"}});
+  else draw_hints(57,680,{{'X',act},{'-',scrub_hint},{'L',""},{'R',skip},{'l',"Previous episode"},{'T',"Tracks"},{chap,chap_label},{'C',"Stop"}});}
+ else draw_hints(57,680,{{'X',act},{'-',scrub_hint},{'L',""},{'R',skip},{'T',"Audio / Subtitles"},{chap,chap_label},{'C',"Stop"},{'S',"Hide"}});
 }
 void draw_skip_button(const std::string& label,bool button){
  // Above the bar's chips, so it reads with the bar up or away.
@@ -613,6 +681,23 @@ void draw_picture_banner(const std::string& state,bool moving){
  face_text(X+(W-face_text_width(state,19,TextFace::Classic))/2,Y+18,state,g_theme.white,19,TextFace::Classic);
  const int hw=hints_width({{'D',moving?"Move":"Size"},{'r',moving?"Size":"Move"},{'S',"Fit / Fill / Stretch"},{'T',"Hold: Reset"},{'C',"Done"}});
  draw_hints(X+(W-hw)/2,Y+58,{{'D',moving?"Move":"Size"},{'r',moving?"Size":"Move"},{'S',"Fit / Fill / Stretch"},{'T',"Hold: Reset"},{'C',"Done"}});
+}
+// Playback statistics (R3). Copyright (C) 2026 jw-notes, GPL-3.0-or-later.
+void draw_stats_panel(const std::vector<PlayerStatLine>& lines){
+ constexpr int X=32,Y=32,W=560,ROW=23,HEAD=29,LABEL=150,PAD=18;
+ int h=PAD+30;for(const auto& l:lines)h+=l.head?HEAD:ROW;h+=PAD+26;
+ round_rect(X,Y,W,h,12,0x0A0C18,200,g_theme.white,40);
+ int y=Y+PAD;
+ face_text(X+PAD,y,T("Playback Statistics"),g_theme.white,18,TextFace::Classic);
+ const std::string hide=T("R3: Hide");face_text(X+W-PAD-face_text_width(hide,14,TextFace::Classic),y+3,hide,g_theme.text_dim,14,TextFace::Classic);
+ y+=30;
+ for(const auto& l:lines){
+  if(l.head){y+=6;face_text(X+PAD,y,T(l.label.c_str()),g_theme.accent,15,TextFace::Classic);y+=HEAD-6;continue;}
+  face_text(X+PAD,y,T(l.label.c_str()),g_theme.text_dim,15,TextFace::Classic);
+  face_text(X+PAD+LABEL,y,l.value,g_theme.white,15,TextFace::Classic,W-2*PAD-LABEL);
+  y+=ROW;}
+ y+=PAD-6;rect(X+PAD,y,W-2*PAD,1,g_theme.hairline);
+ face_text(X+PAD,y+8,"Jellyfin [PS] for PS4 - Copyright (C) 2026 jw-notes - github.com/jw-notes",g_theme.text_dim,13,TextFace::Classic,W-2*PAD);
 }
 void draw_volume_banner(int volume){
  constexpr int W=520,H=80,X=(WIDTH-W)/2,Y=40,BX=X+40,BW=W-80;
@@ -747,8 +832,9 @@ void draw_music_screen(const PlayerOsd& osd,const float* bands,int count,const f
    face_text(QX+28,y+2,std::to_string(i+1),now?g_theme.accent_alt:g_theme.text_faint,15,TextFace::Classic);
    face_text(QX+72,y,fit_face(osd.queue_names[i],QW-100,18,TextFace::Classic),sel||now?g_theme.white:g_theme.text_dim,18,TextFace::Classic);}
   draw_hints(57,680,{{'|',"Select"},{'X',"Play"},{'C',"Close"}});return;}
- if(osd.tracks>1)draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'D',"Seek / Volume"},{'l',""},{'r',"Track"},{'T',osd.shuffle?"Shuffle off":"Shuffle"},{'O',"Queue"},{'S',"Visualizer"},{'C',"Stop"}});
- else draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'D',"Seek / Volume"},{'L',""},{'R',"Skip 5 min"},{'S',"Visualizer"},{'C',"Stop"}});
+ // Left / Right seek, Up / Down set the volume: each lit on its own.
+ if(osd.tracks>1)draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'-',"Seek"},{'|',"Volume"},{'l',""},{'r',"Track"},{'T',osd.shuffle?"Shuffle off":"Shuffle"},{'O',"Queue"},{'S',"Visualizer"},{'C',"Stop"}});
+ else draw_hints(57,680,{{'X',osd.paused?"Play":"Pause"},{'-',"Seek"},{'|',"Volume"},{'L',""},{'R',"Skip 5 min"},{'S',"Visualizer"},{'C',"Stop"}});
 }
 
 // ---- downloads ----------------------------------------------------------------
@@ -856,7 +942,7 @@ void draw_settings_rows(const SettingsCategoryView& category,const std::vector<S
  const SettingsRowView* sel=selected>=0&&selected<(int)rows.size()?&rows[selected]:nullptr;
  if(sel&&sel->reorder&&sel->held)hint_bar({{'|',"Move"},{'X',"Put down"},{'C',"Done"}});
  else if(sel&&sel->reorder)hint_bar({{'|',"Select"},{'X',"Move"},{'T',"Default order"},{'C',"Done"}});
- else if(action)hint_bar({{'|',"Select"},{'X',"Open"},{'C',"Back"}});else hint_bar({{'D',"Select / change"},{'X',"Change"},{'C',"Back"}});
+ else if(action)hint_bar({{'|',"Select"},{'X',"Open"},{'C',"Back"}});else hint_bar({{'|',"Select"},{'-',""},{'X',"Change"},{'C',"Back"}});
 }
 void draw_confirm(const std::string& question,const std::string& detail,const char* yes){
  blend_rect(0,0,WIDTH,HEIGHT,0,150);constexpr int W=560,H=150,X=(WIDTH-W)/2,Y=250;
@@ -884,9 +970,25 @@ enum AboutKind { A_HEAD, A_VER, A_ITEM, A_NAME, A_TEXT, A_GAP };
 struct AboutLine { AboutKind kind; const char* a; const char* b; };
 // Updates: the PS4 releases, newest first. Add each new release at the top.
 const AboutLine about_updates[]={
+ {A_VER,"1.16",nullptr},
+ {A_ITEM,"Subtitles in Chinese, Japanese, Korean, Hebrew, Arabic and Persian.",nullptr},
+ {A_ITEM,"Greek and Russian subtitles show in Noto Sans and Roboto Condensed too.",nullptr},
+ {A_ITEM,"Seek previews while scrubbing, from the server, a USB drive or a download.",nullptr},
+ {A_ITEM,"Playback statistics: R3 while playing, or Settings > Playback.",nullptr},
+ {A_ITEM,"Your sign-in is saved encrypted, sealed to this console.",nullptr},
+ {A_ITEM,"The JELLYFIN lockup as on the PS3, in your theme's colours.",nullptr},
+ {A_ITEM,"Chapters: L2 / R2 jump between them; Options lists them with pictures.",nullptr},
+ {A_ITEM,"Options while watching: chapters, tracks, picture, episodes, skipping.",nullptr},
  {A_VER,"1.15",nullptr},
  {A_ITEM,"Copyright and credits: github.com/jw-notes, and every author listed.",nullptr},
  {A_VER,"1.14",nullptr},
+ {A_ITEM,"Subtitles drawn by the console: SubRip, WebVTT, ASS and PGS.",nullptr},
+ {A_ITEM,"Settings > Subtitles: three fonts and three colours.",nullptr},
+ {A_ITEM,"Subtitle files beside a video on USB; switch tracks while playing.",nullptr},
+ {A_ITEM,"Dolby Digital (Plus) as loud as AAC; the chosen audio track plays.",nullptr},
+ {A_ITEM,"USB drives and downloads through GoldHEN's FTP on more consoles.",nullptr},
+ {A_ITEM,"Fixes: USB scrub bar, .mov files, burned-in PGS subtitles.",nullptr},
+ {A_VER,"1.13",nullptr},
  {A_ITEM,"Music tabs (Albums, Artists, Playlists, Genres, Songs), shuffle and the queue.",nullptr},
  {A_ITEM,"Live search as on the PS3; audio and subtitles while watching.",nullptr},
  {A_ITEM,"Downloads and USB drives, played without the server.",nullptr},
@@ -946,8 +1048,8 @@ const AboutLine about_credits[]={
  {A_TEXT,"github.com/jw-notes/JellyFin-PS4",nullptr},
  {A_TEXT,"Copyright (C) 2026 jw-notes.",nullptr},
  {A_GAP,nullptr,nullptr},
- {A_TEXT,"Interface translations from Jellyfin [PS] for PS3, by jw-notes.",nullptr},
- {A_TEXT,"Playback built on Switchfin's PS4 port by dragonflylee.",nullptr},
+ {A_TEXT,"Interface translations from Jellyfin [PS] for PS3, also by jw-notes:",nullptr},
+ {A_TEXT,"github.com/jw-notes/JellyFin-PS3",nullptr},
  {A_TEXT,"Every other author is credited under Licences.",nullptr},
 };
 const AboutLine about_licences[]={
@@ -962,7 +1064,6 @@ const AboutLine about_licences[]={
  {A_HEAD,"Open-source software",nullptr},
  {A_NAME,"MPV","GPL 2+"},
  {A_NAME,"FFmpeg","LGPL / GPL 3"},
- {A_NAME,"Switchfin PS4 integration","Apache 2.0"},
  {A_NAME,"SDL2, zlib, bzip2","zlib / BSD-style"},
  {A_NAME,"mbedTLS","Apache 2.0"},
  {A_NAME,"dav1d","BSD 2-Clause"},
@@ -974,6 +1075,7 @@ const AboutLine about_licences[]={
  {A_GAP,nullptr,nullptr},
  {A_HEAD,"Fonts and art",nullptr},
  {A_NAME,"Noto Sans, Noto Sans JP","SIL OFL 1.1"},
+ {A_NAME,"Noto Sans SC, KR, Hebrew, Arabic","SIL OFL 1.1"},
  {A_NAME,"Open Sans, Roboto Condensed","Apache 2.0"},
  {A_NAME,"Satoshi","ITF Free Font License"},
  {A_NAME,"PlayStation button sprites (Kenney)","CC0"},

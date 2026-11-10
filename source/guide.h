@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #pragma once
 // The Live TV guide, downloaded to the PS4 (Settings › Live TV): an XMLTV file
 // from the address the viewer gave, else the one the playlist names

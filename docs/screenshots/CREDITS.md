@@ -14,6 +14,9 @@ The films, shows and music in the screenshots are real works whose artwork is fr
 | e1 | NBC Television | Public domain | [Bonanza main cast 1959.JPG](https://commons.wikimedia.org/wiki/File:Bonanza_main_cast_1959.JPG) |
 | e2 | CBS Television | Public domain | [Buddy Ebsen and Irene Ryan Beverly Hillbillies (1969 CBS press photo).jpg](https://commons.wikimedia.org/wiki/File:Buddy_Ebsen_and_Irene_Ryan_Beverly_Hillbillies_(1969_CBS_press_photo).jpg) |
 | e3 | CBS Television In the 1950s and 1960s, it was not unusual for television networks, studios and program sponsors to use e | Public domain | [Lucille Ball Vivian Vance The Lucy Show 1962.JPG](https://commons.wikimedia.org/wiki/File:Lucille_Ball_Vivian_Vance_The_Lucy_Show_1962.JPG) |
+| e7 | Rogers &amp; Cowan (publicity agency), Beverly Hills. | Public domain | [Dick Van Dyke Show main cast photo.jpg](https://commons.wikimedia.org/wiki/File:Dick_Van_Dyke_Show_main_cast_photo.jpg) |
+| e8 | CBS Television | Public domain | [Bob Denver Gilligans Island 1965.jpg](https://commons.wikimedia.org/wiki/File:Bob_Denver_Gilligans_Island_1965.jpg) |
+| e9 | Rogers, Cowan &amp; Brenner (publicity agency). It was not uncommon in the 1950s and 1960s for publicity and advertising | Public domain | [Andy Griffith Don Knots Margaret Teale Andy Griffith Show 1967.JPG](https://commons.wikimedia.org/wiki/File:Andy_Griffith_Don_Knots_Margaret_Teale_Andy_Griffith_Show_1967.JPG) |
 | f1 | "Copyright © 1963 by Universal Pictures Co., Inc." | Public domain | [Charade (1963 poster).jpg](https://commons.wikimedia.org/wiki/File:Charade_(1963_poster).jpg) |
 | f10 | Francesco Siddi | CC BY 4.0 | [Elephants Dream - Final Poster Source.png](https://commons.wikimedia.org/wiki/File:Elephants_Dream_-_Final_Poster_Source.png) |
 | f11 | Blender Foundation | CC BY 3.0 | [Cosmos Laundromat Victor Poster.jpg](https://commons.wikimedia.org/wiki/File:Cosmos_Laundromat_Victor_Poster.jpg) |

@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 // Runtime theming — see theme.h.
 //
 // Phase 1 of the XMB revamp.  The palette used to be a block of #defines in

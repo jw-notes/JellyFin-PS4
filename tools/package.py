@@ -1,3 +1,5 @@
+# JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+# GPL-3.0-or-later, with the attribution terms in NOTICE.
 from pathlib import Path
 import subprocess, shutil, os, re, struct, zlib, json
 p=Path(__file__).resolve().parent.parent
@@ -17,6 +19,8 @@ shutil.copyfile(p/'assets/icon0.png',pkg/'sce_sys/icon0.png')
 (pkg/'assets').mkdir(exist_ok=True)
 shutil.copyfile(p/'assets/jellyfin-mark.png',pkg/'assets/jellyfin-mark.png')
 shutil.copytree(p/'assets/prompts',pkg/'assets/prompts',dirs_exist_ok=True)
+# Subtitle fallback fonts and their licences (tools/make_subtitle_fallbacks.py).
+shutil.copytree(p/'assets/subtitle-fonts',pkg/'assets/subtitle-fonts',dirs_exist_ok=True)
 
 (pkg/'sce_sys/about').mkdir(exist_ok=True)
 (pkg/'sce_module').mkdir(exist_ok=True)

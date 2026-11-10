@@ -1,4 +1,9 @@
-// Uses the PS4 MPV/FFmpeg build from dragonflylee/switchfin's ps4 branch.
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
+// Uses the PS4 MPV/FFmpeg libraries from the PacBrew port packages (tools/ps4-portlibs-107).
+#ifndef JF_BUILD_VERSION
+#define JF_BUILD_VERSION "host"
+#endif
 // The application UI and Jellyfin session/negotiation code remain shared.
 #include "app.h"
 #include "platform.h"
@@ -135,6 +140,25 @@ static std::string subtitle_fonts_dir(){
  for(const auto& face:faces){const std::string path=dir+"/"+face.name;if(local_file_size(path)==face.size)continue;
   const std::string part=path+".part";FILE* out=fopen(part.c_str(),"wb");bool wrote=out&&fwrite(face.data,1,face.size,out)==face.size;if(out&&fclose(out)!=0)wrote=false;
   if(wrote&&rename(part.c_str(),path.c_str())==0){plog(("Subtitles: wrote "+path).c_str());continue;}
+  remove(part.c_str());all=false;plog(("Subtitles: could not write "+path).c_str());}
+ // Fallbacks for what the faces lack (Greek and Cyrillic for the Latin-only
+ // faces, CJK, Hangul, Hebrew, Arabic), shipped in the package. Each carries
+ // the faces' family names, which is how libass finds it for a missing glyph
+ // (tools/make_subtitle_fallbacks.py).
+#ifdef HOST_TEST
+ const std::string shipped="assets/subtitle-fonts";
+#else
+ const std::string shipped="/app0/assets/subtitle-fonts";
+#endif
+ for(const char* name:{"JFSub-Extra.ttf","JFSub-CJK.otf","JFSub-Hangul.otf","JFSub-Hebrew.ttf","JFSub-Arabic.ttf"}){
+  const std::string from=shipped+"/"+name,path=dir+"/"+name;const uint64_t size=local_file_size(from);
+  if(!size){plog(("Subtitles: "+from+" is missing").c_str());continue;}
+  if(local_file_size(path)==size)continue;
+  const std::string part=path+".part";FILE* in=fopen(from.c_str(),"rb");FILE* out=in?fopen(part.c_str(),"wb"):nullptr;bool wrote=in&&out;
+  std::vector<char> buf(256*1024);size_t n;
+  while(wrote&&(n=fread(buf.data(),1,buf.size(),in))>0)wrote=fwrite(buf.data(),1,n,out)==n;
+  if(in)fclose(in);if(out&&fclose(out)!=0)wrote=false;
+  if(wrote&&local_file_size(part)==size&&rename(part.c_str(),path.c_str())==0){plog(("Subtitles: wrote "+path).c_str());continue;}
   remove(part.c_str());all=false;plog(("Subtitles: could not write "+path).c_str());}
  ready=all;return dir;
 }
@@ -339,7 +363,7 @@ bool player_open(const std::string& url){
   // seven audio) with up to 5 MB each. Free memory fell with each reconnect
   // (228, 208 MB) and the app died loading the next: probe 1 MB, 1.5 s.
   option("demuxer-lavf-probesize","1000000");option("demuxer-lavf-analyzeduration","1.5");}
- else{option("referrer",g_server);option("user-agent","JellyfinPS4/0.8");}option("config","no");option("terminal","no");option("idle","yes");option("vo","libmpv");
+ else{option("referrer",g_server);option("user-agent","JellyfinPS4/" JF_BUILD_VERSION);}option("config","no");option("terminal","no");option("idle","yes");option("vo","libmpv");
  // Verbose until the stream has loaded: when one will not open, the reason is
  // in FFmpeg's detail, not in the one-line "loading failed".
  mpv_request_log_messages(player,settings.debug_log?"v":"error");
@@ -423,6 +447,61 @@ void player_volume(int volume){if(player){double v=std::max(0,std::min(100,volum
 bool player_loaded(){events();return started;}
 uint64_t player_last_frame_ms(){return last_frame_ms;}
 double player_cache_seconds(){events();return cached>0?cached:0;}
+// The file's own chapters: a USB file, a download, or one played directly.
+std::vector<PlayerChapter> player_chapters(){
+ std::vector<PlayerChapter> out;if(!player)return out;
+ int64_t count=0;mpv_get_property(player,"chapter-list/count",MPV_FORMAT_INT64,&count);
+ for(int64_t n=0;n<count&&n<500;++n){
+  const std::string at="chapter-list/"+std::to_string(n)+"/";double t=0;
+  if(mpv_get_property(player,(at+"time").c_str(),MPV_FORMAT_DOUBLE,&t)<0)continue;
+  PlayerChapter c;c.start=t>0?(uint64_t)(t*1000):0;c.name=safe_log(prop(at+"title"));out.push_back(c);}
+ return out;
+}
+// Playback statistics (R3): read from MPV each time the panel refreshes.
+std::vector<PlayerStatLine> player_stats(){
+ std::vector<PlayerStatLine> out;if(!player)return out;events();
+ auto num=[](const char* name,double& v){return mpv_get_property(player,name,MPV_FORMAT_DOUBLE,&v)>=0;};
+ auto count=[](const char* name,int64_t& v){return mpv_get_property(player,name,MPV_FORMAT_INT64,&v)>=0;};
+ auto rate=[](double bits){char b[32];if(bits>=1e6)snprintf(b,sizeof b,"%.1f Mbps",bits/1e6);else snprintf(b,sizeof b,"%.0f kbps",bits/1e3);return std::string(b);};
+ auto upper=[](std::string s){for(char& c:s)c=(char)toupper((unsigned char)c);return s;};
+ auto channels=[](int64_t n){return n==1?std::string("Mono"):n==2?std::string("Stereo"):n==6?std::string("5.1"):n==8?std::string("7.1"):std::to_string(n)+" ch";};
+ auto add=[&](const char* label,const std::string& value){if(!value.empty())out.push_back({label,value});};
+ add("Container",upper(prop("file-format")));
+ const std::string vformat=prop("video-format");
+ if(!vformat.empty()){
+  out.push_back({"Video","",true});
+  std::string codec=upper(vformat);const std::string profile=prop("current-tracks/video/codec-profile");if(!profile.empty())codec+=" ("+profile+")";add("Codec",codec);
+  int64_t w=0,h=0;if(count("video-params/w",w)&&count("video-params/h",h)&&w&&h){std::string size=std::to_string(w)+" x "+std::to_string(h);const std::string pix=prop("video-params/pixelformat");if(!pix.empty())size+="  "+pix;add("Resolution",size);}
+  double fps=0,shown=0;std::string frames;char b[64];
+  if(num("container-fps",fps)&&fps>0){snprintf(b,sizeof b,"%.3g in the file",fps);frames=b;}
+  if(num("estimated-vf-fps",shown)&&shown>0){snprintf(b,sizeof b,"%s%.1f decoded",frames.empty()?"":",  ",shown);frames+=b;}
+  add("Frame rate",frames);
+  int64_t dec_drop=0,vo_drop=0;count("decoder-frame-drop-count",dec_drop);count("frame-drop-count",vo_drop);
+  add("Dropped",std::to_string(dec_drop)+" by the decoder,  "+std::to_string(vo_drop)+" late");
+  double vbits=0;if(num("video-bitrate",vbits)&&vbits>0)add("Bitrate",rate(vbits));
+  const std::string hw=prop("hwdec-current");add("Decoder",hw.empty()||hw=="no"?"FFmpeg (software)":hw);
+ }
+ const std::string acodec=prop("audio-codec-name");
+ if(!acodec.empty()){
+  out.push_back({"Audio","",true});
+  std::string in=upper(acodec);int64_t ch=0,hz=0;if(count("audio-params/channel-count",ch)&&ch)in+="  "+channels(ch);if(count("audio-params/samplerate",hz)&&hz)in+="  "+std::to_string(hz/1000)+"."+std::to_string(hz%1000/100)+" kHz";
+  add("Format",in);
+  double abits=0;if(num("audio-bitrate",abits)&&abits>0)add("Bitrate",rate(abits));
+  int64_t och=0,ohz=0;std::string o;if(count("audio-out-params/channel-count",och)&&och)o=channels(och);if(count("audio-out-params/samplerate",ohz)&&ohz)o+=(o.empty()?"":"  ")+std::to_string(ohz/1000)+"."+std::to_string(ohz%1000/100)+" kHz";
+  add("To the PS4",o.empty()?std::string():"PCM  "+o);
+  if(underruns||desyncs)add("Underruns",std::to_string(underruns)+",  "+std::to_string(desyncs)+" resyncs");
+ }
+ {const std::string scodec=prop("current-tracks/sub/codec");
+  std::string s=scodec.empty()?std::string("Off"):subtitle_codec(scodec);const std::string lang=prop("current-tracks/sub/lang");if(!scodec.empty()&&!lang.empty())s=lang+"  "+s;
+  out.push_back({"Subtitles",s});}
+ out.push_back({"Stream","",true});
+ {double ahead=0;num("demuxer-cache-duration",ahead);char b[64];snprintf(b,sizeof b,"%.1f s ahead",ahead>0?ahead:0);std::string buf=b;
+  if(prop("paused-for-cache")=="yes"){int64_t pct=0;count("cache-buffering-state",pct);buf+=",  buffering "+std::to_string(pct)+"%";}
+  add("Buffer",buf);}
+ {double speed=0;if(num("cache-speed",speed)&&speed>0)add("Network",rate(speed*8));}
+ {double sync=0;if(!vformat.empty()&&!acodec.empty()&&num("avsync",sync)){char b[32];snprintf(b,sizeof b,"%+.0f ms",sync*1000);add("A/V sync",b);}}
+ return out;
+}
 bool player_has_audio(){events();return started&&got_audio;}
 bool player_active(){events();return player&&!ended;}
 std::string player_error(){events();return failure;}

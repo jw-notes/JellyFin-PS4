@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 // Host-only previews of 1.13: the music library's tabs (Albums, Artists,
 // Playlists, Genres, Songs), Now Playing with shuffle and the next tracks,
 // and the queue screen.

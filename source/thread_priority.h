@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #pragma once
 // Background work -- artwork downloads and decoding, page prefetch, Home's
 // rows, item facts, the boot loader -- runs below the UI thread, so a busy

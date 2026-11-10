@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #include "app.h"
 #include "thread_priority.h"
 #include "auth.h"
@@ -18,13 +20,26 @@
 #include <algorithm>
 #include <map>
 #include "subtitles.h"
+#include "session_crypt.h"
 #include <set>
 #include <deque>
+#include <functional>
 #include <vector>
 static std::string live_stream_id;
 static bool last_static=false,last_remote=false,force_server=false,force_transcode=false;
 static int last_audio_track=0,last_sub_track=0;
 static std::string last_sub_url;
+static std::string last_method,last_reasons;
+std::string playback_method(){return last_method;}
+std::string playback_reasons(){return last_reasons;}
+// "ContainerNotSupported,AudioCodecNotSupported" -> "Container Not Supported, Audio Codec Not Supported".
+static std::string readable_reasons(const std::string& raw){
+ std::string out;for(size_t i=0;i<raw.size();++i){const char c=raw[i];
+  if(c==','){out+=", ";continue;}
+  if(i&&isupper((unsigned char)c)&&raw[i-1]!=','&&!isupper((unsigned char)raw[i-1]))out+=' ';
+  out+=c;}
+ return out;
+}
 int playback_subtitle_track(){return last_sub_track;}
 std::string playback_subtitle_url(){return last_sub_url;}
 void playback_force_transcode_once(){force_transcode=true;}
@@ -72,6 +87,7 @@ bool storage_init(int user){
   // Settings older than 1.11 ("v" < 11) had Resume off by default: it is on now, once.
   if(number(j.c_str(),"v")<11)settings.resume=true;if(j.find("\"method\"")!=std::string::npos){auto m=number(j.c_str(),"method");settings.method=m<=PLAY_TRANSCODE?(int)m:PLAY_AUTO;}else settings.method=number(j.c_str(),"direct")?PLAY_DIRECT_FILE:PLAY_AUTO;if(j.find("\"saver\"")!=std::string::npos)settings.saver=number(j.c_str(),"saver")!=0;auto delay=number(j.c_str(),"saver_delay");if(delay>=30&&delay<=3600)settings.saver_delay=(int)delay;auto language=field(j.c_str(),"language");if(!language.empty())settings.language=language;if(j.find("\"hd1080\"")!=std::string::npos)settings.hd1080=number(j.c_str(),"hd1080")!=0;
   if(j.find("\"debug\"")!=std::string::npos)settings.debug_log=number(j.c_str(),"debug")!=0;
+  settings.stats=number(j.c_str(),"stats")!=0;
   settings.viz=(int)(number(j.c_str(),"viz")%5);
   settings.home_order=field(j.c_str(),"home_order");
   if(j.find("\"home_onnow\"")!=std::string::npos)settings.home_onnow=number(j.c_str(),"home_onnow")!=0;
@@ -86,14 +102,37 @@ bool storage_init(int user){
   if(j.find("\"pic_w\"")!=std::string::npos){settings.pic_aspect=(int)number(j.c_str(),"pic_aspect")%3;settings.pic_w=std::max(50,std::min(110,(int)number(j.c_str(),"pic_w")));settings.pic_h=std::max(50,std::min(110,(int)number(j.c_str(),"pic_h")));
    // Shifts are stored offset by 100: the JSON reader here takes no minus sign.
    settings.pic_x=std::max(-40,std::min(40,(int)number(j.c_str(),"pic_x")-100));settings.pic_y=std::max(-40,std::min(40,(int)number(j.c_str(),"pic_y")-100));}}return true;}
-bool save_settings(){return write_atomic("settings.json","{\"v\":11,\"bitrate\":"+std::to_string(settings.bitrate)+",\"resume\":"+std::to_string(settings.resume)+",\"method\":"+std::to_string(settings.method)+",\"saver\":"+std::to_string(settings.saver)+",\"saver_delay\":"+std::to_string(settings.saver_delay)+",\"language\":"+json_quote(settings.language)+",\"hd1080\":"+std::to_string(settings.hd1080)+",\"debug\":"+std::to_string(settings.debug_log)+",\"pic_aspect\":"+std::to_string(settings.pic_aspect)+",\"pic_w\":"+std::to_string(settings.pic_w)+",\"pic_h\":"+std::to_string(settings.pic_h)+",\"pic_x\":"+std::to_string(settings.pic_x+100)+",\"pic_y\":"+std::to_string(settings.pic_y+100)+",\"viz\":"+std::to_string(settings.viz)+",\"volume\":"+std::to_string(settings.volume)+",\"home_order\":"+json_quote(settings.home_order)+",\"skip_intro\":"+std::to_string(settings.skip_intro)+",\"skip_outro\":"+std::to_string(settings.skip_outro)+",\"home_onnow\":"+std::to_string(settings.home_onnow)+",\"dl_usb\":"+std::to_string(settings.download_usb)+",\"guide_auto\":"+std::to_string(settings.guide_auto)+",\"guide_url\":"+json_quote(settings.guide_url)+",\"guide_found\":"+json_quote(settings.guide_found)+",\"sub_console\":"+std::to_string(settings.sub_console)+",\"sub_font\":"+std::to_string(settings.sub_font)+",\"sub_colour\":"+std::to_string(settings.sub_colour)+"}");}
+bool save_settings(){return write_atomic("settings.json","{\"v\":11,\"bitrate\":"+std::to_string(settings.bitrate)+",\"resume\":"+std::to_string(settings.resume)+",\"method\":"+std::to_string(settings.method)+",\"saver\":"+std::to_string(settings.saver)+",\"saver_delay\":"+std::to_string(settings.saver_delay)+",\"language\":"+json_quote(settings.language)+",\"hd1080\":"+std::to_string(settings.hd1080)+",\"debug\":"+std::to_string(settings.debug_log)+",\"pic_aspect\":"+std::to_string(settings.pic_aspect)+",\"pic_w\":"+std::to_string(settings.pic_w)+",\"pic_h\":"+std::to_string(settings.pic_h)+",\"pic_x\":"+std::to_string(settings.pic_x+100)+",\"pic_y\":"+std::to_string(settings.pic_y+100)+",\"viz\":"+std::to_string(settings.viz)+",\"volume\":"+std::to_string(settings.volume)+",\"home_order\":"+json_quote(settings.home_order)+",\"skip_intro\":"+std::to_string(settings.skip_intro)+",\"skip_outro\":"+std::to_string(settings.skip_outro)+",\"home_onnow\":"+std::to_string(settings.home_onnow)+",\"dl_usb\":"+std::to_string(settings.download_usb)+",\"guide_auto\":"+std::to_string(settings.guide_auto)+",\"guide_url\":"+json_quote(settings.guide_url)+",\"guide_found\":"+json_quote(settings.guide_found)+",\"sub_console\":"+std::to_string(settings.sub_console)+",\"sub_font\":"+std::to_string(settings.sub_font)+",\"sub_colour\":"+std::to_string(settings.sub_colour)+",\"stats\":"+std::to_string(settings.stats)+"}");}
 // Share Sign-in (PS3): one PS4 user lends their sign-in to the console's
 // users with none of their own. It is a copy of their session beside the
 // users' folders, with whose it is; theirs keeps it up to date.
 static const char* SHARED_SESSION="../shared-session.json";
 bool g_session_shared=false;
-static std::string session_text(int owner){return "{\"server\":"+json_quote(g_server)+",\"username\":"+json_quote(g_username)+",\"token\":"+json_quote(g_token)+",\"userid\":"+json_quote(g_userid)+(owner?",\"owner\":"+std::to_string(owner):"")+"}";}
-static bool apply_session(const std::string& j){snprintf(g_server,sizeof g_server,"%s",field(j.c_str(),"server").c_str());snprintf(g_username,sizeof g_username,"%s",field(j.c_str(),"username").c_str());snprintf(g_token,sizeof g_token,"%s",field(j.c_str(),"token").c_str());snprintf(g_userid,sizeof g_userid,"%s",field(j.c_str(),"userid").c_str());return g_token[0]&&g_server[0]&&g_userid[0];}
+// The access token is saved sealed to this console (session_crypt.h): a copy
+// of the file is no use elsewhere. Host tests have no console ID: plain there.
+static std::string token_field(){
+#ifndef HOST_TEST
+ const std::string sealed=seal_token(g_token);
+ if(!sealed.empty())return ",\"token_sealed\":"+json_quote(sealed);
+ plog("Account: the sign-in could not be sealed; saved as it is");
+#endif
+ return ",\"token\":"+json_quote(g_token);
+}
+static std::string session_text(int owner){return "{\"server\":"+json_quote(g_server)+",\"username\":"+json_quote(g_username)+token_field()+",\"userid\":"+json_quote(g_userid)+(owner?",\"owner\":"+std::to_string(owner):"")+"}";}
+static bool has_token(const std::string& j){return !field(j.c_str(),"token_sealed").empty()||!field(j.c_str(),"token").empty();}
+// A session from before sealing (a plain "token"): sealed when it is next saved.
+static bool session_plain=false;
+static bool apply_session(const std::string& j){
+ std::string token;const std::string sealed=field(j.c_str(),"token_sealed");
+ session_plain=false;
+ if(!sealed.empty()){
+#ifndef HOST_TEST
+  if(!open_token(sealed,token)){plog("Account: the saved sign-in was not sealed on this console, or was changed; sign in again");return false;}
+#endif
+ }else{token=field(j.c_str(),"token");session_plain=!token.empty();}
+ snprintf(g_server,sizeof g_server,"%s",field(j.c_str(),"server").c_str());snprintf(g_username,sizeof g_username,"%s",field(j.c_str(),"username").c_str());snprintf(g_token,sizeof g_token,"%s",token.c_str());snprintf(g_userid,sizeof g_userid,"%s",field(j.c_str(),"userid").c_str());
+ for(volatile char* p=token.empty()?nullptr:&token[0];p&&p<&token[0]+token.size();++p)*p=0;   // no copy of it left behind
+ return g_token[0]&&g_server[0]&&g_userid[0];}
 static int shared_owner(){auto j=read_file(SHARED_SESSION);return j.empty()?0:(int)number(j.c_str(),"owner");}
 int share_state(){if(g_session_shared)return SHARE_USING;const int owner=shared_owner();return !owner?SHARE_OFF:owner==storage_user?SHARE_MINE:SHARE_OTHER;}
 bool share_set(bool on){
@@ -112,14 +151,18 @@ bool save_session(){
 // in their folder, until they choose it again on the sign-in screen.
 std::string shared_name(){
  if(!shared_owner()||shared_owner()==storage_user)return "";
- auto j=read_file(SHARED_SESSION);return field(j.c_str(),"token").empty()?"":field(j.c_str(),"username");
+ auto j=read_file(SHARED_SESSION);return has_token(j)?field(j.c_str(),"username"):"";
 }
 bool share_use(){
  if(shared_name().empty()||!apply_session(read_file(SHARED_SESSION)))return false;
  g_session_shared=true;remove(jf_data_path("no-shared"));plog("Account: using the console's shared sign-in");return true;
 }
 bool load_session(){
- g_session_shared=false;if(apply_session(read_file("session.json")))return true;
+ g_session_shared=false;
+ if(apply_session(read_file("session.json"))){
+  // Saved before sealing: sealed now (and the shared copy with it), so no plain token stays on the console.
+  if(session_plain){plog("Account: sealing the saved sign-in to this console");save_session();}
+  return true;}
  // No sign-in of this user's own: one shared on the console, if any (and not refused).
  if(read_file("no-shared").empty())return share_use();
  return false;
@@ -412,6 +455,21 @@ static std::vector<MediaSegment> chapter_segments(const std::string& item_id){
  if(!out.empty())plog(("Segments: "+std::to_string(out.size())+" from chapter names").c_str());
  return out;
 }
+std::vector<PlayerChapter> fetch_chapters(const std::string& item_id){
+ std::vector<PlayerChapter> out;
+ if(request(HTTP_GET,"/Users/"+encode(g_userid)+"/Items/"+encode(item_id)+"?Fields=Chapters")!=200)return out;
+ const char* j=responseBuffer;const char* e=j+strlen(j);
+ auto a=find_top_value(j,e,"Chapters");if(!a||*a!='[')return out;++a;
+ while(a<e&&out.size()<500){a=skip_ws(a,e);if(a>=e||*a==']')break;if(*a==','){++a;continue;}auto b=object_end(a,e);if(!b)break;
+  const std::string obj(a,b);PlayerChapter c;c.start=number(obj.c_str(),"StartPositionTicks")/10000;c.name=field(obj.c_str(),"Name");
+  // Chapter images: /Items/{id}/Images/Chapter/{index}, made by the server's chapter image task.
+  const std::string tag=field(obj.c_str(),"ImageTag");
+  if(!tag.empty())c.image="/Items/"+encode(item_id)+"/Images/Chapter/"+std::to_string(out.size())+"?tag="+encode(tag)+"&maxWidth=320&quality=85";
+  out.push_back(c);a=b;}
+ // A single chapter at the start is no chapters at all.
+ if(out.size()<2)out.clear();
+ return out;
+}
 std::vector<MediaSegment> fetch_segments(const std::string& item_id){
  std::vector<MediaSegment> out;
  if(request(HTTP_GET,"/MediaSegments/"+encode(item_id)+"?includeSegmentTypes=Intro&includeSegmentTypes=Outro")!=200)return chapter_segments(item_id);
@@ -423,6 +481,33 @@ std::vector<MediaSegment> fetch_segments(const std::string& item_id){
   if((type=="Intro"||type=="Outro")&&s.end>s.start+1000)out.push_back(s);a=b;}
  if(out.empty())return chapter_segments(item_id);
  return out;
+}
+// Trickplay: "Trickplay":{"<source id>":{"<width>":{"Width":320,"Height":180,
+// "TileWidth":10,"TileHeight":10,"ThumbnailCount":541,"Interval":10000,...}}}.
+bool fetch_trickplay(const std::string& item_id,const std::string& source_id,TrickplayInfo& out){
+ out=TrickplayInfo();
+ if(request(HTTP_GET,"/Users/"+encode(g_userid)+"/Items/"+encode(item_id))!=200)return false;
+ const char* j=responseBuffer;const char* e=j+strlen(j);
+ const char* t=find_top_value(j,e,"Trickplay");if(!t||*t!='{')return false;const char* te=object_end(t,e);if(!te)return false;
+ // The entries of an object: each key, and its value's span.
+ auto entries=[](const char* p,const char* end,const std::function<bool(const std::string&,const char*,const char*)>& each){
+  ++p;while(p<end){p=skip_ws(p,end);if(p>=end||*p=='}')break;if(*p==','){++p;continue;}if(*p!='"')break;
+   char key[128]={};if(!read_json_string(p,end,key,sizeof key))break;
+   const char* q=p+1;bool esc=false;while(q<end&&(esc||*q!='"')){esc=!esc&&*q=='\\';++q;}
+   q=skip_ws(q+1,end);if(q>=end||*q!=':')break;q=skip_ws(q+1,end);
+   const char* v_end=*q=='{'?object_end(q,end):nullptr;if(!v_end)break;
+   if(!each(key,q,v_end))break;p=v_end;}};
+ std::string source;const char* s=nullptr;const char* s_end=nullptr;
+ entries(t,te,[&](const std::string& key,const char* v,const char* v_end){if(!s||key==source_id){source=key;s=v;s_end=v_end;}return key!=source_id;});
+ if(!s)return false;
+ int best_gap=1<<30;
+ entries(s,s_end,[&](const std::string&,const char* v,const char* v_end){
+  const std::string o(v,v_end);TrickplayInfo info;info.width=(int)number(o.c_str(),"Width");info.height=(int)number(o.c_str(),"Height");
+  info.tile_w=(int)number(o.c_str(),"TileWidth");info.tile_h=(int)number(o.c_str(),"TileHeight");info.count=(int)number(o.c_str(),"ThumbnailCount");info.interval_ms=number(o.c_str(),"Interval");
+  if(info.width>0&&info.height>0&&info.tile_w>0&&info.tile_h>0&&info.count>0&&info.interval_ms>0){const int gap=abs(info.width-320);if(gap<best_gap){best_gap=gap;out=info;}}
+  return true;});
+ if(!out.count)return false;
+ out.item=item_id;out.source=source;return true;
 }
 bool fetch_adjacent_episodes(const Item& episode,Item& prev,Item& next,bool& has_prev,bool& has_next){
  has_prev=has_next=false;if(episode.series_id.empty())return false;
@@ -473,7 +558,7 @@ bool playback_url(const Item& i,int audio,int sub,const std::string& selected_so
  const std::string profile="{\"Name\":\"JellyFin PS4\",\"MaxStreamingBitrate\":"+std::to_string(settings.bitrate)+",\"DirectPlayProfiles\":[{\"Container\":\"mp4,m4v,mkv,mov\",\"Type\":\"Video\",\"VideoCodec\":\"h264\",\"AudioCodec\":\"aac,mp3,ac3,eac3,flac,opus,vorbis\"},{\"Container\":\"mp3,flac,m4a,mp4,aac,ogg,oga,opus,wav,webma,webm\",\"Type\":\"Audio\"}],\"TranscodingProfiles\":[{\"Container\":\"ts\",\"Type\":\"Video\",\"VideoCodec\":\"h264\",\"AudioCodec\":\"aac\",\"Protocol\":\"hls\",\"Context\":\"Streaming\",\"MaxAudioChannels\":\"2\",\"MinSegments\":\"2\",\"BreakOnNonKeyFrames\":true},{\"Container\":\"mp4\",\"Type\":\"Audio\",\"AudioCodec\":\"aac\",\"Protocol\":\"http\",\"Context\":\"Streaming\"}],\"CodecProfiles\":[{\"Type\":\"Video\",\"Codec\":\"h264\",\"Conditions\":[{\"Condition\":\"LessThanEqual\",\"Property\":\"VideoBitDepth\",\"Value\":\"8\",\"IsRequired\":true},{\"Condition\":\"LessThanEqual\",\"Property\":\"Width\",\"Value\":\""+max_w+"\",\"IsRequired\":true},{\"Condition\":\"LessThanEqual\",\"Property\":\"Height\",\"Value\":\""+max_h+"\",\"IsRequired\":true}]},{\"Type\":\"VideoAudio\",\"Codec\":\"aac\",\"Conditions\":[{\"Condition\":\"Equals\",\"Property\":\"AudioSampleRate\",\"Value\":\"48000\",\"IsRequired\":true}]}],\"SubtitleProfiles\":[{\"Format\":\"srt\",\"Method\":\"Encode\"},{\"Format\":\"ass\",\"Method\":\"Encode\"},{\"Format\":\"pgssub\",\"Method\":\"Encode\"}]}";
  const bool live=!strcmp(i.base.type,"TvChannel");
  const bool forced_transcode=force_transcode;force_transcode=false;
- live_stream_id.clear();session.clear();source_id.clear();url.clear();last_static=last_remote=false;last_audio_track=0;last_sub_track=0;last_sub_url.clear();
+ live_stream_id.clear();session.clear();source_id.clear();url.clear();last_static=last_remote=false;last_audio_track=0;last_sub_track=0;last_sub_url.clear();last_method.clear();last_reasons.clear();
  // Live TV: most channels are a plain HTTP stream (an M3U tuner) the player
  // can open itself -- no server transcode to start, and the provider's best
  // variant rather than whichever it lists first. The source is then asked
@@ -526,7 +611,7 @@ bool playback_url(const Item& i,int audio,int sub,const std::string& selected_so
    source_id=field(source.c_str(),"Id");url=path;last_remote=true;
    // Which provider, not the whole address: enough to tell failing hosts apart.
    const size_t host_end=path.find('/',path.find("//")+2);
-   plog(("Live TV: playing the channel's own stream directly from "+path.substr(0,host_end==std::string::npos?path.size():host_end)).c_str());return true;
+   plog(("Live TV: playing the channel's own stream directly from "+path.substr(0,host_end==std::string::npos?path.size():host_end)).c_str());last_method="Direct from the channel's source";return true;
   }
   plog(("Live TV: source protocol "+(protocol.empty()?std::string("unknown"):protocol)+"; through the server").c_str());
  }
@@ -558,22 +643,24 @@ bool playback_url(const Item& i,int audio,int sub,const std::string& selected_so
  auto direct_play=find_top_value(source.c_str(),end,"SupportsDirectPlay");
  const bool direct_flag=direct_play&&read_json_bool(direct_play,end);
  const bool direct_stream_flag=support&&read_json_bool(support,end);
- {const std::string reasons=playback_url_param(url,"TranscodeReasons");
+ {const std::string reasons=playback_url_param(url,"TranscodeReasons");last_reasons=readable_reasons(reasons);
   plog(("Playback: server decision SupportsDirectPlay="+std::string(direct_flag?"yes":"no")+" SupportsDirectStream="+(direct_stream_flag?"yes":"no")+" audio_codec="+(playback_url_param(url,"AudioCodec").empty()?std::string("n/a"):playback_url_param(url,"AudioCodec"))+" video_codec="+(playback_url_param(url,"VideoCodec").empty()?std::string("n/a"):playback_url_param(url,"VideoCodec"))+" reasons="+(reasons.empty()?std::string("none"):reasons)+(forced_transcode?" (transcode forced)":"")).c_str());}
  const bool server_direct=may_direct&&url.empty()&&direct_flag;
  if((settings.method==PLAY_DIRECT_FILE||server_direct)&&!live&&!forced_transcode){last_static=true;
   // Original file: the player must select the same track the server checked.
-  {const int ordinal=selected_audio>=0?playback_audio_ordinal(source,selected_audio):-1;last_audio_track=ordinal>0?ordinal:0;plog(("Playback: player audio track "+std::to_string(last_audio_track)+" for stream "+std::to_string(selected_audio)+(last_audio_track?"":" (the player chooses)")).c_str());}plog(server_direct?"Playback: direct play (the original file)":"Playback: direct file (setting)");url=std::string(g_server)+(strcmp(i.base.type,"Audio")==0?"/Audio/":"/Videos/")+encode(i.base.id)+"/stream?Static=true&MediaSourceId="+encode(source_id)+"&ApiKey="+encode(g_token);}
+  {const int ordinal=selected_audio>=0?playback_audio_ordinal(source,selected_audio):-1;last_audio_track=ordinal>0?ordinal:0;plog(("Playback: player audio track "+std::to_string(last_audio_track)+" for stream "+std::to_string(selected_audio)+(last_audio_track?"":" (the player chooses)")).c_str());}plog(server_direct?"Playback: direct play (the original file)":"Playback: direct file (setting)");last_method=server_direct?"Direct play":"Direct play (Direct file setting)";last_reasons.clear();url=std::string(g_server)+(strcmp(i.base.type,"Audio")==0?"/Audio/":"/Videos/")+encode(i.base.id)+"/stream?Static=true&MediaSourceId="+encode(source_id)+"&ApiKey="+encode(g_token);}
  else if(url.empty()){
   auto transcode=find_top_value(source.c_str(),end,"SupportsTranscoding");
   if(live&&!live_stream_id.empty()&&!source_id.empty()&&transcode&&read_json_bool(transcode,end)){
    url=std::string(g_server)+"/Videos/"+encode(i.base.id)+"/master.m3u8?MediaSourceId="+encode(source_id)+"&LiveStreamId="+encode(live_stream_id)+"&PlaySessionId="+encode(session)+"&DeviceId="+encode(device_id)+"&VideoCodec=h264&AudioCodec=aac&VideoBitrate="+std::to_string(std::max(1000000,settings.bitrate-192000))+"&AudioBitrate=192000&SegmentContainer=ts&MinSegments=2";
-   plog("Live TV: using the opened source with Jellyfin's H264/AAC HLS endpoint");
+   plog("Live TV: using the opened source with Jellyfin's H264/AAC HLS endpoint");last_method="Transcode (Live TV)";
   }
   auto direct=field(source.c_str(),"DirectStreamUrl");
-  if(url.empty()&&!direct.empty()&&support&&read_json_bool(support,end))url=direct;
+  if(url.empty()&&!direct.empty()&&support&&read_json_bool(support,end)){url=direct;last_method="Direct stream";}
   if(url.empty()){last_error=live?"The live source opened, but the server did not offer a compatible H264/AAC stream.":"The server did not offer a compatible H264/AAC transcode.";plog(last_error.c_str());return false;}
  }
+ // Otherwise the server's TranscodingUrl: converted, for the reasons it gives.
+ if(last_method.empty())last_method=live?"Transcode (Live TV)":"Transcode";
  if(!url.empty()&&url[0]=='/')url=std::string(g_server)+url;
  // AvPlayer makes its own HTTP requests and cannot inherit the Authorization header
  // from our API transport. Authenticate same-server URLs when the server

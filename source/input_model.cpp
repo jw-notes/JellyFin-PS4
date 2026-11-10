@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #include "input_model.h"
 void UiInputFilter::sync(uint32_t raw,uint64_t now){held=raw;nav=raw&0xf0;repeat_at=now+350;released.fill(0);}
 uint32_t UiInputFilter::update(uint32_t raw,uint64_t now){

@@ -19,8 +19,7 @@ ADDITIONAL TERMS (GNU GPL version 3, section 7)
 The following terms apply to all material in this repository written by
 jw-notes, as permitted by section 7(b) and 7(c) of the GNU GPL version 3.
 They apply to any copy, port, translation or modified version of that
-material, in whole or in part, whether the work was changed by a person or
-generated with the help of an AI (clanker) tool.
+material, in whole or in part, however it was made.
 
 1. Attribution (section 7(b)). You must keep this NOTICE file, and the
    copyright and licence notices in the source files, intact. Any work that
@@ -53,8 +52,6 @@ licence (full texts are kept beside each component under tools/ and vendor/):
 
   MPV                                      GPL 2+
   FFmpeg                                   LGPL / GPL 3
-  Switchfin PS4 integration (dragonflylee) Apache 2.0
-                                           https://github.com/dragonflylee/switchfin
   SDL2, zlib, bzip2                        zlib / BSD-style
   mbedTLS                                  Apache 2.0
   dav1d                                    BSD 2-Clause
@@ -64,10 +61,20 @@ licence (full texts are kept beside each component under tools/ and vendor/):
   GoldHEN SDK                              MIT
   shadPS4 (avplayer ABI layouts)           GPL 2+
   Noto Sans, Noto Sans JP                  SIL OFL 1.1
+  Noto Sans SC, KR, Hebrew, Arabic         SIL OFL 1.1
+    (subtitle fallback fonts, subset; licences in assets/subtitle-fonts/)
   Open Sans, Roboto Condensed              Apache 2.0
   Satoshi (Indian Type Foundry)            ITF Free Font License
   PlayStation button sprites (Kenney)      CC0
   Jellyfin logo                            CC BY-SA 4.0
+
+No code, SDK, firmware or other files by Sony are included. The app is built
+with the OpenOrbis PS4 Toolchain, whose PS4 interfaces were reverse
+engineered by the homebrew community for public use. PlayStation, PS3 and
+PS4 are trademarks of Sony Interactive Entertainment; this project is not
+made, endorsed or supported by Sony. JellyFin [PS] is an unofficial client
+for Jellyfin (https://jellyfin.org), not made or endorsed by the Jellyfin
+project.
 
 The artwork in the README screenshots is credited in
 docs/screenshots/CREDITS.md.

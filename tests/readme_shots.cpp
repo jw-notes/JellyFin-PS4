@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 // The README's screenshots, rendered on the host by the app's own drawing code.
 // Titles, years, runtimes, ratings, directors, cast and episode names are real;
 // the synopses are short descriptions of our own, and every image -- posters,
@@ -14,6 +16,7 @@
 #include "language.h"
 #include "boot_anim.h"
 #include "screensaver.h"
+#include "trickplay.h"
 #include "livetv.h"
 #include "api_livetv.h"
 #include "stb_image.h"
@@ -94,7 +97,8 @@ static const std::vector<Film> films={
 struct Episode{const char* id,*series,*name;int season,episode,minutes;double watched;const char* art;};
 static const std::vector<Episode> episodes={
  {"e1","Bonanza","A Rose for Lotta",1,1,52,0.4,"e1"},{"e2","The Beverly Hillbillies","The Clampetts Strike Oil",1,1,26,0.7,"e2"},{"e3","The Lucy Show","Lucy Waits Up for Chris",1,1,25,0.25,"e3"},
- {"e4","Bonanza","Death on Sun Mountain",1,2,52,0.1,"e1"},{"e5","The Beverly Hillbillies","Getting Settled",1,2,26,0.15,"e2"},{"e6","The Lucy Show","Lucy Digs Up a Date",1,2,25,0.05,"e3"},
+ // Next Up: other shows than Continue Watching's, so no show is on Home twice.
+ {"e4","The Dick Van Dyke Show","My Blonde-Haired Brunette",1,2,26,0,"e7"},{"e5","Gilligan's Island","Home Sweet Hut",1,2,25,0,"e8"},{"e6","The Andy Griffith Show","The Manhunt",1,2,26,0,"e9"},
 };
 // Classical works (public-domain compositions), with the composers' portraits as covers.
 struct Album{const char* id,*name,*artist;int year;};
@@ -156,14 +160,16 @@ int main(int argc,char** argv){
  {HomeRow r;r.title="Continue Watching";r.shape=SHAPE_WIDE;for(int k:{0,1,2})r.page.items.push_back(episode_item(episodes[k]));
   for(int k:{0,6,4}){Item i=film_item(films[k]);i.resume=i.duration/3;r.page.items.push_back(i);}home.rows.push_back(r);}
  {HomeRow r;r.title="Next Up";r.shape=SHAPE_WIDE;for(int k:{3,4,5})r.page.items.push_back(episode_item(episodes[k]));home.rows.push_back(r);}
- {HomeRow r;r.title="Latest Movies";r.shape=SHAPE_POSTER;for(auto& f:films)r.page.items.push_back(film_item(f));home.rows.push_back(r);}
+ // Latest Movies leaves out the films already in Continue Watching (0, 6 and 4).
+ {HomeRow r;r.title="Latest Movies";r.shape=SHAPE_POSTER;for(size_t k=0;k<films.size();++k)if(k!=0&&k!=6&&k!=4)r.page.items.push_back(film_item(films[k]));home.rows.push_back(r);}
  {HomeRow r;r.title="Latest Music";r.shape=SHAPE_SQUARE;for(auto& a:albums){Item i=make(a.id,a.name,"MusicAlbum",a.year);i.artist=a.artist;r.page.items.push_back(i);}home.rows.push_back(r);}
  home.focus=0;home.rows[0].col=0;home.rows[1].col=1;home_step(home,true);draw_home(home,-1);capture("home");
  home.focus=1;home_step(home,true);draw_home(home,-1);capture("home-continue");
  home.focus=3;home.rows[3].col=2;home_step(home,true);draw_home(home,-1);capture("home-latest");
 
  // Movies library with the A-Z rail, and the rail open.
- Page movies;movies.total=248;for(auto& f:films)movies.items.push_back(film_item(f));for(auto& f:films)movies.items.push_back(film_item(f));
+ // Each film once: the library is exactly the films here.
+ Page movies;movies.total=(int)films.size();for(auto& f:films)movies.items.push_back(film_item(f));
  JumpBar jump;jump.show=true;draw_library(movies,"Movies",0,4,false,-1,0,"",&jump);capture("library");
  jump.active=true;jump.sel=9;draw_library(movies,"Movies",0,4,false,-1,0,"",&jump);capture("jumpbar");
 
@@ -181,7 +187,30 @@ int main(int argc,char** argv){
  // The player: a Big Buck Bunny frame as the picture, the bar, and the L1 picture mode.
  {Item f=film_item(films[1]);PlayerOsd osd;osd.title=f.base.name;osd.subtitle=std::to_string(f.year);osd.audio="AAC Stereo";osd.duration=f.duration;osd.position=f.duration*37/100;osd.started=true;
   draw_art_cover(std::string(f.base.id)+":backdrop",0,0,WIDTH,HEIGHT);draw_player_osd(osd);capture("player");
-  draw_art_cover(std::string(f.base.id)+":backdrop",0,0,WIDTH,HEIGHT);osd.scrubbing=true;osd.target=osd.position+600000;osd.paused=true;draw_player_osd(osd);capture("player-scrub");
+  // The seek preview: a closer look at the same still stands in for the frame further on.
+  {draw_art_cover(std::string(f.base.id)+":backdrop",-260,-140,900,506);const auto rgba=grab(224,126);std::vector<uint32_t> thumb(224*126);
+   for(size_t i=0;i<thumb.size();++i)thumb[i]=0xff000000u|((uint32_t)rgba[i*4]<<16)|((uint32_t)rgba[i*4+1]<<8)|rgba[i*4+2];trickplay_preview(thumb,224,126);}
+  draw_art_cover(std::string(f.base.id)+":backdrop",0,0,WIDTH,HEIGHT);osd.scrubbing=true;osd.target=f.duration*62/100;osd.paused=true;draw_player_osd(osd);capture("player-scrub");
+  // R3: the playback statistics over the picture, as for a film played directly.
+  draw_art_cover(std::string(f.base.id)+":backdrop",0,0,WIDTH,HEIGHT);osd.scrubbing=false;osd.paused=false;
+  draw_stats_panel({{"Playing","Direct play"},{"Source","Jellyfin server"},{"Limits","20 Mbps,  1080p"},{"Container","MATROSKA,WEBM"},
+   {"Video","",true},{"Codec","H264 (High)"},{"Resolution","1920 x 1080  yuv420p"},{"Frame rate","24 in the file,  24.0 decoded"},{"On screen","24.0 fps"},{"Dropped","0 by the decoder,  0 late"},{"Bitrate","8.4 Mbps"},{"Decoder","FFmpeg (software)"},
+   {"Audio","",true},{"Format","AAC  Stereo  48.0 kHz"},{"Bitrate","192 kbps"},{"To the PS4","PCM  Stereo  48.0 kHz"},{"Subtitles","eng  SRT"},
+   {"Stream","",true},{"Buffer","38.2 s ahead"},{"Network","42.6 Mbps"},{"A/V sync","+3 ms"},{"Memory","2614 MB free"}});capture("player-stats");
+  // Options while watching, a film with chapters; the chapter list it opens.
+  osd.chapters={{0,"Opening",""},{95000,"The Meadow",""},{190000,"Three Bullies",""},{290000,"The Plan",""},{380000,"Traps",""},{470000,"Payback",""},{560000,"Credits",""}};
+  osd.item_id=f.base.id;
+  draw_art_cover(std::string(f.base.id)+":backdrop",0,0,WIDTH,HEIGHT);draw_player_osd(osd);
+  osd.options={{"Chapters","7 chapters"},{"Audio / Subtitles","AAC Stereo"},{"Picture","Fit"},{"Playback Statistics","Off"}};osd.options_sel=0;
+  draw_options_menu(osd);capture("check-options");
+  draw_art_cover(std::string(f.base.id)+":backdrop",0,0,WIDTH,HEIGHT);draw_player_osd(osd);osd.chapter_sel=3;osd.chapter_now=2;draw_chapter_menu(osd);capture("check-chapters");
+  // A show's Options.
+  draw_art_cover(std::string(f.base.id)+":backdrop",0,0,WIDTH,HEIGHT);
+  osd.options={{"Next Episode","S1:E3 - The Clampetts Get Culture"},{"Previous Episode",""},{"Audio / Subtitles","AAC Stereo  /  English"},{"Picture","Fit"},{"Skip Intros","Button"},{"Skip Credits","Auto"},{"Playback Statistics","On"}};osd.options_sel=4;
+  draw_options_menu(osd);capture("check-options-show");
+  // Scrubbing with chapters: their marks on the bar, the chapter named by the time.
+  draw_art_cover(std::string(f.base.id)+":backdrop",0,0,WIDTH,HEIGHT);osd.scrubbing=true;osd.target=300000;draw_player_osd(osd);capture("check-scrub-chapters");
+  osd.chapters.clear();osd.scrubbing=false;
   draw_art_cover(std::string(f.base.id)+":backdrop",0,0,WIDTH,HEIGHT);draw_picture_banner("Picture size   Width 100%   Height 100%   Fill",false);capture("picture");}
 
  // Buffering: Sintel's still under the ring.
@@ -199,9 +228,20 @@ int main(int argc,char** argv){
   if(!chans.empty()){livetv_preview(chans,4,false);capture("livetv");livetv_preview(chans,2,true);capture("livetv-guide");}}
 
  // Settings, a category, and About.
- {std::vector<SettingsCategoryView> cats={{"Playback","Quality  \xC2\xB7  1080p Playback (Alpha)  \xC2\xB7  Resume playback  \xC2\xB7  Playback method",SICON_PLAYBACK},{"Display","Theme  \xC2\xB7  Language  \xC2\xB7  Screensaver  \xC2\xB7  Screensaver Delay",SICON_DISPLAY},{"Account","Log Out",SICON_ACCOUNT},{"System","Software Update  \xC2\xB7  About  \xC2\xB7  Debug Logging  \xC2\xB7  Exit application",SICON_SYSTEM}};
-  draw_settings_categories(cats,0,"Account: alex  \xC2\xB7  http://192.168.1.100:8096","JellyFin [PS] 1.10 \xC2\xB7 built Oct 27 2026");capture("settings");
-  std::vector<SettingsRowView> rows(4);rows[0]={"Quality","20 Mbps","The highest bitrate the server streams at. Lower it if playback\nstops to buffer; raise it for a sharper picture on a fast network."};rows[1]={"1080p Playback (Alpha)","On","x",true};rows[2]={"Resume playback","On","x",true};rows[3]={"Playback method","Auto","x"};
+ // The six groups as main.cpp lists them (SETTING_SECTIONS, SETTING_ROWS).
+ {const char* dot="  \xC2\xB7  ";
+  std::vector<SettingsCategoryView> cats={
+   {"Playback",std::string("Quality")+dot+"1080p Playback (Alpha)"+dot+"Resume playback"+dot+"Skip Intros"+dot+"Skip Credits"+dot+"Playback method"+dot+"Playback Statistics",SICON_PLAYBACK},
+   {"Subtitles",std::string("Draw Subtitles")+dot+"Subtitle Font"+dot+"Subtitle Colour",SICON_PLAYBACK},
+   {"Live TV",std::string("On Now on Home")+dot+"Update Guide"+dot+"Auto-Update Guide"+dot+"Guide Address",SICON_PLAYBACK},
+   {"Display",std::string("Theme")+dot+"Language"+dot+"Home Order"+dot+"Screensaver"+dot+"Screensaver Delay",SICON_DISPLAY},
+   {"Account",std::string("Share Sign-in")+dot+"Log Out",SICON_ACCOUNT},
+   {"System",std::string("Downloads")+dot+"Save Downloads To"+dot+"Software Update"+dot+"About"+dot+"Debug Logging"+dot+"Exit application",SICON_SYSTEM}};
+  std::string version=JF_BUILD_VERSION;if(version.size()>1&&version[0]=='0')version.erase(0,1);   // as main.cpp shows it
+  draw_settings_categories(cats,0,"Account: alex  \xC2\xB7  http://192.168.1.100:8096","JellyFin [PS] "+version+" \xC2\xB7 built " __DATE__);capture("settings");
+  std::vector<SettingsRowView> rows(7);
+  rows[0]={"Quality","20 Mbps","The highest bitrate the server streams at. Lower it if playback\nstops to buffer; raise it for a sharper picture on a fast network."};
+  rows[1]={"1080p Playback (Alpha)","On","x",true};rows[2]={"Resume playback","On","x",true};rows[3]={"Skip Intros","Button","x"};rows[4]={"Skip Credits","Button","x"};rows[5]={"Playback method","Auto","x"};rows[6]={"Playback Statistics","On","x",true};
   draw_settings_rows(cats[0],rows,0);capture("settings-playback");
   draw_about(0,0);capture("about");}
 

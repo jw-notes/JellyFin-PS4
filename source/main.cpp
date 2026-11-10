@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #include "app.h"
 #include "thread_priority.h"
 #include "mono_clock.h"
@@ -17,6 +19,7 @@
 #include "language.h"
 #include "updater.h"
 #include "downloads.h"
+#include "trickplay.h"
 #include "local_media.h"
 #include "subtitles.h"
 #include "../vendor/ps3/source/player/core/picture_size.h"
@@ -76,7 +79,7 @@ static void downloads_screen();
 // What Options downloads from a library: one file, or all of an album, season or series.
 static bool downloadable(const char* t){for(const char* k:{"Movie","Episode","Video","Audio","MusicAlbum","Season","Series"})if(!strcmp(t,k))return true;return false;}
 enum SettingSection { SEC_PLAYBACK, SEC_SUBTITLES, SEC_LIVETV, SEC_DISPLAY, SEC_ACCOUNT, SEC_SYSTEM, SEC__COUNT };
-enum SettingId { SET_QUALITY, SET_HD1080, SET_RESUME, SET_SKIP_INTRO, SET_SKIP_OUTRO, SET_METHOD, SET_SUB_DRAW, SET_SUB_FONT, SET_SUB_COLOUR, SET_GUIDE_UPDATE, SET_GUIDE_AUTO, SET_GUIDE_URL, SET_ONNOW, SET_SHARE, SET_THEME, SET_LANGUAGE, SET_HOME_ORDER, SET_SAVER, SET_SAVER_DELAY, SET_SIGN_OUT, SET_DOWNLOADS, SET_DOWNLOAD_TO, SET_UPDATE, SET_ABOUT, SET_DEBUG, SET_EXIT };
+enum SettingId { SET_QUALITY, SET_HD1080, SET_RESUME, SET_SKIP_INTRO, SET_SKIP_OUTRO, SET_METHOD, SET_STATS, SET_SUB_DRAW, SET_SUB_FONT, SET_SUB_COLOUR, SET_GUIDE_UPDATE, SET_GUIDE_AUTO, SET_GUIDE_URL, SET_ONNOW, SET_SHARE, SET_THEME, SET_LANGUAGE, SET_HOME_ORDER, SET_SAVER, SET_SAVER_DELAY, SET_SIGN_OUT, SET_DOWNLOADS, SET_DOWNLOAD_TO, SET_UPDATE, SET_ABOUT, SET_DEBUG, SET_EXIT };
 struct SettingDef { SettingId id; SettingSection section; const char* label; const char* description; bool action; };
 static const SettingDef SETTING_ROWS[]={
  {SET_QUALITY,SEC_PLAYBACK,"Quality","The highest bitrate the server streams at. Lower it if playback\nstops to buffer; raise it for a sharper picture on a fast network.",false},
@@ -85,6 +88,7 @@ static const SettingDef SETTING_ROWS[]={
  {SET_SKIP_INTRO,SEC_PLAYBACK,"Skip Intros","Films and shows: Auto jumps past the intro; Button shows Skip Intro (Triangle).\nNeeds intro markers on the server (Jellyfin 10.10+, e.g. Intro Skipper).",false},
  {SET_SKIP_OUTRO,SEC_PLAYBACK,"Skip Credits","Shows: at the credits, Auto goes on to the next episode; Button shows\nSkip to Next Episode (Triangle). Needs credits markers on the server.",false},
  {SET_METHOD,SEC_PLAYBACK,"Playback method","Auto plays files the PS4 can decode straight from the server, and has the\nserver convert the rest. Always transcode converts everything (slower to start).",false},
+ {SET_STATS,SEC_PLAYBACK,"Playback Statistics","Show the codec, frame rate, dropped frames, buffer and how the file is played\n(direct or converted) over anything playing. R3 turns it on and off while playing.",false},
  // The PS3's Subtitles section; its font and colour rows keep its words.
  {SET_SUB_DRAW,SEC_SUBTITLES,"Draw Subtitles","Console draws subtitles over the original file, so a film with them still plays\ndirectly. Server burns them into the picture, which means converting the video.",false},
  {SET_SUB_FONT,SEC_SUBTITLES,"Subtitle Font","The typeface subtitles are drawn in.\nLeft and Right step through the choices.",false},
@@ -119,6 +123,7 @@ static SettingsRowView setting_view(const SettingDef& r){
  switch(r.id){
  case SET_QUALITY:v.value=TF("%d Mbps",settings.bitrate/1000000);break;
  case SET_HD1080:v.value=T(settings.hd1080?"On":"Off");v.lit=settings.hd1080;break;
+ case SET_STATS:v.value=T(settings.stats?"On":"Off");v.lit=settings.stats;break;
  case SET_RESUME:v.value=T(settings.resume?"On":"Off");v.lit=settings.resume;break;
  // The guide: its state under Update Guide, its address under Guide Address.
  case SET_GUIDE_UPDATE:v.description=guide_status()+"\n"+T("X downloads the guide now. Anyone signed in can update it.");break;
@@ -160,6 +165,7 @@ static bool setting_step(SettingId id,int dir){
  switch(id){
  case SET_QUALITY:{const int rates[]={2000000,4000000,8000000,12000000,20000000};int n=0;for(int i=0;i<5;i++)if(rates[i]==settings.bitrate)n=i;settings.bitrate=rates[(n+dir+5)%5];break;}
  case SET_HD1080:settings.hd1080=!settings.hd1080;break;
+ case SET_STATS:settings.stats=!settings.stats;break;
  case SET_RESUME:settings.resume=!settings.resume;break;
  case SET_GUIDE_AUTO:settings.guide_auto=!settings.guide_auto;break;
  case SET_ONNOW:settings.home_onnow=!settings.home_onnow;home_dirty=true;break;
@@ -323,10 +329,22 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
  const uint64_t play_pressed=mono_ms();bool prepared=false;std::vector<MediaSegment> segments;std::vector<bool> segment_done;
  // A download plays from its file: no server, no progress reports.
  const bool offline=!item.local.empty();
- std::vector<PlayerSubtitleFile> side_subs;
+ std::vector<PlayerSubtitleFile> side_subs;TrickplayInfo trick;std::vector<PlayerChapter> chapters;
  buffering_run([&]{if(offline){url=item.local;for(const auto& f:local_subtitle_files(item.local))side_subs.push_back({f.url,f.label,f.lang});prepared=true;return;}prepared=playback_url(item,audio,subtitle,source,url,session,source_id);
-  if(prepared&&!live&&!audio_only&&(settings.skip_intro||settings.skip_outro))segments=fetch_segments(item.base.id);});
+  if(prepared&&!live&&!audio_only&&(settings.skip_intro||settings.skip_outro))segments=fetch_segments(item.base.id);
+  // Seek preview thumbnails, when the server has made them (Jellyfin 10.9+).
+  if(prepared&&!live&&!audio_only)fetch_trickplay(item.base.id,source_id,trick);
+  // Chapters, with the server's pictures of them; a file's own are read once it plays.
+  if(prepared&&!live&&!audio_only&&!offline)chapters=fetch_chapters(item.base.id);});
+ if(!chapters.empty())plog(("Playback: "+std::to_string(chapters.size())+" chapters from the server").c_str());
  segment_done.assign(segments.size(),false);
+ // Seek previews: the server's trickplay, else frames from the file itself --
+ // the one playing (USB, a download, direct play), or for a transcode the
+ // original, which can be sought anywhere.
+ if(trick.count||live||audio_only||!prepared)trickplay_begin(trick);
+ else if(offline||playback_is_static())trickplay_begin_file(url);
+ else if(!source_id.empty())trickplay_begin_file(std::string(g_server)+"/Videos/"+encode(item.base.id)+"/stream?static=true&MediaSourceId="+encode(source_id)+"&ApiKey="+encode(g_token));
+ else trickplay_end();
  if(!segments.empty())plog(("Playback: "+std::to_string(segments.size())+" intro / credits markers").c_str());
  plog(("Playback: PlaybackInfo took "+std::to_string(mono_ms()-play_pressed)+" ms"+(settings.hd1080?" (1080p)":"")).c_str());
  if(!prepared){buffering_finish(false);end_playback(session);error_screen();return PLAY_STOPPED;}
@@ -353,6 +371,9 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
  // its tracks, and switches among them in place.
  std::vector<PlayerAudioTrack> local_tracks,local_subs;
  bool audio_checked=false,audio_fallback=false;
+ // The server's chapters; a file played as it is (USB, a download, direct play)
+ // may carry its own instead, read once it has loaded.
+ osd.chapters=chapters;osd.item_id=item.base.id;bool chapters_checked=!osd.chapters.empty()||live||audio_only;
  auto open_local_tracks=[&]{local_tracks=player_audio_tracks();local_subs=player_subtitle_tracks();if(local_tracks.size()<2&&local_subs.empty())return false;
   osd.audio_names.clear();osd.audio_now=0;for(size_t i=0;i<local_tracks.size();++i){osd.audio_names.push_back(local_tracks[i].label);if(local_tracks[i].selected)osd.audio_now=(int)i;}
   osd.sub_names={T("Off")};osd.sub_now=0;for(size_t i=0;i<local_subs.size();++i){osd.sub_names.push_back(local_subs[i].label);if(local_subs[i].selected)osd.sub_now=(int)i+1;}
@@ -368,6 +389,23 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
  uint64_t osd_until=now_ms()+5000,target=0,scrub_at=0,hold_until=0;bool scrubbing=false;int scrub_presses=0;
  bool picture=false,picture_move=false;uint64_t viz_toast_until=0,tri_since=0;bool tri_down=false,tri_used=false,volume_changed=false,volume_active=false;uint64_t volume_until=0,skip_toast_until=0;std::string skip_toast;int control=-1;
  uint64_t reconnect_at=0,reconnect_us=0,reconnect_window=0;int reconnects=0;
+ // Playback statistics (R3, or Settings > Playback): what is playing and how,
+ // refreshed twice a second. Frames shown per second are counted here.
+ std::vector<PlayerStatLine> stats;uint64_t stats_at=0,fps_at=now_ms();int frames_shown=0;double shown_fps=0;
+ auto stat_lines=[&]{
+  std::vector<PlayerStatLine> out;
+  const std::string method=offline?std::string("Direct play (from the file)"):playback_method();
+  out.push_back({"Playing",method.empty()?std::string("Unknown"):method});
+  if(!offline&&!playback_reasons().empty())out.push_back({"Converted for",playback_reasons()});
+  const bool download=offline&&(item.local.find("/downloads/")!=std::string::npos||item.local.find("/JellyFin/")!=std::string::npos);
+  out.push_back({"Source",offline?(download?std::string("Download"):std::string("USB drive")):remote?std::string("The channel's own stream"):std::string("Jellyfin server")});
+  if(!offline&&!remote){char limit[64];snprintf(limit,sizeof limit,"%d Mbps,  %s",settings.bitrate/1000000,settings.hd1080?"1080p":"720p");out.push_back({"Limits",limit});}
+  for(auto& line:player_stats())out.push_back(line);
+  if(!audio_only){char fps[32];snprintf(fps,sizeof fps,"%.1f fps",shown_fps);
+   for(size_t i=0;i<out.size();++i)if(out[i].label=="Frame rate"){out.insert(out.begin()+i+1,{"On screen",fps});break;}}
+  std::string memory=resource_report();if(memory.rfind("free memory ",0)==0)memory=memory.substr(12)+" free";
+  out.push_back({"Memory",memory});
+  return out;};
  wait_release();
  for(;;){
   bool got=player_draw();auto decoder_error=player_error();if(!decoder_error.empty()){last_error=decoder_error;play_failed=true;break;}
@@ -393,6 +431,8 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
   // A file whose sound the player cannot decode plays silently: the server can
   // convert the sound, so go back to it from here. A USB file has only this
   // player, so it says why there is no sound and goes on with the picture.
+  if(started&&!chapters_checked&&player_loaded()){chapters_checked=true;
+   if(is_static){auto own=player_chapters();if(own.size()>=2){osd.chapters=own;plog(("Playback: "+std::to_string(own.size())+" chapters in the file").c_str());}}}
   if(started&&!audio_checked&&!live&&player_audio_failed()){audio_checked=true;
    plog("Playback: the audio track could not be decoded or output");
    if(is_static&&!offline){audio_fallback=true;break;}
@@ -408,6 +448,9 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
   if(live&&now>=guide_at){guide_at=now+5000;guide_line();}
   if(!audio_only){osd.control=control;osd.volume_active=volume_active||(live&&now<volume_until);osd.volume=settings.volume;osd.picture=settings.pic_aspect==PIC_FILL?"Fill":settings.pic_aspect==PIC_STRETCH?"Stretch":"Fit";
    if(bar_shown)draw_player_osd(osd);}
+  if(got)++frames_shown;
+  if(now-fps_at>=1000){shown_fps=frames_shown*1000.0/(double)(now-fps_at);frames_shown=0;fps_at=now;}
+  if(settings.stats&&started){if(now>=stats_at){stats_at=now+500;stats=stat_lines();}draw_stats_panel(stats);}
   // Reconnecting after a stalled picture, until the first new frame.
   if(reconnect_at&&!player_last_frame_ms())buffering_overlay(reconnect_us,T("RECONNECTING"));
   if(picture){
@@ -418,6 +461,7 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
   }
   if(audio_only&&now<volume_until)draw_volume_banner(settings.volume);
   if(osd.tracks_open)draw_track_menu(osd);
+  if(osd.chapters_open)draw_chapter_menu(osd);else if(osd.options_open)draw_options_menu(osd);
   // Intro / credits markers: the one playing now, not yet acted on.
   // Credits only count in a show with a next episode (they skip to it); a
   // film's are left alone.
@@ -427,6 +471,55 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
   if(seg_mode==SKIP_BUTTON&&!picture)draw_skip_button(T(seg_next?"Skip to Next Episode":"Skip Intro"),true);
   if(now<skip_toast_until&&!picture)draw_skip_button(skip_toast,false);
   present();auto b=press();
+  // R3 (the right stick pressed in) turns the statistics on and off, whatever
+  // else is open; the choice is kept, as in Settings > Playback.
+  if(b&ORBIS_PAD_BUTTON_R3){settings.stats=!settings.stats;stats_at=0;save_settings();plog(settings.stats?"Playback: statistics on":"Playback: statistics off");b&=~ORBIS_PAD_BUTTON_R3;}
+  // Options while watching (as the PS4's own player): Chapters, Audio /
+  // Subtitles, Picture, Playback Statistics. The menu, and the chapter list it
+  // opens, have the buttons to themselves while open.
+  auto skip_label=[](int mode){return std::string(T(mode==SKIP_AUTO?"Auto":mode==SKIP_BUTTON?"Button":"Off"));};
+  auto build_options=[&]{osd.options.clear();
+   // A show: its episodes either side, and how intros and credits are skipped.
+   if(!live&&!audio_only&&osd.has_next)osd.options.push_back({"Next Episode",osd.up_next});
+   if(!live&&!audio_only&&osd.has_prev)osd.options.push_back({"Previous Episode",""});
+   if(!osd.chapters.empty())osd.options.push_back({"Chapters",TF("%d chapters",(int)osd.chapters.size())});
+   if(!live)osd.options.push_back({"Audio / Subtitles",osd.subtitles.empty()?osd.audio:osd.audio+"  /  "+osd.subtitles});
+   osd.options.push_back({"Picture",T(settings.pic_aspect==PIC_FILL?"Fill":settings.pic_aspect==PIC_STRETCH?"Stretch":"Fit")});
+   if(series){osd.options.push_back({"Skip Intros",skip_label(settings.skip_intro)});osd.options.push_back({"Skip Credits",skip_label(settings.skip_outro)});}
+   osd.options.push_back({"Playback Statistics",T(settings.stats?"On":"Off")});
+   osd.options_sel=std::max(0,std::min((int)osd.options.size()-1,osd.options_sel));};
+  if(osd.chapters_open){
+   const int n=(int)osd.chapters.size();
+   if(n&&(b&ORBIS_PAD_BUTTON_UP))osd.chapter_sel=(osd.chapter_sel+n-1)%n;
+   else if(n&&(b&ORBIS_PAD_BUTTON_DOWN))osd.chapter_sel=(osd.chapter_sel+1)%n;
+   else if(n&&(b&ORBIS_PAD_BUTTON_CROSS)){
+    const uint64_t to=osd.chapters[osd.chapter_sel].start;osd.chapters_open=osd.options_open=false;
+    plog(("Playback: chapter "+std::to_string(osd.chapter_sel+1)+" of "+std::to_string(n)).c_str());
+    // A transcode starts at the resume point; earlier positions are clamped to it.
+    scrubbing=false;target=to<base?base:to;player_seek(to>base?to-base:0);hold_until=now+3000;osd_until=now+3000;}
+   else if(b&ORBIS_PAD_BUTTON_CIRCLE){osd.chapters_open=false;osd.options_open=true;}   // back to Options
+   else if(b&ORBIS_PAD_BUTTON_OPTIONS)osd.chapters_open=osd.options_open=false;
+   if(osd.chapters_open||osd.options_open)osd_until=now+5000;b=0;
+  }
+  else if(osd.options_open){
+   build_options();const int n=(int)osd.options.size();
+   if(b&ORBIS_PAD_BUTTON_UP)osd.options_sel=(osd.options_sel+n-1)%n;
+   else if(b&ORBIS_PAD_BUTTON_DOWN)osd.options_sel=(osd.options_sel+1)%n;
+   else if(b&ORBIS_PAD_BUTTON_CROSS){const std::string what=osd.options[osd.options_sel].first;
+    // The same as R1 / L1: the episode after or before, as the queue has them.
+    if(what=="Next Episode"){osd.options_open=false;plog("Playback: next episode (Options)");skip=PLAY_NEXT;break;}
+    if(what=="Previous Episode"){osd.options_open=false;plog("Playback: previous episode (Options)");skip=PLAY_PREVIOUS;break;}
+    // Off -> Button -> Auto, kept as in Settings > Playback; it applies from the next marker.
+    if(what=="Skip Intros"){settings.skip_intro=(settings.skip_intro+1)%3;save_settings();build_options();}
+    else if(what=="Skip Credits"){settings.skip_outro=(settings.skip_outro+1)%3;save_settings();build_options();}
+    else if(what=="Chapters"){osd.chapters_open=true;osd.chapter_now=std::max(0,chapter_at(osd.chapters,pos));osd.chapter_sel=osd.chapter_now;}
+    else if(what=="Audio / Subtitles"){osd.options_open=false;if(!open_tracks()){skip_toast=T("No other tracks");skip_toast_until=now+2000;}}
+    else if(what=="Picture"){osd.options_open=false;picture=true;picture_move=false;tri_down=buttons()&ORBIS_PAD_BUTTON_TRIANGLE;tri_used=true;}
+    else if(what=="Playback Statistics"){settings.stats=!settings.stats;stats_at=0;save_settings();build_options();}}
+   else if(b&(ORBIS_PAD_BUTTON_CIRCLE|ORBIS_PAD_BUTTON_OPTIONS))osd.options_open=false;
+   osd_until=now+5000;b=0;
+  }
+  else if(!audio_only&&started&&!picture&&!osd.tracks_open&&(b&ORBIS_PAD_BUTTON_OPTIONS)){osd.options_sel=0;build_options();osd.options_open=true;osd_until=now+5000;b=0;}
   // Music's queue (Options): Up / Down choose a track, X plays it, Circle or
   // Options closes it. It has the buttons to itself while it is open.
   if(audio_only&&queue&&osd.queue_open){
@@ -559,9 +652,18 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
   if(b&(ORBIS_PAD_BUTTON_UP|ORBIS_PAD_BUTTON_DOWN|ORBIS_PAD_BUTTON_TRIANGLE))osd_until=now+5000;
   const uint32_t seek=b&(ORBIS_PAD_BUTTON_LEFT|ORBIS_PAD_BUTTON_RIGHT|ORBIS_PAD_BUTTON_L2|ORBIS_PAD_BUTTON_R2);
   if(seek&&!live&&started){
+   const bool first_press=!scrubbing;
    if(!scrubbing){target=shown;scrubbing=true;scrub_presses=0;}
-   const uint64_t step=(seek&(ORBIS_PAD_BUTTON_L2|ORBIS_PAD_BUTTON_R2))?300000:scrub_presses<6?10000:scrub_presses<16?30000:60000;
-   if(seek&(ORBIS_PAD_BUTTON_LEFT|ORBIS_PAD_BUTTON_L2))target=target>step?target-step:0;else target+=step;
+   if((seek&(ORBIS_PAD_BUTTON_L2|ORBIS_PAD_BUTTON_R2))&&!osd.chapters.empty()){
+    // Chapters, as a Blu-ray player: R2 the next one's start; L2 this one's
+    // start when well into it (3 s), else the one before. Presses in a row go
+    // on stepping; the seek happens once they stop, as for a scrub.
+    if(seek&ORBIS_PAD_BUTTON_R2){for(const auto& c:osd.chapters)if(c.start>target+500){target=c.start;break;}}
+    else{const uint64_t into=first_press?3000:500;uint64_t to=0;for(const auto& c:osd.chapters)if(c.start+into<target)to=c.start;target=to;}
+   }else{
+    const uint64_t step=(seek&(ORBIS_PAD_BUTTON_L2|ORBIS_PAD_BUTTON_R2))?300000:scrub_presses<6?10000:scrub_presses<16?30000:60000;
+    if(seek&(ORBIS_PAD_BUTTON_LEFT|ORBIS_PAD_BUTTON_L2))target=target>step?target-step:0;else target+=step;
+   }
    if(item.duration&&target+5000>item.duration)target=item.duration>5000?item.duration-5000:0;
    ++scrub_presses;scrub_at=now;osd_until=now+5000;
   }
@@ -598,7 +700,7 @@ static PlayEnd play(Item item,int audio,int subtitle,const std::string& source,c
  }
  if(buffering_active())buffering_finish(false);
  if(picture||volume_changed)save_settings();
- uint64_t pos=base+player_time();player_close();
+ uint64_t pos=base+player_time();player_close();trickplay_end();
  if(!offline)finish_playback(item,session,source_id,pos,paused);
  else if(started){download_played(item,pos);if(g_token[0]&&strncmp(item.base.id,"local:",6))finish_playback(item,"","",pos,paused);}
  // A new audio or subtitle track: the same item again from here, with it.

@@ -1,4 +1,7 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #include "art.h"
+#include "lockup.h"
 #include "thread_priority.h"
 #include "mono_clock.h"
 #include "app.h"
@@ -157,8 +160,11 @@ bool art_prepare(const std::string& id,int w,int h,bool cover){
 bool draw_art(const std::string& id,int x,int y,int w,int h,bool keep,int alpha){pthread_mutex_lock(&art_lock);auto i=cache.find(id);bool result=i!=cache.end()&&draw_image(i->second,x,y,w,h,false,false,keep,alpha);pthread_mutex_unlock(&art_lock);return result;}
 bool draw_art_cover(const std::string& id,int x,int y,int w,int h,bool keep,int alpha){pthread_mutex_lock(&art_lock);auto i=cache.find(id);bool result=i!=cache.end()&&draw_image(i->second,x,y,w,h,true,false,keep,alpha);pthread_mutex_unlock(&art_lock);return result;}
 bool draw_art_circle(const std::string& id,int x,int y,int d){pthread_mutex_lock(&art_lock);auto i=cache.find(id);bool result=i!=cache.end()&&draw_image(i->second,x,y,d,d,true,true);pthread_mutex_unlock(&art_lock);return result;}
+// The mark in the theme's colours, as the PS3 draws it (lockup.cpp): made again
+// when the theme changes.
 void draw_brand_mark(int x,int y,int size,int alpha){
- if(!mark_loaded){mark_loaded=true;int channels;auto p=stbi_load("/app0/assets/jellyfin-mark.png",&mark.width,&mark.height,&channels,4);if(!p)p=stbi_load("assets/jellyfin-mark.png",&mark.width,&mark.height,&channels,4);if(p){mark.pixels.assign(p,p+mark.width*mark.height*4);stbi_image_free(p);}}
+ static uint64_t made_for=0;const uint64_t key=mark_theme_key();
+ if(!mark_loaded||made_for!=key){mark_loaded=true;made_for=key;mark=Art();if(!mark_rgba(mark.pixels,mark.width,mark.height))mark.pixels.clear();}
  draw_image(mark,x,y,size,size,false,false,true,alpha);
 }
 

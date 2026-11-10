@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #include "avplayer_module.h"
 #include <stdio.h>
 static const char* names[]={"sceAvPlayerInit","sceAvPlayerAddSource","sceAvPlayerStop","sceAvPlayerClose","sceAvPlayerGetAudioData","sceAvPlayerGetVideoData","sceAvPlayerIsActive","sceAvPlayerCurrentTime","sceAvPlayerPause","sceAvPlayerResume","sceAvPlayerJumpToTime","sceAvPlayerGetVideoDataEx","sceAvPlayerAddSourceEx","sceAvPlayerPostInit","sceAvPlayerSetLogCallback"};

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+# GPL-3.0-or-later, with the attribution terms in NOTICE.
 # See tests/usb_download_115.cpp. Arguments: a short real video file, and a video
 # with its index at the end (a .mov). Nothing here touches the console.
 set -euo pipefail

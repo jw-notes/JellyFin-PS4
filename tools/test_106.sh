@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+# GPL-3.0-or-later, with the attribution terms in NOTICE.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p build/host-sdk
@@ -9,7 +11,7 @@ common=(tests/http_host.cpp source/app.cpp source/playback_model.cpp source/auth
 g++ -std=c++17 -O2 "${flags[@]}" tests/large_library_106.cpp "${common[@]}" -o build/large-library-106
 python3 tools/run_large_library_106.py
 g++ -std=c++17 -O2 "${flags[@]}" -Dmain=ps4_application_main -c source/main.cpp -o build/main-navigation-106.o
-g++ -std=c++17 -O2 "${flags[@]}" tests/navigation_106.cpp build/main-navigation-106.o source/input.cpp source/input_model.cpp source/render.cpp source/ui_view.cpp source/screenshot.cpp source/art.cpp source/facts.cpp "${common[@]}" -o build/navigation-106
+g++ -std=c++17 -O2 "${flags[@]}" tests/navigation_106.cpp build/main-navigation-106.o source/input.cpp source/input_model.cpp source/render.cpp source/ui_view.cpp source/trickplay.cpp source/screenshot.cpp source/art.cpp source/lockup.cpp source/facts.cpp "${common[@]}" -o build/navigation-106
 export JF_TEST_DATA="$PWD/build/nav-test-106"
 mkdir -p "$JF_TEST_DATA"
 ./build/navigation-106 "$@"

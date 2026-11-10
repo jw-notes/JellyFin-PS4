@@ -1,3 +1,5 @@
+// JellyFin [PS] for PS4 - Copyright (C) 2026 jw-notes <https://github.com/jw-notes>
+// GPL-3.0-or-later, with the attribution terms in NOTICE.
 #pragma once
 // Leaving the PS4 app sandbox so USB drives (/mnt/usb0..7) can be written
 // (Downloads > USB drive): GoldHEN 2.3+'s own escape through its Plugins SDK (MIT, vendor/goldhen_sdk).

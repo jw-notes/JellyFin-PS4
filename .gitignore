@@ -9,10 +9,12 @@ dist/*
 !dist/v1.13/
 !dist/v1.14/
 !dist/v1.15/
+!dist/v1.16/
 *.pkg
 !dist/v1.13/*.pkg
 !dist/v1.14/*.pkg
 !dist/v1.15/*.pkg
+!dist/v1.16/*.pkg
 
 # Stray build and download output
 *.o
