@@ -60,7 +60,7 @@ A native Jellyfin client for PS4 consoles, built with the OpenOrbis toolchain. I
 
 ## Install
 
-1. Copy `dist/v1.14/IV0000-JFPS40000_00-JELLYFINPS400000.pkg` to your PS4 and install it with your package installer. It installs over an earlier version and keeps your sign-in and settings.
+1. Copy `dist/v1.15/IV0000-JFPS40000_00-JELLYFINPS400000.pkg` to your PS4 and install it with your package installer. It installs over an earlier version and keeps your sign-in and settings.
 2. Open **Jellyfin [PS]**, enter your server's full URL including the port (for example `http://192.168.1.100:8096`), then sign in with Quick Connect or your username and password.
 
 ### Updates
@@ -116,6 +116,8 @@ The films, shows and music in the screenshots were chosen because their artwork 
 
 ## Credits and licence
 
-Made by jw-notes. Jellyfin [PS] is free software under the GNU GPL, version 3 or later; see `LICENSE`.
+Made by [jw-notes](https://github.com/jw-notes). Copyright (C) 2026 jw-notes.
+
+Jellyfin [PS] is free software under the GNU GPL, version 3 or later; see [LICENSE](LICENSE). It also carries additional attribution terms under section 7 of the GPL, set out in [NOTICE](NOTICE): any copy, port or modified version, by hand or with AI (clanker) tools, must keep these notices, must credit *"Based on JellyFin [PS] for PS4 by jw-notes - https://github.com/jw-notes/JellyFin-PS4"* in its README and About screen, must keep the credits to the other authors below, and must not be presented as original work.
 
 Playback uses the PS4 builds of MPV (GPL 2+) and FFmpeg (LGPL / GPL 3) from [Switchfin](https://github.com/dragonflylee/switchfin/tree/ps4) (Apache 2.0), with SDL2, mbedTLS, dav1d, libass, FreeType, FriBidi, libpng, zlib and bzip2 under their own licences. The interface translations come from Jellyfin [PS] for PS3. Fonts: Satoshi (ITF Free Font License), Open Sans and Roboto Condensed (Apache 2.0), Noto Sans JP (SIL OFL 1.1). Button sprites by Kenney (CC0). Jellyfin logo CC BY-SA 4.0.

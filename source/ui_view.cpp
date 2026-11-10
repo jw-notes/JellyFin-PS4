@@ -884,6 +884,8 @@ enum AboutKind { A_HEAD, A_VER, A_ITEM, A_NAME, A_TEXT, A_GAP };
 struct AboutLine { AboutKind kind; const char* a; const char* b; };
 // Updates: the PS4 releases, newest first. Add each new release at the top.
 const AboutLine about_updates[]={
+ {A_VER,"1.15",nullptr},
+ {A_ITEM,"Copyright and credits: github.com/jw-notes, and every author listed.",nullptr},
  {A_VER,"1.14",nullptr},
  {A_ITEM,"Music tabs (Albums, Artists, Playlists, Genres, Songs), shuffle and the queue.",nullptr},
  {A_ITEM,"Live search as on the PS3; audio and subtitles while watching.",nullptr},
@@ -940,13 +942,22 @@ const AboutLine about_updates[]={
 const AboutLine about_credits[]={
  {A_HEAD,"Made by",nullptr},
  {A_NAME,"jw-notes","Jellyfin [PS] for PS4"},
+ {A_TEXT,"github.com/jw-notes",nullptr},
+ {A_TEXT,"github.com/jw-notes/JellyFin-PS4",nullptr},
+ {A_TEXT,"Copyright (C) 2026 jw-notes.",nullptr},
+ {A_GAP,nullptr,nullptr},
+ {A_TEXT,"Interface translations from Jellyfin [PS] for PS3, by jw-notes.",nullptr},
+ {A_TEXT,"Playback built on Switchfin's PS4 port by dragonflylee.",nullptr},
+ {A_TEXT,"Every other author is credited under Licences.",nullptr},
 };
 const AboutLine about_licences[]={
  {A_HEAD,"License",nullptr},
  {A_TEXT,"JellyFin [PS] is free software under the GNU GPL, version 3 or later.",nullptr},
  {A_TEXT,"It comes with no warranty. Each component keeps its own licence.",nullptr},
+ {A_TEXT,"Copies and modified versions must keep these credits and say:",nullptr},
+ {A_TEXT,"\"Based on JellyFin [PS] for PS4 by jw-notes\" (see NOTICE).",nullptr},
  {A_TEXT,"Source code and the full licence texts:",nullptr},
- {A_TEXT,"github.com/jw-notes",nullptr},
+ {A_TEXT,"github.com/jw-notes/JellyFin-PS4",nullptr},
  {A_GAP,nullptr,nullptr},
  {A_HEAD,"Open-source software",nullptr},
  {A_NAME,"MPV","GPL 2+"},
@@ -958,6 +969,8 @@ const AboutLine about_licences[]={
  {A_NAME,"libass, FreeType, FriBidi, libpng","ISC / FTL / LGPL / libpng"},
  {A_NAME,"stb_image, stb_truetype","Public domain / MIT"},
  {A_NAME,"OpenOrbis PS4 Toolchain","GPL 3"},
+ {A_NAME,"GoldHEN SDK","MIT"},
+ {A_NAME,"shadPS4 (AvPlayer layouts)","GPL 2+"},
  {A_GAP,nullptr,nullptr},
  {A_HEAD,"Fonts and art",nullptr},
  {A_NAME,"Noto Sans, Noto Sans JP","SIL OFL 1.1"},

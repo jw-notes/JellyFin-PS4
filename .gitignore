@@ -8,9 +8,11 @@ source.corrupt-*/
 dist/*
 !dist/v1.13/
 !dist/v1.14/
+!dist/v1.15/
 *.pkg
 !dist/v1.13/*.pkg
 !dist/v1.14/*.pkg
+!dist/v1.15/*.pkg
 
 # Stray build and download output
 *.o
